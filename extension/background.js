@@ -28,6 +28,25 @@ async function discoverZoteroPort() {
 discoverZoteroPort();
 setInterval(discoverZoteroPort, 30_000);
 
+// Auto-discover existing ChatGPT tabs on startup and trigger initial history scrape
+(async () => {
+  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+  if (tabs.length > 0 && activeChatTabId === null) {
+    activeChatTabId = tabs[0].id;
+    console.log(`[sync-zotero] Found existing ChatGPT tab: ${tabs[0].id}`);
+
+    // Wait for Zotero port discovery, then trigger a history scrape
+    await discoverZoteroPort();
+    try {
+      await ensureContentScript(activeChatTabId);
+      // Ping the content script to trigger an immediate scrapeHistory()
+      chrome.tabs.sendMessage(activeChatTabId, { type: "SCRAPE_HISTORY_NOW" }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_) {}
+  }
+})();
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -185,6 +204,20 @@ async function pollForCommand() {
       }
 
       broadcastStatus("idle", "Loaded past chat — ready for follow-up");
+    } else if (cmd.type === "SCRAPE_HISTORY") {
+      // Plugin is requesting a fresh history scrape
+      let tabId = activeChatTabId;
+      if (!tabId) {
+        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        if (tabs.length > 0) { tabId = tabs[0].id; activeChatTabId = tabId; }
+      }
+      if (tabId) {
+        try {
+          chrome.tabs.sendMessage(tabId, { type: "SCRAPE_HISTORY_NOW" }, () => {
+            void chrome.runtime.lastError;
+          });
+        } catch (_) {}
+      }
     } else if (cmd.type === "DELETE_CHAT" && cmd.chatId) {
       if (activeChatTabId !== null) {
         chrome.tabs.sendMessage(activeChatTabId, { type: "DELETE_CHAT", chatId: cmd.chatId }, (response) => {
@@ -205,8 +238,10 @@ async function pollForCommand() {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "HISTORY_UPDATE") {
-    // Forward the scraped history to the local Next.js server
-    serverPost("/update_chat_history", { sessions: message.history }).catch(() => {});
+    // Forward the scraped history to the relay server
+    serverPost("/update_chat_history", { sessions: message.history })
+      .then(() => console.log(`[sync-zotero] History updated: ${message.history?.length} sessions`))
+      .catch((err) => console.warn("[sync-zotero] History update failed:", err.message));
   }
 });
 async function pollForQuery() {

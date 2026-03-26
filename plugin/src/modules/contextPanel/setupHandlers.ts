@@ -6484,6 +6484,11 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       modelBtn.style.cursor = isWebChat ? "default" : "";
     }
 
+    // [webchat] Pre-fetch history in background so it's ready when user clicks
+    if (isWebChat) {
+      void warmUpWebChatHistory();
+    }
+
     // Clear button → "Exit" in webchat, restore "Clear" otherwise
     if (clearBtn) {
       if (isWebChat) {
@@ -6496,6 +6501,30 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
         clearBtn.title = "";
       }
     }
+  };
+
+  // [webchat] Pre-fetch history in background — triggers a scrape command then polls
+  let historyWarmUpRunning = false;
+  const warmUpWebChatHistory = async () => {
+    if (historyWarmUpRunning) return;
+    historyWarmUpRunning = true;
+    try {
+      // Tell the extension to scrape history NOW via a relay command
+      const { relaySetCommand } = await import("../../webchat/relayServer");
+      relaySetCommand({ type: "SCRAPE_HISTORY" });
+
+      const { fetchChatHistory } = await import("../../webchat/client");
+      // Poll up to 15 seconds for history to arrive from the extension
+      for (let i = 0; i < 10; i++) {
+        const sessions = await fetchChatHistory("");
+        if (sessions.length > 0) {
+          ztoolkit.log(`[webchat] History warmed up: ${sessions.length} conversations`);
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    } catch { /* ignore */ }
+    historyWarmUpRunning = false;
   };
 
   // [webchat] Render ChatGPT conversation history in the history menu
@@ -6528,7 +6557,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       const { fetchChatHistory } = await import("../../webchat/client");
       sessions = await fetchChatHistory(host);
     } catch {
-      // Web host not reachable
+      // Relay not reachable
     }
 
     if (!sessions.length) {
@@ -6543,6 +6572,16 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       return;
     }
 
+    await renderHistorySessions(doc, header, sessions, host);
+  };
+
+  // Helper: render session list into a history menu header container
+  const renderHistorySessions = async (
+    doc: Document,
+    container: HTMLElement,
+    sessions: Array<{ id: string; title: string; chatUrl: string | null }>,
+    host: string,
+  ) => {
     // Scrollable viewport
     const viewport = createElement(doc, "div", "llm-history-menu-section-viewport", {});
     viewport.style.maxHeight = "300px";
@@ -6571,12 +6610,24 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
         // Navigate ChatGPT to this conversation and load messages
         void (async () => {
           try {
+            // Clear current chat and show loading indicator in the chat panel
+            const key = getConversationKey(item);
+            chatHistory.set(key, [{
+              role: "assistant" as const,
+              text: `Loading conversation: **${session.title || "Untitled"}**\n\nFetching messages from ChatGPT…`,
+              timestamp: Date.now(),
+              modelName: "chatgpt.com",
+              modelProviderLabel: "ChatGPT",
+              streaming: true,
+            }]);
+            refreshChatPreservingScroll();
+            if (status) setStatus(status, "Loading conversation from ChatGPT…", "sending");
+
             const { loadChatSession, fetchScrapedMessages } = await import("../../webchat/client");
             const result = await loadChatSession(host, session.id);
             // The web host sends a LOAD_CHAT command to the extension,
             // which navigates ChatGPT to the conversation URL.
 
-            const key = getConversationKey(item);
             const messages: Message[] = [];
 
             // Try local history first (plugin-initiated conversations)
@@ -6625,8 +6676,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     }
 
     viewport.appendChild(rows);
-    header.appendChild(viewport);
-    historyMenu.appendChild(header);
+    container.appendChild(viewport);
+    if (!container.parentElement) historyMenu?.appendChild(container);
   };
 
   // Initialize preview state

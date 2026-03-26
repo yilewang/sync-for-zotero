@@ -778,6 +778,14 @@ async function scrapeAllMessages() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "PING") { sendResponse({ pong: true }); return false; }
 
+  // [webchat] Trigger immediate sidebar history scrape (force re-send)
+  if (msg.type === "SCRAPE_HISTORY_NOW") {
+    lastHistoryJson = "";  // Reset cache to force re-send
+    scrapeHistory();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   // [webchat] Navigate to a URL (forces full page reload for SPA)
   if (msg.type === "NAVIGATE") {
     window.location.href = msg.url;

@@ -470,6 +470,11 @@ export function relayNewChat(): void {
   S().pendingCommand = { type: "NEW_CHAT" };
 }
 
+/** Set a pending command directly (no HTTP). */
+export function relaySetCommand(cmd: { type: string; chatUrl?: string; chatId?: string }): void {
+  S().pendingCommand = cmd as any;
+}
+
 /** Load a chat session directly (no HTTP). */
 export function relayLoadChat(sessionId: string): {
   ok: boolean;
