@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+  <!-- Counterclockwise arrow around clock face -->
+  <path d="M5.5 1 3 3.5l2.5 2.5V4.4A4.5 4.5 0 1 1 3.5 8H2A6 6 0 1 0 5.5 2.4V1z"/>
+  <!-- Clock hands -->
+  <path d="M8.65 4.5a.65.65 0 0 0-1.3 0v3.65l2.3 1.38a.65.65 0 0 0 .65-1.127L8.65 7.28V4.5z"/>
+</svg>
