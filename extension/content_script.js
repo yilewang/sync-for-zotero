@@ -680,23 +680,50 @@ function htmlToMarkdown(html) {
  * Returns them in chronological order as { role, text } objects.
  */
 async function scrapeAllMessages() {
-  // Wait a moment for the page to fully render
-  await sleep(1000);
-
-  const messages = [];
-
-  // Try multiple selectors for message containers
   const MSG_SELECTORS = [
     "[data-message-author-role]",
-    "article[data-testid]",
     "div[data-message-id]",
   ];
 
-  let msgElements = [];
-  for (const sel of MSG_SELECTORS) {
-    msgElements = Array.from(document.querySelectorAll(sel));
-    if (msgElements.length > 0) break;
+  // --- Phase 1: Wait for at least one message to appear in the DOM ---
+  // ChatGPT loads conversation messages asynchronously after page load.
+  // Poll up to 15 seconds for any message element to appear.
+  let foundSelector = null;
+  for (let i = 0; i < 30; i++) { // 30 × 500ms = 15s
+    for (const sel of MSG_SELECTORS) {
+      if (document.querySelectorAll(sel).length > 0) {
+        foundSelector = sel;
+        break;
+      }
+    }
+    if (foundSelector) break;
+    await sleep(500);
   }
+
+  if (!foundSelector) {
+    console.warn("[sync-zotero] scrapeAllMessages: no messages found after 15s");
+    return [];
+  }
+
+  // --- Phase 2: Wait for messages to stabilize ---
+  // ChatGPT may still be rendering. Wait until message count stops changing.
+  let lastCount = 0;
+  let stableChecks = 0;
+  for (let i = 0; i < 10; i++) { // up to 5 more seconds
+    const count = document.querySelectorAll(foundSelector).length;
+    if (count === lastCount && count > 0) {
+      stableChecks++;
+      if (stableChecks >= 3) break; // stable for 1.5s
+    } else {
+      stableChecks = 0;
+      lastCount = count;
+    }
+    await sleep(500);
+  }
+
+  // --- Phase 3: Extract all messages ---
+  const msgElements = Array.from(document.querySelectorAll(foundSelector));
+  const messages = [];
 
   for (const el of msgElements) {
     const role = el.getAttribute("data-message-author-role") || "";
@@ -704,10 +731,8 @@ async function scrapeAllMessages() {
     // Skip system/tool messages
     if (role !== "user" && role !== "assistant") continue;
 
-    // Extract text content
     let text = "";
     if (role === "assistant") {
-      // Try structured content selectors
       const CONTENT_SELECTORS = [
         ".markdown",
         "[class*='markdown']",
@@ -723,12 +748,10 @@ async function scrapeAllMessages() {
           break;
         }
       }
-      // Fallback
       if (!text) {
         text = el.innerText?.trim() || el.textContent?.trim() || "";
       }
     } else {
-      // User messages: just get text content
       text = el.innerText?.trim() || el.textContent?.trim() || "";
     }
 
@@ -740,6 +763,7 @@ async function scrapeAllMessages() {
     }
   }
 
+  console.log(`[sync-zotero] scrapeAllMessages: found ${messages.length} messages`);
   return messages;
 }
 
@@ -754,11 +778,25 @@ async function scrapeAllMessages() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "PING") { sendResponse({ pong: true }); return false; }
 
+  // [webchat] Navigate to a URL (forces full page reload for SPA)
+  if (msg.type === "NAVIGATE") {
+    window.location.href = msg.url;
+    sendResponse({ ok: true });
+    return false;
+  }
+
   // [webchat] Scrape all messages from the current ChatGPT conversation
   if (msg.type === "SCRAPE_MESSAGES") {
+    console.log("[sync-zotero] SCRAPE_MESSAGES received, starting scrape…");
     scrapeAllMessages()
-      .then((messages) => sendResponse({ ok: true, messages }))
-      .catch((err) => sendResponse({ ok: false, error: err.message, messages: [] }));
+      .then((messages) => {
+        console.log(`[sync-zotero] SCRAPE_MESSAGES done: ${messages.length} messages`);
+        sendResponse({ ok: true, messages });
+      })
+      .catch((err) => {
+        console.warn("[sync-zotero] SCRAPE_MESSAGES error:", err);
+        sendResponse({ ok: false, error: err.message, messages: [] });
+      });
     return true; // async sendResponse
   }
 

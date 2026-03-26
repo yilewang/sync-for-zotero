@@ -641,7 +641,8 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         // [webchat] Auto-configure for webchat
         if (nextAuthMode === "webchat") {
           group.providerProtocol = "web_sync";
-          group.apiBase = "http://localhost:7878";
+          const webchatPort = Zotero.Prefs.get("httpServer.port") || 23119;
+          group.apiBase = `http://127.0.0.1:${webchatPort}/llm-for-zotero/webchat`;
           group.apiKey = "";
           // Ensure at least one model entry exists (the target name)
           if (!group.models.length) {

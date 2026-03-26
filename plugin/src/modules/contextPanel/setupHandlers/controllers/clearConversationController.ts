@@ -84,7 +84,7 @@ export function createClearConversationController(
     // [webchat] Sync new-chat to web host so ChatGPT navigates to a fresh conversation
     if (deps.isWebChatActive?.()) {
       import("../../../../webchat/client").then(({ sendNewChat }) => {
-        sendNewChat(deps.getWebChatHost?.() || "http://localhost:7878").catch(() => {});
+        sendNewChat(deps.getWebChatHost?.() || "http://127.0.0.1:23119/llm-for-zotero/webchat").catch(() => {});
       }).catch(() => {});
     }
 

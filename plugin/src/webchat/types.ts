@@ -15,7 +15,7 @@ export type WebChatTargetEntry = {
 };
 
 export const WEBCHAT_TARGETS: WebChatTargetEntry[] = [
-  { id: "chatgpt", label: "ChatGPT", defaultHost: "http://localhost:7878" },
+  { id: "chatgpt", label: "ChatGPT", defaultHost: "http://127.0.0.1:23119/llm-for-zotero/webchat" }, // port is dynamic — use getRelayBaseUrl() at runtime
 ];
 
 export function getWebChatTarget(id: string): WebChatTargetEntry | undefined {

@@ -10,7 +10,6 @@
 import type { ReasoningEvent } from "../utils/llmClient";
 import { readLocalFileBytes } from "../utils/llmClient";
 import { submitQuery, pollForResponse, bytesToBase64 } from "./client";
-import { ensureServer } from "./serverLauncher";
 
 // ---------------------------------------------------------------------------
 // PDF resolution helpers
@@ -99,9 +98,6 @@ export async function sendWebChatQuestion(
   opts: WebChatSendOptions,
 ): Promise<string> {
   const { item, question, host, isFollowUp, images, chatgptMode, signal, onDelta, onReasoning } = opts;
-
-  // --- Ensure the relay server is running ---
-  await ensureServer(host);
 
   // --- Resolve and read the current paper's PDF (first message only) ---
   let pdfBase64: string | null = null;

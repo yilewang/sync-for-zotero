@@ -4970,9 +4970,11 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       closeHistoryMenu();
 
       // [webchat] In webchat mode, "+" creates a new ChatGPT conversation
-      const { selectedEntry: newChatEntry } = getSelectedModelInfo();
-      if (newChatEntry?.authMode === "webchat") {
-        const webChatHost = newChatEntry.apiBase || "http://localhost:7878";
+      const { selectedEntry: _debugEntry } = getSelectedModelInfo();
+      ztoolkit.log(`[webchat] + clicked: authMode=${_debugEntry?.authMode}, entryId=${_debugEntry?.entryId}, isWebChat=${_debugEntry?.authMode === "webchat"}`);
+      if (isWebChatMode()) {
+        const webchatPort = Zotero.Prefs.get("httpServer.port") || 23119;
+        const webChatHost = `http://127.0.0.1:${webchatPort}/llm-for-zotero/webchat`;
         (async () => {
           try {
             const { sendNewChat } = await import("../../webchat/client");
@@ -6238,8 +6240,9 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     stopWebChatConnectionCheck();
     const check = async () => {
       try {
-        const { selectedEntry: se } = getSelectedModelInfo();
-        const host = se?.apiBase || "http://localhost:7878";
+        // Always use dynamic port — saved apiBase may be stale
+        const { getRelayBaseUrl } = await import("../../webchat/relayServer");
+        const host = getRelayBaseUrl();
         const { testConnection } = await import("../../webchat/client");
         const alive = await testConnection(host);
         dot.className = alive
@@ -6517,7 +6520,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
 
     // Fetch conversations from web host
     const { selectedEntry: se } = getSelectedModelInfo();
-    const host = se?.apiBase || "http://localhost:7878";
+    const { getRelayBaseUrl: getHost } = await import("../../webchat/relayServer");
+    const host = getHost();
 
     let sessions: Array<{ id: string; title: string; chatUrl: string | null }> = [];
     try {
@@ -6590,7 +6594,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
             } else {
               // No local history — wait for extension to scrape messages from ChatGPT DOM
               if (status) setStatus(status, "Loading conversation from ChatGPT…", "sending");
-              const scraped = await fetchScrapedMessages(host, 10_000);
+              const scraped = await fetchScrapedMessages(host, 20_000);
               for (const m of scraped) {
                 messages.push({
                   role: m.role === "user" ? "user" : "assistant",
@@ -6600,13 +6604,18 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
                   modelProviderLabel: m.role === "bot" ? "ChatGPT" : undefined,
                 });
               }
-              if (status) setStatus(status, messages.length > 0 ? "Conversation loaded" : "Ready", "ready");
+              if (scraped.length === 0) {
+                if (status) setStatus(status, "No messages found — open the ChatGPT tab to load", "ready");
+              } else {
+                if (status) setStatus(status, `Loaded ${scraped.length} messages`, "ready");
+              }
             }
 
             chatHistory.set(key, messages);
             refreshChatPreservingScroll();
           } catch (err) {
             ztoolkit.log("[webchat] Failed to load chat:", err);
+            if (status) setStatus(status, `Error loading chat: ${(err as Error).message || "Unknown error"}`, "error");
           }
         })();
       });
@@ -8436,8 +8445,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       return selectedEntry?.authMode === "webchat";
     },
     getWebChatHost: () => {
-      const { selectedEntry } = getSelectedModelInfo();
-      return selectedEntry?.apiBase || "http://localhost:7878";
+      const port = Zotero.Prefs.get("httpServer.port") || 23119;
+      return `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
     },
   });
   const executeSend = async () => {

@@ -6,8 +6,27 @@
  * Tracks the active ChatGPT tab so follow-up messages continue the same conversation.
  */
 
-const SERVER      = "http://localhost:7878";
+let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const CHATGPT_URL = "https://chatgpt.com/";
+
+// Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
+async function discoverZoteroPort() {
+  for (let port = 23119; port <= 23128; port++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/poll_response`);
+      if (res.ok) {
+        SERVER = `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
+        console.log(`[sync-zotero] Found Zotero server on port ${port}`);
+        return;
+      }
+    } catch { /* try next port */ }
+  }
+  console.warn("[sync-zotero] Could not find Zotero server on ports 23119-23128");
+}
+
+// Discover port on startup and periodically
+discoverZoteroPort();
+setInterval(discoverZoteroPort, 30_000);
 
 // ---------------------------------------------------------------------------
 // State
@@ -69,52 +88,101 @@ async function pollForCommand() {
 
     const cmd = data.command;
     if (cmd.type === "NEW_CHAT") {
-      // Navigate the active ChatGPT tab to a fresh page
-      if (activeChatTabId !== null) {
+      // Navigate a ChatGPT tab to a fresh page
+      let tabId = activeChatTabId;
+
+      // Find an existing ChatGPT tab if we don't have one tracked
+      if (tabId === null) {
+        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        if (tabs.length > 0) tabId = tabs[0].id;
+      }
+
+      if (tabId !== null) {
         try {
-          await chrome.tabs.update(activeChatTabId, { url: CHATGPT_URL });
-          await waitForTabLoad(activeChatTabId);
+          await chrome.tabs.update(tabId, { url: CHATGPT_URL });
+          await waitForTabLoad(tabId);
+          activeChatTabId = tabId;
         } catch (_) {
           activeChatTabId = null;
         }
       }
-      activeChatTabId = null;
       broadcastStatus("idle", "New chat — ready for next query");
     } else if (cmd.type === "LOAD_CHAT" && cmd.chatUrl) {
       // Navigate to a specific past chat URL
       let tabId = null;
+
+      // Try to find an existing ChatGPT tab first
       if (activeChatTabId !== null) {
         try {
-          await chrome.tabs.update(activeChatTabId, { url: cmd.chatUrl });
-          await waitForTabLoad(activeChatTabId);
-          tabId = activeChatTabId;
+          const existingTab = await chrome.tabs.get(activeChatTabId);
+          if (existingTab?.url?.startsWith("https://chatgpt.com")) {
+            tabId = activeChatTabId;
+          }
         } catch (_) {
           activeChatTabId = null;
         }
       }
       if (!tabId) {
+        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        if (tabs.length > 0) {
+          tabId = tabs[0].id;
+          activeChatTabId = tabId;
+        }
+      }
+
+      if (tabId) {
+        // ChatGPT is an SPA — navigating within it won't trigger a full page load.
+        // Use the content script to navigate via window.location for a clean reload.
+        try {
+          await ensureContentScript(tabId);
+          await new Promise((resolve) => {
+            chrome.tabs.sendMessage(tabId, { type: "NAVIGATE", url: cmd.chatUrl }, () => {
+              void chrome.runtime.lastError;
+              resolve();
+            });
+          });
+        } catch (_) {
+          // Fallback: direct tab update
+          await chrome.tabs.update(tabId, { url: cmd.chatUrl });
+        }
+        await waitForTabLoad(tabId);
+      } else {
+        // No existing ChatGPT tab — create a new one
         const tab = await chrome.tabs.create({ url: cmd.chatUrl, active: false });
         await waitForTabLoad(tab.id);
         activeChatTabId = tab.id;
         tabId = tab.id;
       }
+
       broadcastStatus("idle", "Loaded past chat — scraping messages…");
 
-      // Scrape all messages from the loaded conversation and post back to web host
+      // Scrape all messages from the loaded conversation.
+      // The content script waits for messages to appear in DOM (up to 15s).
       try {
+        // Wait for page to fully reload and content script to initialize
+        await new Promise(r => setTimeout(r, 3000));
         await ensureContentScript(tabId);
-        // Give the page extra time to render all messages
-        await new Promise(r => setTimeout(r, 2000));
+
         const response = await new Promise((resolve) => {
           chrome.tabs.sendMessage(tabId, { type: "SCRAPE_MESSAGES" }, (res) => {
-            if (chrome.runtime.lastError) resolve({ ok: false, messages: [] });
-            else resolve(res || { ok: false, messages: [] });
+            if (chrome.runtime.lastError) {
+              console.warn("[sync-zotero] SCRAPE_MESSAGES failed:", chrome.runtime.lastError.message);
+              resolve({ ok: false, messages: [] });
+            } else {
+              resolve(res || { ok: false, messages: [] });
+            }
           });
         });
+
         if (response.ok && response.messages?.length > 0) {
-          await serverPost("/submit_scraped_messages", { messages: response.messages });
+          console.log(`[sync-zotero] Scraped ${response.messages.length} messages, posting to server`);
+          await serverPost("/chat_history", { action: "submit_scraped", messages: response.messages });
+        } else {
+          console.warn("[sync-zotero] No messages scraped from ChatGPT page");
         }
-      } catch (_) { /* scraping is best-effort */ }
+      } catch (err) {
+        console.warn("[sync-zotero] Scraping error:", err);
+      }
 
       broadcastStatus("idle", "Loaded past chat — ready for follow-up");
     } else if (cmd.type === "DELETE_CHAT" && cmd.chatId) {

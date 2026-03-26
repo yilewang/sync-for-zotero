@@ -317,10 +317,27 @@ routes["POST /update_chat_url"] = async (req, res) => {
 };
 
 // GET /chat_history
-routes["GET /chat_history"] = (_req, res) => {
+routes["GET /chat_history"] = (req, res) => {
+  const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
+  const action = reqUrl.searchParams.get("action");
+  if (action === "get_scraped") {
+    const messages = scrapedMessages;
+    scrapedMessages = null;
+    return json(res, { messages });
+  }
   json(res, {
     sessions: mirroredHistory.map((s) => ({ id: s.id, title: s.title, chatUrl: s.chatUrl })),
   });
+};
+
+// POST /chat_history (submit scraped messages)
+routes["POST /chat_history"] = async (req, res) => {
+  const body = await readBody(req);
+  if (body.action === "submit_scraped") {
+    scrapedMessages = body.messages || [];
+    return json(res, { ok: true });
+  }
+  json(res, { error: "Unknown action" }, 400);
 };
 
 // POST /update_chat_history

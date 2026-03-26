@@ -2818,10 +2818,12 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
 
       // historyForLLM was captured before the current user message was added,
       // so if it has entries, this is a follow-up (no need to re-send PDF).
+      // Always use dynamic port for the embedded relay server
+      const { getRelayBaseUrl } = await import("../../webchat/relayServer");
       const answer = await sendWebChatQuestion({
         item,
         question,
-        host: effectiveRequestConfig.apiBase || "http://localhost:7878",
+        host: getRelayBaseUrl(),
         isFollowUp: historyForLLM.length > 0,
         images: screenshotImagesForMessage.length > 0 ? screenshotImagesForMessage : undefined,
         chatgptMode,

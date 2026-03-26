@@ -64,6 +64,14 @@ async function onStartup() {
     }
   })();
 
+  // [webchat] Register embedded relay server on Zotero's HTTP server
+  try {
+    const { registerWebChatRelay } = await import("./webchat/relayServer");
+    registerWebChatRelay();
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to register webchat relay", err);
+  }
+
   registerPrefsPane();
 
   await Promise.all(
@@ -112,6 +120,11 @@ function onShutdown(): void {
   ztoolkit.unregisterAll();
   addon.data.dialog?.window?.close();
   pauseBatchProcessing();
+  // [webchat] Unregister relay endpoints
+  try {
+    const { unregisterWebChatRelay } = require("./webchat/relayServer");
+    unregisterWebChatRelay();
+  } catch { /* ignore if module not loaded */ }
   shutdownAgentSubsystem();
   clearAllState();
   // Remove addon object
