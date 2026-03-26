@@ -16,6 +16,7 @@ const CHATGPT_URL = "https://chatgpt.com/";
 let pipelineRunning  = false;
 let activeChatTabId  = null;   // ChatGPT tab used for the current conversation
 let lastProcessedSeq = 0;      // prevents re-running the same query on SW restart
+let activePort       = null;   // current port connection to content script
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -57,6 +58,89 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Main poll loop (runs while SW is alive)
 setInterval(pollForQuery, 2000);
 
+// Poll for navigation commands from the Next.js server
+setInterval(pollForCommand, 2000);
+
+async function pollForCommand() {
+  if (pipelineRunning) return;
+  try {
+    const data = await fetch(`${SERVER}/poll_command`).then(r => r.json());
+    if (!data.command) return;
+
+    const cmd = data.command;
+    if (cmd.type === "NEW_CHAT") {
+      // Navigate the active ChatGPT tab to a fresh page
+      if (activeChatTabId !== null) {
+        try {
+          await chrome.tabs.update(activeChatTabId, { url: CHATGPT_URL });
+          await waitForTabLoad(activeChatTabId);
+        } catch (_) {
+          activeChatTabId = null;
+        }
+      }
+      activeChatTabId = null;
+      broadcastStatus("idle", "New chat — ready for next query");
+    } else if (cmd.type === "LOAD_CHAT" && cmd.chatUrl) {
+      // Navigate to a specific past chat URL
+      let tabId = null;
+      if (activeChatTabId !== null) {
+        try {
+          await chrome.tabs.update(activeChatTabId, { url: cmd.chatUrl });
+          await waitForTabLoad(activeChatTabId);
+          tabId = activeChatTabId;
+        } catch (_) {
+          activeChatTabId = null;
+        }
+      }
+      if (!tabId) {
+        const tab = await chrome.tabs.create({ url: cmd.chatUrl, active: false });
+        await waitForTabLoad(tab.id);
+        activeChatTabId = tab.id;
+        tabId = tab.id;
+      }
+      broadcastStatus("idle", "Loaded past chat — scraping messages…");
+
+      // Scrape all messages from the loaded conversation and post back to web host
+      try {
+        await ensureContentScript(tabId);
+        // Give the page extra time to render all messages
+        await new Promise(r => setTimeout(r, 2000));
+        const response = await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tabId, { type: "SCRAPE_MESSAGES" }, (res) => {
+            if (chrome.runtime.lastError) resolve({ ok: false, messages: [] });
+            else resolve(res || { ok: false, messages: [] });
+          });
+        });
+        if (response.ok && response.messages?.length > 0) {
+          await serverPost("/submit_scraped_messages", { messages: response.messages });
+        }
+      } catch (_) { /* scraping is best-effort */ }
+
+      broadcastStatus("idle", "Loaded past chat — ready for follow-up");
+    } else if (cmd.type === "DELETE_CHAT" && cmd.chatId) {
+      if (activeChatTabId !== null) {
+        chrome.tabs.sendMessage(activeChatTabId, { type: "DELETE_CHAT", chatId: cmd.chatId }, (response) => {
+          if (response && !response.success) {
+            broadcastStatus("error", `Failed to delete chat: ${response.error}`);
+          }
+        });
+      }
+    }
+  } catch (_) {
+    // Server not running — ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// History Mirroring Logic
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "HISTORY_UPDATE") {
+    // Forward the scraped history to the local Next.js server
+    serverPost("/update_chat_history", { sessions: message.history }).catch(() => {});
+  }
+});
 async function pollForQuery() {
   if (pipelineRunning) return;
 
@@ -118,9 +202,11 @@ async function runPipeline(query) {
 
     // ── Stream via port connection ─────────────────────────────────
     const { text: responseText, thinking: thinkingText } = await streamPipeline(tab.id, {
-      pdfBase64:   query.pdf_base64,
-      pdfFilename: query.pdf_filename,
-      prompt:      query.prompt,
+      pdfBase64:    query.pdf_base64,
+      pdfFilename:  query.pdf_filename,
+      prompt:       query.prompt,
+      images:       query.images || null,
+      chatgptMode:  query.chatgpt_mode || null,
       isFollowup,
       seq,
     });
@@ -131,6 +217,14 @@ async function runPipeline(query) {
       thinking: thinkingText ?? null,
       error:    null,
     });
+
+    // Capture the ChatGPT URL for history persistence
+    try {
+      const currentTab = await chrome.tabs.get(activeChatTabId);
+      if (currentTab.url && currentTab.url.startsWith("https://chatgpt.com/c/")) {
+        await serverPost("/update_chat_url", { chat_url: currentTab.url });
+      }
+    } catch (_) {}
 
     broadcastStatus("done", "Response sent to GUI");
 
@@ -201,11 +295,23 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // ---------------------------------------------------------------------------
 
 function streamPipeline(tabId, payload) {
-  return new Promise((resolve, reject) => {
+  const PIPELINE_TIMEOUT_MS = 180_000;
+
+  // Disconnect any stale port from a previous pipeline
+  if (activePort) {
+    try { activePort.disconnect(); } catch (_) {}
+    activePort = null;
+  }
+
+  const pipelinePromise = new Promise((resolve, reject) => {
     const port = chrome.tabs.connect(tabId, { name: "sync-zotero" });
+    activePort = port;
+    let resolved = false;
 
     port.onMessage.addListener(async (msg) => {
       if (msg.type === "partial") {
+        // Ignore partials from a stale seq (Bug 2 guard)
+        if (msg.seq !== undefined && msg.seq !== payload.seq) return;
         broadcastStatus("running", msg.thinking ? "Thinking…" : "Streaming response…");
         try {
           await serverPost("/update_partial", {
@@ -217,27 +323,39 @@ function streamPipeline(tabId, payload) {
       } else if (msg.type === "visibility") {
         if (!msg.visible) {
           broadcastStatus("running", "Chrome is hidden — waiting for full response…");
-          // Clear any partial so the GUI shows the waiting state cleanly
           try { await serverPost("/update_partial", { seq: payload.seq, text: null }); } catch (_) {}
         } else {
           broadcastStatus("running", "Streaming response…");
         }
       } else if (msg.type === "done") {
+        resolved = true;
+        if (activePort === port) activePort = null;
         port.disconnect();
         resolve({ text: msg.text, thinking: msg.thinking ?? null });
       } else if (msg.type === "error") {
+        resolved = true;
+        if (activePort === port) activePort = null;
         port.disconnect();
         reject(new Error(msg.error));
       }
     });
 
     port.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      if (err) reject(new Error("Port disconnected: " + err.message));
+      if (activePort === port) activePort = null;
+      if (!resolved) {
+        const err = chrome.runtime.lastError;
+        reject(new Error("Port disconnected unexpectedly" + (err ? ": " + err.message : "")));
+      }
     });
 
     port.postMessage({ type: "START", ...payload });
   });
+
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("Pipeline timed out after 180s")), PIPELINE_TIMEOUT_MS);
+  });
+
+  return Promise.race([pipelinePromise, timeoutPromise]);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,13 +408,21 @@ async function ensureContentScript(tabId) {
 
   if (alive) return;
 
-  // Content script not responsive — inject it
+  // Content script not responsive — inject both scripts
+  // 1. MAIN world script (fetch interceptor) — must run first
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files:  ["injected.js"],
+    world:  "MAIN",
+  });
+
+  // 2. ISOLATED world script (pipeline handler)
   await chrome.scripting.executeScript({
     target: { tabId },
     files:  ["content_script.js"],
   });
 
-  // Wait for it to initialise
+  // Wait for them to initialise
   await new Promise((resolve) => setTimeout(resolve, 1000));
 }
 
@@ -319,5 +445,46 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse(data.pipelineStatus || { state: "idle", message: "Ready" });
     });
     return true;
+  }
+
+  if (msg.type === "GET_FULL_STATUS") {
+    (async () => {
+      // Check web host
+      let webHostAlive = false;
+      try {
+        const res = await fetch(`${SERVER}/poll_response?since=0`);
+        webHostAlive = res.ok;
+      } catch { /* offline */ }
+
+      // Check ChatGPT tab — look for ANY open ChatGPT tab, not just activeChatTabId
+      let chatTabAlive = false;
+      let chatUrl = null;
+      try {
+        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        if (tabs.length > 0) {
+          chatTabAlive = true;
+          // Prefer the active pipeline tab, otherwise use the first found
+          const preferred = activeChatTabId !== null
+            ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
+            : tabs[0];
+          if (preferred.url && preferred.url.startsWith("https://chatgpt.com/c/")) {
+            chatUrl = preferred.url;
+          }
+        }
+      } catch { /* no tabs */ }
+
+      // Pipeline status
+      const stored = await chrome.storage.session.get("pipelineStatus");
+      const ps = stored.pipelineStatus || { state: "idle", message: "Ready" };
+
+      sendResponse({
+        webHostAlive,
+        chatTabAlive,
+        chatUrl,
+        pipelineState: ps.state,
+        pipelineMessage: ps.message,
+      });
+    })();
+    return true; // async sendResponse
   }
 });

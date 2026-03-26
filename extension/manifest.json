@@ -20,6 +20,12 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
+      "js": ["injected.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
       "js": ["content_script.js"],
       "run_at": "document_idle"
     }

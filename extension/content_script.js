@@ -8,6 +8,8 @@
  *   4. Wait for the response to finish streaming
  *   5. Extract the response as markdown text
  *   6. Return it to the background script
+ *
+ * Also continuously scrapes the sidebar history and handles DELETE_CHAT commands.
  */
 
 // ---------------------------------------------------------------------------
@@ -55,7 +57,46 @@ function setNativeValue(el, value) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Attach PDF
+// Step 1a: Attach images (screenshots) to ChatGPT
+// ---------------------------------------------------------------------------
+
+async function attachImages(imageDataUrls) {
+  if (!imageDataUrls || !imageDataUrls.length) return;
+
+  for (const dataUrl of imageDataUrls) {
+    // Convert data URL to File
+    const [header, base64] = dataUrl.split(",");
+    const mimeMatch = header.match(/data:(.*?);/);
+    const mime = mimeMatch ? mimeMatch[1] : "image/png";
+    const ext = mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : "png";
+
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const file = new File([bytes], `screenshot.${ext}`, { type: mime });
+
+    const dt = new DataTransfer();
+    dt.items.add(file);
+
+    const dropTarget =
+      document.querySelector("#prompt-textarea") ||
+      document.querySelector("[data-testid='text-input']") ||
+      document.querySelector("form") ||
+      document.body;
+
+    dropTarget.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    await sleep(100);
+    dropTarget.dispatchEvent(new DragEvent("dragover",  { bubbles: true, cancelable: true, dataTransfer: dt }));
+    await sleep(100);
+    dropTarget.dispatchEvent(new DragEvent("drop",      { bubbles: true, cancelable: true, dataTransfer: dt }));
+
+    // Wait briefly for the upload to be accepted
+    await sleep(1000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 1b: Attach PDF
 // ---------------------------------------------------------------------------
 
 async function attachPDF(pdfBase64, pdfFilename) {
@@ -99,6 +140,156 @@ async function attachPDF(pdfBase64, pdfFilename) {
     fileInput.dispatchEvent(new Event("change", { bubbles: true }));
     await sleep(1500);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Step 1c: Select ChatGPT model / thinking mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Switch ChatGPT's model and thinking effort before sending a message.
+ *
+ * Supported modes:
+ *   "instant"           → Select "Instant" (fast, no thinking)
+ *   "thinking_standard"  → Select "Thinking" + "Standard" effort
+ *   "thinking_extended"  → Select "Thinking" + "Extended" effort
+ *
+ * Skips if mode is null/undefined (leave whatever the user already has).
+ */
+async function selectChatGPTMode(mode) {
+  if (!mode) return;
+
+  // --- Step 1: Open the model selector dropdown ---
+  // The model selector is typically a button containing the model name ("ChatGPT")
+  // near the top-left of the page, or inside the composer area.
+  const modelBtnSelectors = [
+    'button[data-testid="model-selector"]',
+    'button[aria-haspopup="menu"][class*="model"]',
+    // Fallback: look for a button containing "ChatGPT" or "GPT" text near top
+    ...Array.from(document.querySelectorAll('main button[aria-haspopup]'))
+      .filter(b => /chatgpt|gpt-|model/i.test(b.textContent + " " + (b.getAttribute("aria-label") || "")))
+      .map(() => null), // just for iteration, we'll handle below
+  ];
+
+  let modelBtn = null;
+  for (const sel of modelBtnSelectors) {
+    if (!sel) continue;
+    modelBtn = document.querySelector(sel);
+    if (modelBtn) break;
+  }
+
+  // Broader fallback: find button with "ChatGPT" text
+  if (!modelBtn) {
+    const buttons = document.querySelectorAll('button[aria-haspopup]');
+    for (const btn of buttons) {
+      if (/chatgpt/i.test(btn.textContent)) {
+        modelBtn = btn;
+        break;
+      }
+    }
+  }
+
+  if (!modelBtn) {
+    console.warn("[sync-zotero] Could not find ChatGPT model selector button");
+    return;
+  }
+
+  modelBtn.click();
+  await sleep(400);
+
+  // --- Step 2: Select the model type (Instant vs Thinking) ---
+  const wantThinking = mode.startsWith("thinking");
+  const targetLabel = wantThinking ? "thinking" : "instant";
+
+  // Find menu items in the dropdown
+  const menuItems = document.querySelectorAll(
+    '[role="menuitem"], [role="option"], [data-testid*="model-option"], [class*="menu"] button'
+  );
+
+  let targetItem = null;
+  for (const item of menuItems) {
+    const text = item.textContent.toLowerCase().trim();
+    if (text.includes(targetLabel)) {
+      targetItem = item;
+      break;
+    }
+  }
+
+  // Also try generic menu items
+  if (!targetItem) {
+    const allClickables = document.querySelectorAll('[role="dialog"] button, [role="menu"] button, [role="listbox"] [role="option"]');
+    for (const el of allClickables) {
+      if (el.textContent.toLowerCase().includes(targetLabel)) {
+        targetItem = el;
+        break;
+      }
+    }
+  }
+
+  if (targetItem) {
+    targetItem.click();
+    await sleep(400);
+  } else {
+    console.warn(`[sync-zotero] Could not find "${targetLabel}" option in model menu`);
+    // Close menu by pressing Escape
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(200);
+    return;
+  }
+
+  // --- Step 3: If thinking mode, set the effort level ---
+  if (wantThinking) {
+    const effort = mode === "thinking_extended" ? "extended" : "standard";
+
+    // The thinking effort selector may appear as a pill/chip near the composer
+    // ("Extended thinking ▾") or as part of the model menu
+    await sleep(300);
+
+    // Look for the thinking effort dropdown/chip
+    const effortSelectors = [
+      'button[aria-label*="thinking"]',
+      'button[class*="thinking"]',
+      '[data-testid*="thinking"]',
+    ];
+
+    let effortBtn = null;
+    for (const sel of effortSelectors) {
+      effortBtn = document.querySelector(sel);
+      if (effortBtn) break;
+    }
+
+    // Fallback: find button containing "thinking" text near the composer
+    if (!effortBtn) {
+      const composerArea = document.querySelector('form') || document.querySelector('[class*="composer"]') || document.body;
+      const btns = composerArea.querySelectorAll('button');
+      for (const btn of btns) {
+        if (/thinking/i.test(btn.textContent) && btn.textContent.length < 50) {
+          effortBtn = btn;
+          break;
+        }
+      }
+    }
+
+    if (effortBtn) {
+      effortBtn.click();
+      await sleep(300);
+
+      // Select the effort level from the sub-menu
+      const effortItems = document.querySelectorAll(
+        '[role="menuitem"], [role="option"], [role="dialog"] button, [role="menu"] button'
+      );
+      for (const item of effortItems) {
+        if (item.textContent.toLowerCase().includes(effort)) {
+          item.click();
+          await sleep(200);
+          break;
+        }
+      }
+    }
+  }
+
+  // Close any remaining open menus
+  await sleep(200);
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +339,8 @@ async function submitMessage() {
   // Wait for the send button to exist AND not be disabled
   // (ChatGPT disables it while the uploaded file is being processed)
   let sendBtn = null;
-  for (let i = 0; i < 30; i++) {
+  // Wait up to 120 seconds — PDF uploads to ChatGPT can take a while
+  for (let i = 0; i < 240; i++) {
     const btn = findSendButton();
     if (btn && !btn.disabled && !btn.hasAttribute("disabled")) {
       sendBtn = btn;
@@ -162,6 +354,22 @@ async function submitMessage() {
   sendBtn.click();
   await sleep(500);
 }
+
+// ---------------------------------------------------------------------------
+// SSE interception listener (receives data from injected.js in MAIN world)
+// ---------------------------------------------------------------------------
+
+let sseText = "";
+let sseThinking = null;
+let sseDone = false;
+
+window.addEventListener("message", (event) => {
+  if (event.source !== window) return;
+  if (event.data?.type !== "SYNC_ZOTERO_SSE") return;
+  sseText = event.data.text || "";
+  sseThinking = event.data.thinking || null;
+  sseDone = event.data.done || false;
+});
 
 // ---------------------------------------------------------------------------
 // Step 4: Stream response — emit partials every 500ms, resolve when done
@@ -183,34 +391,108 @@ function workerSleep(ms) {
   });
 }
 
-async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000) {
-  const STOP_SELECTOR = '[data-testid="stop-button"]';
+const STOP_SELECTORS = [
+  '[data-testid="stop-button"]',
+  'button[aria-label="Stop generating"]',
+  'button[aria-label="Stop"]',
+];
 
-  // Wait up to 15s for streaming to START
+function findStopButton() {
+  for (const sel of STOP_SELECTORS) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
+  return null;
+}
+
+async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000) {
+  // Reset SSE state for this new response
+  sseText = "";
+  sseThinking = null;
+  sseDone = false;
+
+  // Snapshot: count existing assistant messages BEFORE the new response arrives.
+  const baselineCount = document.querySelectorAll(
+    "[data-message-author-role='assistant']"
+  ).length;
+
+  // --- Phase 1: Wait for streaming to START ---
+  // Signals: stop button appears, SSE data arrives, or new assistant DOM message
   const startDeadline = Date.now() + 15000;
+  let streamStarted = false;
   while (Date.now() < startDeadline) {
-    if (document.querySelector(STOP_SELECTOR)) break;
+    if (findStopButton()) { streamStarted = true; break; }
+    if (sseText.length > 0) { streamStarted = true; break; }
+    // DOM fallback: new assistant message appeared with content
+    const currentCount = document.querySelectorAll(
+      "[data-message-author-role='assistant']"
+    ).length;
+    if (currentCount > baselineCount) {
+      const text = extractResponseAfter(baselineCount);
+      if (text && text.length > 0) { streamStarted = true; break; }
+    }
     await workerSleep(300);
   }
 
-  // Stream partials while ChatGPT is generating
+  // --- Phase 2: Stream partials while ChatGPT is generating ---
   const endDeadline = Date.now() + timeoutMs;
-  while (Date.now() < endDeadline) {
-    if (!document.querySelector(STOP_SELECTOR)) break;
+  let lastSentText = "";
+  let stableChecks = 0;
+  const STABLE_WITH_BUTTON_GONE = 2;   // 2 × 500ms = 1s
+  const STABLE_WITHOUT_BUTTON   = 6;   // 6 × 500ms = 3s
 
+  while (Date.now() < endDeadline) {
+    const stopBtn = findStopButton();
+
+    // --- Get text: prefer SSE (network-level), fall back to DOM ---
+    // SSE works even when tab is hidden!
+    let text = sseText;
+    let thinking = sseThinking;
+
+    if (!text && !document.hidden) {
+      // DOM fallback only when SSE not providing data
+      text = extractResponseAfter(baselineCount);
+      if (!thinking) thinking = extractThinking();
+    }
+
+    // Emit partial if text changed
+    if (text && text !== lastSentText) {
+      onPartial(text, thinking);
+      lastSentText = text;
+      stableChecks = 0;
+    } else if (text && !stopBtn) {
+      stableChecks++;
+    }
+
+    // Reset stability while stop button is showing (still generating)
+    if (stopBtn) stableChecks = 0;
+
+    // Visibility notification
     if (document.hidden) {
       onVisibilityChange(false);
     } else {
       onVisibilityChange(true);
-      const text     = extractResponse();
-      const thinking = extractThinking();
-      if (text || thinking) onPartial(text, thinking);
     }
+
+    // --- Completion detection ---
+    // Primary: SSE stream sent [DONE] — emit final text before breaking
+    if (sseDone) {
+      // Ensure we emit the very last SSE text (it may have arrived with the done flag)
+      if (sseText && sseText !== lastSentText) {
+        onPartial(sseText, sseThinking);
+        lastSentText = sseText;
+      }
+      if (lastSentText.length > 0) break;
+    }
+    // Secondary: stop button gone + content stable for 1s
+    if (streamStarted && !stopBtn && stableChecks >= STABLE_WITH_BUTTON_GONE && lastSentText.length > 0) break;
+    // Tertiary: no stop button + content stable for 3s
+    if (!stopBtn && stableChecks >= STABLE_WITHOUT_BUTTON && lastSentText.length > 0) break;
 
     await workerSleep(500);
   }
 
-  // Final settle — always wait for DOM to flush after stop button disappears
+  // Final settle — wait for DOM to flush
   await workerSleep(1000);
 }
 
@@ -218,25 +500,48 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000)
 // Step 5: Extract response as markdown
 // ---------------------------------------------------------------------------
 
-function extractResponse() {
-  // Try selectors from most to least specific, covering both
-  // the final rendered state and the in-progress streaming state.
-  const selectors = [
-    "[data-message-author-role='assistant'] .markdown",
-    "[data-testid^='conversation-turn'] .markdown",
-    "[data-message-author-role='assistant'] .prose",
-    "[data-message-author-role='assistant'] [class*='prose']",
-    ".markdown",
-    // During streaming, ChatGPT may only have a plain text container
-    "[data-message-author-role='assistant'] p",
+/**
+ * Extract the response from the newest assistant message only.
+ * @param {number} baselineCount — number of assistant messages that existed
+ *   BEFORE the current query was submitted. Only messages after this count
+ *   are considered, preventing old responses from leaking into follow-ups.
+ */
+function extractResponseAfter(baselineCount = 0) {
+  // Try multiple selectors for assistant message containers (ChatGPT changes these)
+  const MSG_SELECTORS = [
     "[data-message-author-role='assistant']",
+    "article[data-testid*='assistant']",
+    "[class*='agent-turn']",
+    "div[data-message-id]",
   ];
 
-  for (const sel of selectors) {
+  let assistantMessages = [];
+  for (const sel of MSG_SELECTORS) {
     const nodes = document.querySelectorAll(sel);
-    if (nodes.length > 0) {
-      const el = nodes[nodes.length - 1];
-      // Skip if the element only contains the cursor/spinner
+    if (nodes.length > baselineCount) {
+      assistantMessages = nodes;
+      break;
+    }
+  }
+
+  if (assistantMessages.length <= baselineCount) return "";
+
+  const latestAssistant = assistantMessages[assistantMessages.length - 1];
+
+  // Try multiple content selectors within the message (resilient to UI changes)
+  const contentSelectors = [
+    ".markdown",
+    "[class*='markdown']",
+    ".prose",
+    "[class*='prose']",
+    "article",
+    ".text-message",
+    "div[data-message-content]",
+    "p",
+  ];
+  for (const sel of contentSelectors) {
+    const el = latestAssistant.querySelector(sel);
+    if (el) {
       const text = el.textContent.trim();
       if (text && text.length > 1) {
         return htmlToMarkdown(el.innerHTML);
@@ -244,7 +549,16 @@ function extractResponse() {
     }
   }
 
+  // Ultimate fallback: use innerText on the entire container
+  const text = latestAssistant.innerText?.trim() || latestAssistant.textContent?.trim();
+  if (text && text.length > 1) return text;
+
   return "";
+}
+
+/** Extract the last assistant response (used for final extraction after streaming). */
+function extractResponse() {
+  return extractResponseAfter(0);
 }
 
 function extractThinking() {
@@ -358,6 +672,78 @@ function htmlToMarkdown(html) {
 }
 
 // ---------------------------------------------------------------------------
+// Scrape all messages from the current ChatGPT conversation page
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract all user and assistant messages from the current ChatGPT page.
+ * Returns them in chronological order as { role, text } objects.
+ */
+async function scrapeAllMessages() {
+  // Wait a moment for the page to fully render
+  await sleep(1000);
+
+  const messages = [];
+
+  // Try multiple selectors for message containers
+  const MSG_SELECTORS = [
+    "[data-message-author-role]",
+    "article[data-testid]",
+    "div[data-message-id]",
+  ];
+
+  let msgElements = [];
+  for (const sel of MSG_SELECTORS) {
+    msgElements = Array.from(document.querySelectorAll(sel));
+    if (msgElements.length > 0) break;
+  }
+
+  for (const el of msgElements) {
+    const role = el.getAttribute("data-message-author-role") || "";
+
+    // Skip system/tool messages
+    if (role !== "user" && role !== "assistant") continue;
+
+    // Extract text content
+    let text = "";
+    if (role === "assistant") {
+      // Try structured content selectors
+      const CONTENT_SELECTORS = [
+        ".markdown",
+        "[class*='markdown']",
+        ".prose",
+        "[class*='prose']",
+        "article",
+        "p",
+      ];
+      for (const sel of CONTENT_SELECTORS) {
+        const contentEl = el.querySelector(sel);
+        if (contentEl && contentEl.textContent.trim().length > 1) {
+          text = htmlToMarkdown(contentEl.innerHTML);
+          break;
+        }
+      }
+      // Fallback
+      if (!text) {
+        text = el.innerText?.trim() || el.textContent?.trim() || "";
+      }
+    } else {
+      // User messages: just get text content
+      text = el.innerText?.trim() || el.textContent?.trim() || "";
+    }
+
+    if (text) {
+      messages.push({
+        role: role === "assistant" ? "bot" : "user",
+        text,
+      });
+    }
+  }
+
+  return messages;
+}
+
+// ---------------------------------------------------------------------------
 // Main message listener
 // ---------------------------------------------------------------------------
 
@@ -366,7 +752,16 @@ function htmlToMarkdown(html) {
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "PING") { sendResponse({ pong: true }); }
+  if (msg.type === "PING") { sendResponse({ pong: true }); return false; }
+
+  // [webchat] Scrape all messages from the current ChatGPT conversation
+  if (msg.type === "SCRAPE_MESSAGES") {
+    scrapeAllMessages()
+      .then((messages) => sendResponse({ ok: true, messages }))
+      .catch((err) => sendResponse({ ok: false, error: err.message, messages: [] }));
+    return true; // async sendResponse
+  }
+
   return false;
 });
 
@@ -374,34 +769,158 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Port-based pipeline handler (streaming)
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "sync-zotero") return;
+// Guard: only register the port listener once per execution context.
+// If the content script is re-injected, the old context's listener is orphaned
+// and cannot receive new connections, but this prevents same-context duplication.
+let _syncZoteroPort = null;
 
-  port.onMessage.addListener(async (msg) => {
-    if (msg.type !== "START") return;
+if (!window.__syncZoteroListenerRegistered) {
+  window.__syncZoteroListenerRegistered = true;
 
-    try {
-      if (!msg.isFollowup) {
-        await attachPDF(msg.pdfBase64, msg.pdfFilename);
-      }
-      await typePrompt(msg.prompt);
-      await submitMessage();
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "sync-zotero") return;
 
-      await streamResponse(
-        (partialText, thinkingText) => {
-          try { port.postMessage({ type: "partial", text: partialText, thinking: thinkingText ?? null }); } catch (_) {}
-        },
-        (isVisible) => {
-          try { port.postMessage({ type: "visibility", visible: isVisible }); } catch (_) {}
-        }
-      );
-
-      const finalText    = extractResponse();
-      const finalThinking = extractThinking();
-      port.postMessage({ type: "done", text: finalText, thinking: finalThinking ?? null });
-
-    } catch (err) {
-      try { port.postMessage({ type: "error", error: err.message }); } catch (_) {}
+    // Disconnect any previous port to prevent parallel pipelines
+    if (_syncZoteroPort) {
+      try { _syncZoteroPort.disconnect(); } catch (_) {}
     }
+    _syncZoteroPort = port;
+
+    port.onDisconnect.addListener(() => {
+      if (_syncZoteroPort === port) _syncZoteroPort = null;
+    });
+
+    port.onMessage.addListener(async (msg) => {
+      if (msg.type !== "START") return;
+
+      const seq = msg.seq; // track seq for end-to-end validation
+
+      try {
+        // Snapshot existing assistant messages before we start, so we only
+        // extract the NEW response (not previous ones in a follow-up).
+        const baselineCount = document.querySelectorAll(
+          "[data-message-author-role='assistant']"
+        ).length;
+
+        if (!msg.isFollowup) {
+          await attachPDF(msg.pdfBase64, msg.pdfFilename);
+        }
+        if (msg.images && msg.images.length > 0) {
+          console.log(`[sync-zotero] Attaching ${msg.images.length} image(s)…`);
+          try {
+            await attachImages(msg.images);
+          } catch (imgErr) {
+            console.warn("[sync-zotero] Image attachment failed:", imgErr);
+          }
+        }
+        // Switch ChatGPT model/thinking mode if requested
+        if (msg.chatgptMode) {
+          await selectChatGPTMode(msg.chatgptMode);
+        }
+        await typePrompt(msg.prompt);
+        await submitMessage();
+
+        await streamResponse(
+          (partialText, thinkingText) => {
+            try { port.postMessage({ type: "partial", seq, text: partialText, thinking: thinkingText ?? null }); } catch (_) {}
+          },
+          (isVisible) => {
+            try { port.postMessage({ type: "visibility", visible: isVisible }); } catch (_) {}
+          }
+        );
+
+        // Final response: prefer SSE text (most reliable), fall back to DOM
+        const finalText = sseText || extractResponseAfter(baselineCount);
+        const finalThinking = sseThinking || extractThinking();
+        port.postMessage({ type: "done", seq, text: finalText, thinking: finalThinking ?? null });
+
+      } catch (err) {
+        try { port.postMessage({ type: "error", seq, error: err.message }); } catch (_) {}
+      }
+    });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: History Mirroring & Deletion
+// ---------------------------------------------------------------------------
+
+let lastHistoryJson = "";
+
+async function scrapeHistory() {
+  const items = Array.from(document.querySelectorAll('nav a[href^="/c/"]'));
+  const history = items.map(a => {
+    const href = a.getAttribute('href');
+    const chatId = href.replace('/c/', '');
+    // The title is usually in a nested div, but textContent works well enough
+    // to get the visible text, stripped of extra whitespace.
+    const title = a.textContent.trim();
+    return { id: chatId, title, chatUrl: `https://chatgpt.com${href}` };
+  });
+
+  const historyJson = JSON.stringify(history);
+  if (historyJson !== lastHistoryJson && history.length > 0) {
+    lastHistoryJson = historyJson;
+    chrome.runtime.sendMessage({ type: "HISTORY_UPDATE", history }, () => {
+      // Suppress "Receiving end does not exist" when service worker is inactive
+      void chrome.runtime.lastError;
+    });
+  }
+}
+
+// Scrape every 2 seconds
+setInterval(scrapeHistory, 2000);
+
+async function handleDeleteChat(chatId) {
+  // Find the exact link in the sidebar
+  const chatLink = document.querySelector(`nav a[href="/c/${chatId}"]`);
+  if (!chatLink) return { success: false, error: "Chat not found in sidebar" };
+
+  // Hover or focus to ensure the options button appears
+  chatLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+  await sleep(300);
+
+  // The options button is usually a sibling or child button with aria-haspopup="menu"
+  // Let's look for a button inside the link or immediately next to it.
+  const optionsBtn = chatLink.querySelector('button[aria-haspopup="menu"]') || 
+                     chatLink.parentElement.querySelector('button[aria-haspopup="menu"]');
+                     
+  if (!optionsBtn) return { success: false, error: "Options button not found" };
+  
+  optionsBtn.click();
+  await sleep(300);
+
+  // Radix menu opens at the end of the body
+  // Find the Delete menu item
+  const menuItems = Array.from(document.querySelectorAll('[role="menuitem"]'));
+  const deleteItem = menuItems.find(item => item.textContent.toLowerCase().includes('delete'));
+  
+  if (!deleteItem) return { success: false, error: "Delete menu item not found" };
+  
+  deleteItem.click();
+  await sleep(500);
+
+  // Find the red confirmation button in the modal
+  const modalButtons = Array.from(document.querySelectorAll('[role="dialog"] button'));
+  // Usually the destructive action button has specific styling, or it's the last button containing "Delete"
+  const confirmBtn = modalButtons.find(btn => btn.textContent.toLowerCase().includes('delete'));
+  
+  if (!confirmBtn) return { success: false, error: "Confirmation button not found" };
+  
+  confirmBtn.click();
+  await sleep(1000); // Wait for deletion to process
+
+  // Scrape history immediately to reflect deletion
+  scrapeHistory();
+  return { success: true };
+}
+
+// Message listener for the DELETE command
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "DELETE_CHAT") {
+    handleDeleteChat(request.chatId)
+      .then(res => sendResponse(res))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true; // Keep message channel open for async response
+  }
 });

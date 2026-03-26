@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">
+  <!-- Globe outer ring -->
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 1.5a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11z"/>
+  <!-- Equator stripe -->
+  <rect x="1" y="7.25" width="14" height="1.5" rx=".75"/>
+  <!-- Central longitude ellipse outline -->
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M8 2.5c-1.38 0-2.5 2.463-2.5 5.5s1.12 5.5 2.5 5.5 2.5-2.463 2.5-5.5S9.38 2.5 8 2.5zm0 1.5c.55 0 1 1.567 1 4s-.45 4-1 4-1-1.567-1-4 .45-4 1-4z"/>
+</svg>
