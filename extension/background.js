@@ -131,11 +131,10 @@ async function pollForCommand() {
         try {
           await chrome.tabs.update(tabId, { url: CHATGPT_URL });
           await waitForTabLoad(tabId);
-          activeChatTabId = tabId;
-        } catch (_) {
-          activeChatTabId = null;
-        }
+        } catch (_) {}
       }
+      // Reset so next message is treated as a new conversation (not follow-up)
+      activeChatTabId = null;
       broadcastStatus("idle", "New chat — ready for next query");
     } else if (cmd.type === "LOAD_CHAT" && cmd.chatUrl) {
       // Navigate to a specific past chat URL
@@ -281,31 +280,46 @@ async function pollForQuery() {
 async function runPipeline(query) {
   pipelineRunning  = true;
   const seq        = query.seq;
-  const isFollowup = !query.pdf_base64;
+  // Follow-up = we have an active conversation tab to continue.
+  // PDF attachment is independent — user can send PDF mid-conversation.
+  const isFollowup = activeChatTabId !== null;
 
   broadcastStatus("running", isFollowup
-    ? "Sending follow-up to ChatGPT…"
-    : `Attaching PDF: ${query.pdf_filename}…`
+    ? (query.pdf_base64 ? `Attaching PDF to conversation…` : "Sending follow-up to ChatGPT…")
+    : (query.pdf_base64 ? `Attaching PDF: ${query.pdf_filename}…` : "Sending to ChatGPT…")
   );
 
   try {
     // ── Get the right ChatGPT tab ──────────────────────────────────
     let tab;
 
-    if (isFollowup && activeChatTabId !== null) {
+    // First, process any pending NEW_CHAT command immediately (don't wait for poll)
+    // This handles the race where "+" was clicked but pollForCommand hasn't run yet
+    if (isFollowup) {
       try {
         tab = await chrome.tabs.get(activeChatTabId);
         if (!tab.url || !tab.url.startsWith("https://chatgpt.com")) {
           throw new Error("Tab navigated away from ChatGPT");
         }
-        // No focus change — stay in background
       } catch (_) {
-        await submitError(seq, "ChatGPT tab was closed. Please start a new conversation by selecting a new PDF in the GUI.");
-        return;
+        activeChatTabId = null;
+        tab = await getChatGPTTab();
+        activeChatTabId = tab.id;
       }
-    } else {
+    }
+
+    if (!isFollowup || !tab) {
       tab = await getChatGPTTab();
       activeChatTabId = tab.id;
+    }
+
+    // If the tab shows an old conversation and we're sending a PDF (new context),
+    // navigate to a fresh chat page first
+    if (query.pdf_base64 && tab.url && tab.url.includes("/c/")) {
+      try {
+        await chrome.tabs.update(tab.id, { url: CHATGPT_URL });
+        await waitForTabLoad(tab.id);
+      } catch (_) {}
     }
 
     // ── Ensure content script is ready ────────────────────────────
@@ -316,8 +330,8 @@ async function runPipeline(query) {
 
     // ── Stream via port connection ─────────────────────────────────
     const { text: responseText, thinking: thinkingText } = await streamPipeline(tab.id, {
-      pdfBase64:    query.pdf_base64,
-      pdfFilename:  query.pdf_filename,
+      pdfBase64:    query.pdf_base64 || null,
+      pdfFilename:  query.pdf_base64 ? (query.pdf_filename || "document.pdf") : null,
       prompt:       query.prompt,
       images:       query.images || null,
       chatgptMode:  query.chatgpt_mode || null,
@@ -441,6 +455,9 @@ function streamPipeline(tabId, payload) {
         } else {
           broadcastStatus("running", "Streaming response…");
         }
+      } else if (msg.type === "mode_report") {
+        // Forward ChatGPT's actual mode back to the plugin relay
+        serverPost("/update_mode", { seq: payload.seq, mode: msg.mode }).catch(() => {});
       } else if (msg.type === "done") {
         resolved = true;
         if (activePort === port) activePort = null;
@@ -513,6 +530,17 @@ async function ensureTabReady(tabId) {
 }
 
 async function ensureContentScript(tabId) {
+  // Always inject the MAIN world script (SSE interceptor).
+  // It has its own __syncZoteroFetchPatched guard to avoid double-patching,
+  // but after full page reloads the guard resets and re-injection is needed.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files:  ["injected.js"],
+      world:  "MAIN",
+    });
+  } catch (_) {}
+
   // Try pinging the content script
   const alive = await new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
@@ -522,21 +550,13 @@ async function ensureContentScript(tabId) {
 
   if (alive) return;
 
-  // Content script not responsive — inject both scripts
-  // 1. MAIN world script (fetch interceptor) — must run first
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files:  ["injected.js"],
-    world:  "MAIN",
-  });
-
-  // 2. ISOLATED world script (pipeline handler)
+  // Content script not responsive — inject it
   await chrome.scripting.executeScript({
     target: { tabId },
     files:  ["content_script.js"],
   });
 
-  // Wait for them to initialise
+  // Wait for it to initialise
   await new Promise((resolve) => setTimeout(resolve, 1000));
 }
 

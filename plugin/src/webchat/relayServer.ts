@@ -66,6 +66,8 @@ interface RelayState {
   }>;
   activeSessionId: string | null;
   pendingCommand: PendingCommand | null;
+  /** [webchat] Actual ChatGPT mode reported back by the extension. */
+  reported_mode: string | null;
 }
 
 // Use Zotero object as shared namespace — guaranteed same across all contexts
@@ -97,6 +99,7 @@ if (!Z._webchatRelay) {
       responses: [],
       activeSessionId: null,
       pendingCommand: null,
+      reported_mode: null,
     },
     mirroredHistory: [],
     scrapedMessages: null,
@@ -123,6 +126,7 @@ function getScrapedMessages(): Array<{ role: string; text: string }> | null { re
 function setScrapedMessages(m: Array<{ role: string; text: string }> | null) { _store().scrapedMessages = m; }
 
 function resetState() {
+  const prevSeq = S().query.seq; // preserve seq counter so background.js doesn't skip new queries
   S().status = "idle";
   S().query = {
     prompt: null,
@@ -130,7 +134,7 @@ function resetState() {
     pdf_filename: null,
     images: null,
     chatgpt_mode: null,
-    seq: 0,
+    seq: prevSeq,
   };
   S().active_seq = 0;
   S().running_since = 0;
@@ -139,6 +143,7 @@ function resetState() {
   S().responses = [];
   S().activeSessionId = null;
   S().pendingCommand = null;
+  S().reported_mode = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +366,14 @@ const UpdateChatUrlEndpoint = createEndpoint(["POST"], () => {
   return jsonReply({ ok: true });
 });
 
+// POST /update_mode — extension reports ChatGPT's actual thinking mode
+const UpdateModeEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+  const mode = body.mode as string | undefined;
+  if (mode) S().reported_mode = mode;
+  return jsonReply({ ok: true });
+});
+
 // POST /load_chat
 const LoadChatEndpoint = createEndpoint(["POST"], (opts) => {
   const body = parseBody(opts.data);
@@ -399,6 +412,7 @@ const ENDPOINTS: Record<string, ReturnType<typeof createEndpoint>> = {
   [`${PREFIX}/chat_history`]: ChatHistoryEndpoint,
   [`${PREFIX}/update_chat_history`]: UpdateChatHistoryEndpoint,
   [`${PREFIX}/update_chat_url`]: UpdateChatUrlEndpoint,
+  [`${PREFIX}/update_mode`]: UpdateModeEndpoint,
   [`${PREFIX}/load_chat`]: LoadChatEndpoint,
 };
 
@@ -496,6 +510,11 @@ export function relayLoadChat(sessionId: string): {
 /** Get mirrored chat history directly (no HTTP). */
 export function relayGetChatHistory(): Array<{ id: string; title: string; chatUrl: string | null }> {
   return getMirroredHistory().map((s) => ({ id: s.id, title: s.title, chatUrl: s.chatUrl }));
+}
+
+/** Get the reported ChatGPT mode (set by extension via /update_mode). */
+export function relayGetReportedMode(): string | null {
+  return S().reported_mode;
 }
 
 /** Get and clear scraped messages directly (no HTTP). */

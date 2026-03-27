@@ -53,6 +53,11 @@ type SendFlowControllerDeps = {
     item: Zotero.Item,
     paperContexts: PaperContextRef[],
   ) => PaperContextRef[];
+  /** [webchat] Check if any paper has PDF content source AND full-text send mode (purple chip). */
+  hasActivePdfFullTextPapers: (
+    item: Zotero.Item,
+    paperContexts: PaperContextRef[],
+  ) => boolean;
   resolvePdfPaperAttachments: (
     paperContexts: PaperContextRef[],
   ) => Promise<ChatAttachment[]>;
@@ -117,7 +122,7 @@ type SendFlowControllerDeps = {
   ) => Promise<void>;
   retainPinnedImageState: (itemId: number) => void;
   retainPaperState: (itemId: number) => void;
-  consumePaperModeState: (itemId: number) => void;
+  consumePaperModeState: (itemId: number, opts?: { webchatGreyOut?: boolean }) => void;
   retainPinnedFileState: (itemId: number) => void;
   retainPinnedTextState: (conversationKey: number) => void;
   updatePaperPreviewPreservingScroll: () => void;
@@ -162,7 +167,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
     const allSelectedPaperContexts = deps.getSelectedPaperContexts(item.id);
     // Agent mode always uses text/MinerU pipeline — it can fetch PDF pages on demand
     const isAgent = deps.isAgentMode();
-    const pdfModePaperContexts = isAgent
+    // [webchat] Skip standard PDF pipeline — webchat handles PDF via its own drag-and-drop mechanism
+    const earlySelectedProfile = deps.getSelectedProfile();
+    const isWebChatEarly = earlySelectedProfile?.providerProtocol === "web_sync";
+    const pdfModePaperContexts = (isAgent || isWebChatEarly)
       ? []
       : deps.getPdfModePaperContexts(item, allSelectedPaperContexts);
     // Papers in PDF mode are sent as file attachments, not through the text pipeline
@@ -304,6 +312,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
     }
 
     const selectedProfile = deps.getSelectedProfile();
+    const isWebChat = selectedProfile?.providerProtocol === "web_sync";
     const activeModelName = (
       selectedProfile?.model ||
       deps.getCurrentModelName() ||
@@ -378,7 +387,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.persistDraftInput();
       deps.retainPinnedImageState(item.id);
       if (hasPaperComposeState) {
-        deps.consumePaperModeState(item.id);
+        deps.consumePaperModeState(item.id, { webchatGreyOut: isWebChat });
         deps.retainPaperState(item.id);
         deps.updatePaperPreviewPreservingScroll();
       }
@@ -410,6 +419,14 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.updateSelectedTextPreviewPreservingScroll();
     }
 
+    // [webchat] Determine if PDF should be sent based on chip state.
+    // Purple chip (full-text mode) = send PDF; grey chip (retrieval) = skip.
+    // Note: fullTextPaperContexts excludes PDF-content-source papers by design,
+    // so we use hasActivePdfFullTextPapers which checks both content source AND send mode.
+    const webchatSendPdf = isWebChat
+      ? deps.hasActivePdfFullTextPapers(item, allSelectedPaperContexts)
+      : false;
+
     const sendTask = deps.sendQuestion({
       body: deps.body,
       item,
@@ -431,9 +448,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       runtimeMode,
       pdfModePaperKeys: pdfModeKeySet.size > 0 ? pdfModeKeySet : undefined,
       pdfUploadSystemMessages: pdfUploadSystemMessages.length ? pdfUploadSystemMessages : undefined,
+      webchatSendPdf,
     });
     if (hasPaperComposeState) {
-      deps.consumePaperModeState(item.id);
+      deps.consumePaperModeState(item.id, { webchatGreyOut: isWebChat });
       deps.retainPaperState(item.id);
       deps.updatePaperPreviewPreservingScroll();
     }

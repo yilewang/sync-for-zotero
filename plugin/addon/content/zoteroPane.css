@@ -3425,8 +3425,8 @@ label.llm-search-results-item:hover {
   background: var(--llm-mineru-bg);
 }
 
-/* PDF mode chip styling (amber) — same blueprint as full/mineru, only colors differ. */
-.llm-paper-context-chip.llm-paper-context-chip-pdf
+/* PDF mode chip styling (amber) — only when full-text mode; retrieval stays plain. */
+.llm-paper-context-chip.llm-paper-context-chip-full.llm-paper-context-chip-pdf
   .llm-paper-context-chip-header {
   border: 1px solid var(--llm-pdf-border-color);
   border-radius: 8px;
@@ -3434,7 +3434,7 @@ label.llm-search-results-item:hover {
   box-shadow: inset 0 0 0 1px var(--llm-pdf-border-color);
 }
 
-.llm-paper-context-chip.llm-paper-context-chip-pdf
+.llm-paper-context-chip.llm-paper-context-chip-full.llm-paper-context-chip-pdf
   .llm-paper-context-chip-expanded
   .llm-paper-chip-menu-row {
   border-color: var(--llm-pdf-border-color);

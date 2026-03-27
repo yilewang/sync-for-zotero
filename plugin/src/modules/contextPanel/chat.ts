@@ -1103,6 +1103,7 @@ function restoreRequestUIIdle(
     }
     if (freshUi.cancelBtn) freshUi.cancelBtn.style.display = "none";
   });
+  setHistoryControlsDisabled(body, false);
 }
 
 function createPanelUpdateHelpers(
@@ -2801,30 +2802,17 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
       // Note: `question` already includes selected text context via
       // buildQuestionWithSelectedTextContexts() — no need to prepend again.
 
-      // [webchat] Map reasoning selection to ChatGPT mode
-      // Dropdown stores: "none"→Instant, "medium"→Standard Thinking, "high"→Extended Thinking
-      const WEBCHAT_MODE_MAP: Record<string, string> = {
-        none: "instant",
-        low: "thinking_standard",
-        minimal: "thinking_standard",
-        medium: "thinking_standard",
-        high: "thinking_extended",
-        xhigh: "thinking_extended",
-      };
-      const reasoningLevel = effectiveRequestConfig.reasoning?.level;
-      const chatgptMode = reasoningLevel
-        ? WEBCHAT_MODE_MAP[reasoningLevel] || undefined
-        : undefined;
+      // [webchat] Mode switching disabled — users control thinking mode on chatgpt.com
+      const chatgptMode: string | undefined = undefined;
 
-      // historyForLLM was captured before the current user message was added,
-      // so if it has entries, this is a follow-up (no need to re-send PDF).
+      // [webchat] Send PDF only when the caller explicitly requests it via chip state.
       // Always use dynamic port for the embedded relay server
       const { getRelayBaseUrl } = await import("../../webchat/relayServer");
       const answer = await sendWebChatQuestion({
         item,
         question,
         host: getRelayBaseUrl(),
-        isFollowUp: historyForLLM.length > 0,
+        sendPdf: opts.webchatSendPdf === true,
         images: screenshotImagesForMessage.length > 0 ? screenshotImagesForMessage : undefined,
         chatgptMode,
         signal: currentAbortController?.signal,
@@ -2850,6 +2838,7 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
 
       assistantMessage.text = sanitizeText(answer) || assistantMessage.text || "No response.";
       assistantMessage.streaming = false;
+
       refreshChatSafely();
       await persistAssistantOnce();
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
@@ -3239,6 +3228,8 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
     ? latestRetryPair.userIndex + 1
     : -1;
   const conversationIsIdle = !history.some((m) => m.streaming);
+  // [webchat] Resolve provider protocol once for editability checks
+  const renderProviderProtocol = resolveEffectiveRequestConfig({ item }).providerProtocol;
   for (const [index, msg] of history.entries()) {
     const isUser = msg.role === "user";
     const assistantPairMsg = history[index + 1];
@@ -3248,6 +3239,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       hasItem: Boolean(item),
       conversationIsIdle,
       assistantPair: assistantPairMsg,
+      providerProtocol: renderProviderProtocol,
     });
     const isInlineEditBubble = Boolean(
       canEditUserPrompt &&

@@ -143,8 +143,12 @@ async function attachPDF(pdfBase64, pdfFilename) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1c: Select ChatGPT model / thinking mode
+// Step 1c: Detect and select ChatGPT model / thinking mode
 // ---------------------------------------------------------------------------
+
+// Track the last mode we successfully set, so we can skip the dropdown
+// when the mode hasn't changed (avoids disrupting the composer on follow-ups).
+let _lastSetChatGPTMode = null;
 
 /**
  * Switch ChatGPT's model and thinking effort before sending a message.
@@ -154,142 +158,148 @@ async function attachPDF(pdfBase64, pdfFilename) {
  *   "thinking_standard"  → Select "Thinking" + "Standard" effort
  *   "thinking_extended"  → Select "Thinking" + "Extended" effort
  *
+ * Skips if mode matches the last successfully set mode.
  * Skips if mode is null/undefined (leave whatever the user already has).
  */
 async function selectChatGPTMode(mode) {
   if (!mode) return;
-
-  // --- Step 1: Open the model selector dropdown ---
-  // The model selector is typically a button containing the model name ("ChatGPT")
-  // near the top-left of the page, or inside the composer area.
-  const modelBtnSelectors = [
-    'button[data-testid="model-selector"]',
-    'button[aria-haspopup="menu"][class*="model"]',
-    // Fallback: look for a button containing "ChatGPT" or "GPT" text near top
-    ...Array.from(document.querySelectorAll('main button[aria-haspopup]'))
-      .filter(b => /chatgpt|gpt-|model/i.test(b.textContent + " " + (b.getAttribute("aria-label") || "")))
-      .map(() => null), // just for iteration, we'll handle below
-  ];
-
-  let modelBtn = null;
-  for (const sel of modelBtnSelectors) {
-    if (!sel) continue;
-    modelBtn = document.querySelector(sel);
-    if (modelBtn) break;
-  }
-
-  // Broader fallback: find button with "ChatGPT" text
-  if (!modelBtn) {
-    const buttons = document.querySelectorAll('button[aria-haspopup]');
-    for (const btn of buttons) {
-      if (/chatgpt/i.test(btn.textContent)) {
-        modelBtn = btn;
-        break;
-      }
-    }
-  }
-
-  if (!modelBtn) {
-    console.warn("[sync-zotero] Could not find ChatGPT model selector button");
+  if (mode === _lastSetChatGPTMode) {
+    console.log(`[sync-zotero] Mode already ${mode} — skipping switch`);
     return;
   }
 
-  modelBtn.click();
-  await sleep(400);
-
-  // --- Step 2: Select the model type (Instant vs Thinking) ---
-  const wantThinking = mode.startsWith("thinking");
-  const targetLabel = wantThinking ? "thinking" : "instant";
-
-  // Find menu items in the dropdown
-  const menuItems = document.querySelectorAll(
-    '[role="menuitem"], [role="option"], [data-testid*="model-option"], [class*="menu"] button'
-  );
-
-  let targetItem = null;
-  for (const item of menuItems) {
-    const text = item.textContent.toLowerCase().trim();
-    if (text.includes(targetLabel)) {
-      targetItem = item;
-      break;
-    }
-  }
-
-  // Also try generic menu items
-  if (!targetItem) {
-    const allClickables = document.querySelectorAll('[role="dialog"] button, [role="menu"] button, [role="listbox"] [role="option"]');
-    for (const el of allClickables) {
-      if (el.textContent.toLowerCase().includes(targetLabel)) {
-        targetItem = el;
-        break;
-      }
-    }
-  }
-
-  if (targetItem) {
-    targetItem.click();
-    await sleep(400);
-  } else {
-    console.warn(`[sync-zotero] Could not find "${targetLabel}" option in model menu`);
-    // Close menu by pressing Escape
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    await sleep(200);
-    return;
-  }
-
-  // --- Step 3: If thinking mode, set the effort level ---
-  if (wantThinking) {
-    const effort = mode === "thinking_extended" ? "extended" : "standard";
-
-    // The thinking effort selector may appear as a pill/chip near the composer
-    // ("Extended thinking ▾") or as part of the model menu
-    await sleep(300);
-
-    // Look for the thinking effort dropdown/chip
-    const effortSelectors = [
-      'button[aria-label*="thinking"]',
-      'button[class*="thinking"]',
-      '[data-testid*="thinking"]',
+  try {
+    // --- Step 1: Open the model selector dropdown ---
+    const modelBtnSelectors = [
+      'button[data-testid="model-selector"]',
+      'button[aria-haspopup="menu"][class*="model"]',
     ];
 
-    let effortBtn = null;
-    for (const sel of effortSelectors) {
-      effortBtn = document.querySelector(sel);
-      if (effortBtn) break;
+    let modelBtn = null;
+    for (const sel of modelBtnSelectors) {
+      modelBtn = document.querySelector(sel);
+      if (modelBtn) break;
     }
 
-    // Fallback: find button containing "thinking" text near the composer
-    if (!effortBtn) {
-      const composerArea = document.querySelector('form') || document.querySelector('[class*="composer"]') || document.body;
-      const btns = composerArea.querySelectorAll('button');
-      for (const btn of btns) {
-        if (/thinking/i.test(btn.textContent) && btn.textContent.length < 50) {
-          effortBtn = btn;
+    // Broader fallback: find button with "ChatGPT" text
+    if (!modelBtn) {
+      const buttons = document.querySelectorAll('button[aria-haspopup]');
+      for (const btn of buttons) {
+        if (/chatgpt/i.test(btn.textContent)) {
+          modelBtn = btn;
           break;
         }
       }
     }
 
-    if (effortBtn) {
-      effortBtn.click();
+    if (!modelBtn) {
+      console.warn("[sync-zotero] Could not find ChatGPT model selector button — skipping mode switch");
+      return;
+    }
+
+    modelBtn.click();
+    await sleep(400);
+
+    // --- Step 2: Select the model type (Instant vs Thinking) ---
+    const wantThinking = mode.startsWith("thinking");
+    const targetLabel = wantThinking ? "thinking" : "instant";
+
+    // Find menu items in the dropdown
+    const menuItems = document.querySelectorAll(
+      '[role="menuitem"], [role="option"], [data-testid*="model-option"], [class*="menu"] button'
+    );
+
+    let targetItem = null;
+    for (const item of menuItems) {
+      const text = item.textContent.toLowerCase().trim();
+      if (text.includes(targetLabel)) {
+        targetItem = item;
+        break;
+      }
+    }
+
+    // Also try generic menu items
+    if (!targetItem) {
+      const allClickables = document.querySelectorAll('[role="dialog"] button, [role="menu"] button, [role="listbox"] [role="option"]');
+      for (const el of allClickables) {
+        if (el.textContent.toLowerCase().includes(targetLabel)) {
+          targetItem = el;
+          break;
+        }
+      }
+    }
+
+    if (targetItem) {
+      targetItem.click();
+      await sleep(400);
+    } else {
+      console.warn(`[sync-zotero] Could not find "${targetLabel}" option in model menu`);
+    }
+
+    // --- Step 3: If thinking mode, set the effort level ---
+    if (wantThinking && targetItem) {
+      const effort = mode === "thinking_extended" ? "extended" : "standard";
       await sleep(300);
 
-      // Select the effort level from the sub-menu
-      const effortItems = document.querySelectorAll(
-        '[role="menuitem"], [role="option"], [role="dialog"] button, [role="menu"] button'
-      );
-      for (const item of effortItems) {
-        if (item.textContent.toLowerCase().includes(effort)) {
-          item.click();
-          await sleep(200);
-          break;
+      // Look for the thinking effort dropdown/chip
+      const effortSelectors = [
+        'button[aria-label*="thinking"]',
+        'button[class*="thinking"]',
+        '[data-testid*="thinking"]',
+      ];
+
+      let effortBtn = null;
+      for (const sel of effortSelectors) {
+        effortBtn = document.querySelector(sel);
+        if (effortBtn) break;
+      }
+
+      // Fallback: find button containing "thinking" text near the composer
+      if (!effortBtn) {
+        const composerArea = document.querySelector('form') || document.querySelector('[class*="composer"]') || document.body;
+        const btns = composerArea.querySelectorAll('button');
+        for (const btn of btns) {
+          if (/thinking/i.test(btn.textContent) && btn.textContent.length < 50) {
+            effortBtn = btn;
+            break;
+          }
+        }
+      }
+
+      if (effortBtn) {
+        effortBtn.click();
+        await sleep(300);
+
+        const effortItems = document.querySelectorAll(
+          '[role="menuitem"], [role="option"], [role="dialog"] button, [role="menu"] button'
+        );
+        for (const item of effortItems) {
+          if (item.textContent.toLowerCase().includes(effort)) {
+            item.click();
+            await sleep(200);
+            break;
+          }
         }
       }
     }
+  } finally {
+    // Always close any remaining open menus/dropdowns to unblock the composer
+    await sleep(100);
+    const openMenus = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
+    for (const menu of openMenus) {
+      // Only close if it looks like a floating/overlay menu (not the main page)
+      if (menu.closest('[data-radix-popper-content-wrapper]') || menu.closest('[class*="popover"]')) {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await sleep(200);
+        break;
+      }
+    }
+    // Final Escape to be safe — clicking outside won't work if composer is covered
+    document.body.click();
+    await sleep(100);
   }
-
-  // Close any remaining open menus
-  await sleep(200);
+  // Record the mode we just set so we can skip next time if unchanged
+  _lastSetChatGPTMode = mode;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,16 +415,17 @@ function findStopButton() {
   return null;
 }
 
-async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000) {
+async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000, preSubmitBaseline = -1) {
   // Reset SSE state for this new response
   sseText = "";
   sseThinking = null;
   sseDone = false;
 
-  // Snapshot: count existing assistant messages BEFORE the new response arrives.
-  const baselineCount = document.querySelectorAll(
-    "[data-message-author-role='assistant']"
-  ).length;
+  // Use pre-submit baseline if provided (more accurate — counted before ChatGPT
+  // adds the response element to DOM). Fall back to counting now.
+  const baselineCount = preSubmitBaseline >= 0
+    ? preSubmitBaseline
+    : document.querySelectorAll("[data-message-author-role='assistant']").length;
 
   // --- Phase 1: Wait for streaming to START ---
   // Signals: stop button appears, SSE data arrives, or new assistant DOM message
@@ -488,6 +499,15 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000)
     if (streamStarted && !stopBtn && stableChecks >= STABLE_WITH_BUTTON_GONE && lastSentText.length > 0) break;
     // Tertiary: no stop button + content stable for 3s
     if (!stopBtn && stableChecks >= STABLE_WITHOUT_BUTTON && lastSentText.length > 0) break;
+    // Fallback: if no text found after 30s and no stop button, try extractResponse() (ignores baseline)
+    if (!stopBtn && !lastSentText && stableChecks >= 60) {
+      const fallbackText = extractResponse();
+      if (fallbackText) {
+        onPartial(fallbackText, extractThinking());
+        lastSentText = fallbackText;
+        break;
+      }
+    }
 
     await workerSleep(500);
   }
@@ -512,7 +532,6 @@ function extractResponseAfter(baselineCount = 0) {
     "[data-message-author-role='assistant']",
     "article[data-testid*='assistant']",
     "[class*='agent-turn']",
-    "div[data-message-id]",
   ];
 
   let assistantMessages = [];
@@ -788,6 +807,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   // [webchat] Navigate to a URL (forces full page reload for SPA)
   if (msg.type === "NAVIGATE") {
+    _lastSetChatGPTMode = null; // Reset mode tracking for new page
     window.location.href = msg.url;
     sendResponse({ ok: true });
     return false;
@@ -848,7 +868,8 @@ if (!window.__syncZoteroListenerRegistered) {
           "[data-message-author-role='assistant']"
         ).length;
 
-        if (!msg.isFollowup) {
+        // Attach PDF whenever provided — the plugin controls when to send via chip state
+        if (msg.pdfBase64) {
           await attachPDF(msg.pdfBase64, msg.pdfFilename);
         }
         if (msg.images && msg.images.length > 0) {
@@ -859,10 +880,7 @@ if (!window.__syncZoteroListenerRegistered) {
             console.warn("[sync-zotero] Image attachment failed:", imgErr);
           }
         }
-        // Switch ChatGPT model/thinking mode if requested
-        if (msg.chatgptMode) {
-          await selectChatGPTMode(msg.chatgptMode);
-        }
+        // Mode switching disabled — users control thinking mode directly on chatgpt.com
         await typePrompt(msg.prompt);
         await submitMessage();
 
@@ -872,11 +890,19 @@ if (!window.__syncZoteroListenerRegistered) {
           },
           (isVisible) => {
             try { port.postMessage({ type: "visibility", visible: isVisible }); } catch (_) {}
-          }
+          },
+          180000,
+          baselineCount  // pre-submit count for accurate DOM fallback
         );
 
-        // Final response: prefer SSE text (most reliable), fall back to DOM
-        const finalText = sseText || extractResponseAfter(baselineCount);
+        // Final response: try multiple extraction methods
+        let finalText = sseText || extractResponseAfter(baselineCount);
+        // If both SSE and baseline-aware extraction failed, try extracting the
+        // very last assistant message regardless of baseline (handles cases where
+        // the baseline count was wrong due to page state changes)
+        if (!finalText) {
+          finalText = extractResponse();
+        }
         const finalThinking = sseThinking || extractThinking();
         port.postMessage({ type: "done", seq, text: finalText, thinking: finalThinking ?? null });
 

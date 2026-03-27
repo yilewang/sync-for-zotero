@@ -15,6 +15,7 @@ import {
   relayLoadChat,
   relayGetChatHistory,
   relayGetScrapedMessages,
+  relayGetReportedMode,
   getRelayBaseUrl,
 } from "./relayServer";
 
@@ -261,6 +262,15 @@ export async function fetchScrapedMessages(
     await new Promise((r) => setTimeout(r, 1000));
   }
   return [];
+}
+
+// ---------------------------------------------------------------------------
+// Reported mode (direct state access)
+// ---------------------------------------------------------------------------
+
+/** Get the ChatGPT mode reported back by the extension. */
+export function getReportedMode(): string | null {
+  return relayGetReportedMode();
 }
 
 // ---------------------------------------------------------------------------

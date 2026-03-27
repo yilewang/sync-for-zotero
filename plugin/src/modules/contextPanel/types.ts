@@ -266,6 +266,8 @@ export type SendQuestionOptions = {
   pdfModePaperKeys?: Set<string>;
   /** System messages injected by provider-side PDF upload (Qwen fileid://, Kimi extracted text). */
   pdfUploadSystemMessages?: string[];
+  /** [webchat] When true, attach the paper PDF to the ChatGPT query. */
+  webchatSendPdf?: boolean;
 };
 
 export type EditRetryOptions = {

@@ -2,7 +2,7 @@
  * [webchat] Dedicated send pipeline for WebChat providers.
  *
  * Unlike the normal LLM pipeline, this:
- *   - Always auto-attaches the current paper's PDF (no context assembly)
+ *   - Attaches the current paper's PDF when `sendPdf` is true (controlled by chip state)
  *   - Sends only the raw question text (no system messages, no history)
  *   - Submits via the web host relay → Chrome extension → ChatGPT.com
  */
@@ -76,8 +76,8 @@ export type WebChatSendOptions = {
   item: Zotero.Item;
   question: string;
   host: string;
-  /** True if this is a follow-up in an existing conversation (skip PDF). */
-  isFollowUp?: boolean;
+  /** When true, attach the paper PDF to the ChatGPT query. */
+  sendPdf?: boolean;
   /** Screenshot images as base64 data URLs to attach to ChatGPT. */
   images?: string[];
   /** ChatGPT mode: "instant", "thinking_standard", or "thinking_extended". */
@@ -89,21 +89,23 @@ export type WebChatSendOptions = {
 
 /**
  * Send a question to ChatGPT via the web host relay.
- * On the first message, automatically attaches the current paper's PDF.
- * Follow-up messages send text only (ChatGPT already has the PDF).
+ * Attaches the current paper's PDF only when `sendPdf` is true.
+ * The caller determines whether to send PDF based on the paper chip state.
  *
  * Returns the final response text.
  */
 export async function sendWebChatQuestion(
   opts: WebChatSendOptions,
 ): Promise<string> {
-  const { item, question, host, isFollowUp, images, chatgptMode, signal, onDelta, onReasoning } = opts;
+  const { item, question, host, sendPdf, images, chatgptMode, signal, onDelta, onReasoning } = opts;
 
-  // --- Resolve and read the current paper's PDF (first message only) ---
+  ztoolkit.log(`[webchat] sendWebChatQuestion: sendPdf=${sendPdf}`);
+
+  // --- Resolve and read the current paper's PDF (only when explicitly requested) ---
   let pdfBase64: string | null = null;
   let pdfFilename: string | null = null;
 
-  if (!isFollowUp) {
+  if (sendPdf) {
     const pdf = await resolveItemPdfPath(item);
     if (pdf) {
       try {
