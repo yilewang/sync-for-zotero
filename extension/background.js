@@ -13,8 +13,11 @@ const CHATGPT_URL = "https://chatgpt.com/";
 async function discoverZoteroPort() {
   for (let port = 23119; port <= 23128; port++) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/poll_response`);
-      if (res.ok) {
+      const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/debug`);
+      if (!res.ok) continue;
+      const data = await res.json();
+      // Verify this is actually our relay, not Zotero returning generic text
+      if (data && typeof data.status === "string") {
         SERVER = `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
         console.log(`[sync-zotero] Found Zotero server on port ${port}`);
         return;
@@ -62,7 +65,11 @@ let activePort       = null;   // current port connection to content script
 
 async function serverGet(path) {
   const res  = await fetch(`${SERVER}${path}`);
-  const data = await res.json();
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch {
+    throw new Error(`Server returned non-JSON: ${text.slice(0, 100)}`);
+  }
   if (data.error) throw new Error(data.error);
   return data;
 }
@@ -73,7 +80,11 @@ async function serverPost(path, body) {
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify(body),
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch {
+    throw new Error(`Server returned non-JSON: ${text.slice(0, 100)}`);
+  }
   if (data.error) throw new Error(data.error);
   return data;
 }
