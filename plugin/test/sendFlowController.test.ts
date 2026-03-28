@@ -39,6 +39,9 @@ describe("sendFlowController", function () {
     let lastSentQuestion = "";
     let lastRuntimeMode = "";
     let lastEditRuntimeMode = "";
+    let lastWebchatForceNewChat = false;
+    let lastWebchatSendPdf = false;
+    let markWebchatPdfUploadedCalls = 0;
 
     const deps = {
       body: {} as Element,
@@ -49,6 +52,17 @@ describe("sendFlowController", function () {
       getSelectedTextContextEntries: () => selectedTextContexts,
       getSelectedPaperContexts: () => [selectedPaper],
       getFullTextPaperContexts: () => [selectedPaper],
+      getPdfModePaperContexts: () => [],
+      hasActivePdfFullTextPapers: () => false,
+      hasUploadedPdfInCurrentWebChatConversation: () => false,
+      markWebChatPdfUploadedForCurrentConversation: () => {
+        markWebchatPdfUploadedCalls += 1;
+      },
+      resolvePdfPaperAttachments: async () => [],
+      renderPdfPagesAsImages: async () => [],
+      getModelPdfSupport: () => "none" as const,
+      uploadPdfForProvider: async () => null,
+      resolvePdfBytes: async () => new Uint8Array(),
       getSelectedFiles: () => [selectedFile],
       getSelectedImages: () => ["data:image/png;base64,AAA"],
       resolvePromptText: () => "ask question",
@@ -72,56 +86,28 @@ describe("sendFlowController", function () {
       isScreenshotUnsupportedModel: () => false,
       getSelectedReasoning: () => undefined,
       getAdvancedModelParams: () => undefined,
+      consumeWebChatForceNewChatIntent: () => false,
       getActiveEditSession: () => null,
       setActiveEditSession: () => {
         setActiveEditSessionCalls += 1;
       },
       getLatestEditablePair: async () => null,
-      editLatestUserMessageAndRetry: async (
-        _body: Element,
-        _item: Zotero.Item,
-        _displayQuestion: string,
-        _selectedTexts?: string[],
-        _selectedTextSources?: unknown,
-        _selectedTextPaperContexts?: unknown,
-        _screenshotImages?: string[],
-        _paperContexts?: PaperContextRef[],
-        _fullTextPaperContexts?: PaperContextRef[],
-        _attachments?: ChatAttachment[],
-        targetRuntimeMode?: "chat" | "agent",
-        _expected?: unknown,
-        _model?: string,
-        _apiBase?: string,
-        _apiKey?: string,
-        _reasoning?: unknown,
-        _advanced?: unknown,
-      ) => {
+      editLatestUserMessageAndRetry: async (opts: { targetRuntimeMode?: "chat" | "agent" }) => {
         editCalled += 1;
-        lastEditRuntimeMode = targetRuntimeMode || "";
+        lastEditRuntimeMode = opts.targetRuntimeMode || "";
         return "ok" as const;
       },
-      sendQuestion: async (
-        _body: Element,
-        _item: Zotero.Item,
-        _question: string,
-        _screenshotImages?: string[],
-        _model?: string,
-        _apiBase?: string,
-        _apiKey?: string,
-        _reasoning?: unknown,
-        _advanced?: unknown,
-        _displayQuestion?: string,
-        _selectedTexts?: string[],
-        _selectedTextSources?: unknown,
-        _selectedTextPaperContexts?: unknown,
-        _paperContexts?: PaperContextRef[],
-        _fullTextPaperContexts?: PaperContextRef[],
-        _attachments?: ChatAttachment[],
-        runtimeMode?: "chat" | "agent",
-      ) => {
+      sendQuestion: async (opts: {
+        question: string;
+        runtimeMode?: "chat" | "agent";
+        webchatSendPdf?: boolean;
+        webchatForceNewChat?: boolean;
+      }) => {
         sendCalled += 1;
-        lastSentQuestion = _question;
-        lastRuntimeMode = runtimeMode || "";
+        lastSentQuestion = opts.question;
+        lastRuntimeMode = opts.runtimeMode || "";
+        lastWebchatSendPdf = opts.webchatSendPdf === true;
+        lastWebchatForceNewChat = opts.webchatForceNewChat === true;
       },
       retainPinnedImageState: () => {
         retainImageCalled += 1;
@@ -148,6 +134,8 @@ describe("sendFlowController", function () {
         persistDraftInputCalls += 1;
         draftValue = inputBox.value;
       },
+      autoLockGlobalChat: () => undefined,
+      autoUnlockGlobalChat: () => undefined,
       setStatusMessage: () => undefined,
       editStaleStatusText: "stale",
       ...overrides,
@@ -172,6 +160,9 @@ describe("sendFlowController", function () {
       getLastSend: () => ({
         lastSentQuestion,
         lastRuntimeMode,
+        lastWebchatSendPdf,
+        lastWebchatForceNewChat,
+        markWebchatPdfUploadedCalls,
       }),
       getLastEditRuntimeMode: () => lastEditRuntimeMode,
     };
@@ -314,5 +305,120 @@ describe("sendFlowController", function () {
 
     assert.equal(lastSend.lastSentQuestion, "ask question");
     assert.equal(lastSend.lastRuntimeMode, "agent");
+  });
+
+  it("passes force-new-chat intent through webchat sends exactly once", async function () {
+    let consumeCalls = 0;
+    const { controller, getLastSend } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat",
+        model: "chatgpt",
+        apiBase: "http://localhost",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat" as const,
+        providerProtocol: "web_sync" as const,
+      }),
+      consumeWebChatForceNewChatIntent: () => {
+        consumeCalls += 1;
+        return true;
+      },
+    });
+
+    await controller.doSend();
+    const lastSend = getLastSend();
+
+    assert.equal(consumeCalls, 1);
+    assert.isTrue(lastSend.lastWebchatForceNewChat);
+  });
+
+  it("skips PDF upload for webchat retrieval mode", async function () {
+    const { controller, getLastSend } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat",
+        model: "chatgpt",
+        apiBase: "http://localhost",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat" as const,
+        providerProtocol: "web_sync" as const,
+      }),
+      hasActivePdfFullTextPapers: () => false,
+    });
+
+    await controller.doSend();
+    const lastSend = getLastSend();
+
+    assert.isFalse(lastSend.lastWebchatSendPdf);
+    assert.equal(lastSend.markWebchatPdfUploadedCalls, 0);
+  });
+
+  it("uploads the PDF once for webchat full-send mode and records it", async function () {
+    const { controller, getLastSend } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat",
+        model: "chatgpt",
+        apiBase: "http://localhost",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat" as const,
+        providerProtocol: "web_sync" as const,
+      }),
+      hasActivePdfFullTextPapers: () => true,
+      hasUploadedPdfInCurrentWebChatConversation: () => false,
+    });
+
+    await controller.doSend();
+    const lastSend = getLastSend();
+
+    assert.isTrue(lastSend.lastWebchatSendPdf);
+    assert.equal(lastSend.markWebchatPdfUploadedCalls, 1);
+  });
+
+  it("does not re-upload the PDF in the same webchat conversation unless a fresh chat is requested", async function () {
+    const { controller, getLastSend } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat",
+        model: "chatgpt",
+        apiBase: "http://localhost",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat" as const,
+        providerProtocol: "web_sync" as const,
+      }),
+      hasActivePdfFullTextPapers: () => true,
+      hasUploadedPdfInCurrentWebChatConversation: () => true,
+      consumeWebChatForceNewChatIntent: () => false,
+    });
+
+    await controller.doSend();
+    const lastSend = getLastSend();
+
+    assert.isFalse(lastSend.lastWebchatSendPdf);
+    assert.equal(lastSend.markWebchatPdfUploadedCalls, 0);
+  });
+
+  it("re-uploads the PDF after a fresh-chat request even if the current conversation already had it", async function () {
+    const { controller, getLastSend } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat",
+        model: "chatgpt",
+        apiBase: "http://localhost",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat" as const,
+        providerProtocol: "web_sync" as const,
+      }),
+      hasActivePdfFullTextPapers: () => true,
+      hasUploadedPdfInCurrentWebChatConversation: () => true,
+      consumeWebChatForceNewChatIntent: () => true,
+    });
+
+    await controller.doSend();
+    const lastSend = getLastSend();
+
+    assert.isTrue(lastSend.lastWebchatSendPdf);
+    assert.isTrue(lastSend.lastWebchatForceNewChat);
+    assert.equal(lastSend.markWebchatPdfUploadedCalls, 1);
   });
 });

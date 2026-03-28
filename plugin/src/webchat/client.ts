@@ -58,6 +58,7 @@ export async function submitQuery(
   signal?: AbortSignal,
   images?: string[],
   chatgptMode?: string,
+  forceNewChat?: boolean,
 ): Promise<SubmitQueryResult> {
   if (signal?.aborted) throw createAbortError();
 
@@ -67,6 +68,7 @@ export async function submitQuery(
     pdf_filename: pdfFilename,
     images: images || null,
     chatgpt_mode: chatgptMode || null,
+    force_new_chat: forceNewChat === true,
   });
 
   if (!result.ok) {
@@ -122,6 +124,10 @@ export async function pollForResponse(
       if (match) {
         if (match.error) throw new Error(match.error);
         const finalText = match.text || "";
+        if (!finalText.trim()) {
+          if (lastPartialText.length > 0) return lastPartialText;
+          throw new Error("ChatGPT finished without a visible final answer.");
+        }
         if (finalText.length > lastPartialText.length) {
           onDelta(finalText.slice(lastPartialText.length));
         }
@@ -166,6 +172,10 @@ export async function pollForResponse(
     if (match) {
       if (match.error) throw new Error(match.error);
       const finalText = match.text || "";
+      if (!finalText.trim()) {
+        if (lastPartialText.length > 0) return lastPartialText;
+        throw new Error("ChatGPT finished without a visible final answer.");
+      }
       if (finalText.length > lastPartialText.length) {
         onDelta(finalText.slice(lastPartialText.length));
       }
@@ -179,7 +189,9 @@ export async function pollForResponse(
     // Status done/idle fallback
     if (data.status === "done" || data.status === "idle") {
       if (lastPartialText.length > 0) return lastPartialText;
-      if (data.status === "done") return "";
+      if (data.status === "done") {
+        throw new Error("ChatGPT finished without a visible final answer.");
+      }
     }
 
     // Stale detection

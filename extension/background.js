@@ -6,8 +6,31 @@
  * Tracks the active ChatGPT tab so follow-up messages continue the same conversation.
  */
 
+try {
+  importScripts("webchat_shared.js");
+} catch (_) {}
+
+const shared = globalThis.SyncZoteroShared || {
+  attemptToken: (seq, attempt) => `${Number(seq) || 0}:${Number(attempt) || 0}`,
+  hasMeaningfulAssistantText: (text) => {
+    const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
+    return normalized.length > 1 &&
+      normalized !== "thinking" &&
+      normalized !== "thinking..." &&
+      normalized !== "stopped thinking" &&
+      normalized !== "quick answer" &&
+      normalized !== "stopped thinking quick answer" &&
+      !/^thought for .+$/.test(normalized) &&
+      !/^reading\s+documents?\.?$/i.test(normalized) &&
+      !/^searching(\s+the\s+web)?\.?$/i.test(normalized) &&
+      !/^analyzing\.?$/i.test(normalized) &&
+      !/^browsing\.?$/i.test(normalized);
+  },
+};
+
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const CHATGPT_URL = "https://chatgpt.com/";
+const MAX_PRE_SUBMIT_RELEASES = 3;
 
 // Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
 async function discoverZoteroPort() {
@@ -56,7 +79,8 @@ setInterval(discoverZoteroPort, 30_000);
 
 let pipelineRunning  = false;
 let activeChatTabId  = null;   // ChatGPT tab used for the current conversation
-let lastProcessedSeq = 0;      // prevents re-running the same query on SW restart
+let lastProcessedSeq = 0;
+let lastProcessedAttempt = 0;
 let activePort       = null;   // current port connection to content script
 
 // ---------------------------------------------------------------------------
@@ -89,6 +113,18 @@ async function serverPost(path, body) {
   return data;
 }
 
+async function claimQuery(seq) {
+  return serverPost("/claim_query", { seq });
+}
+
+async function ackQueryPhase(seq, attempt, phase) {
+  return serverPost("/ack_query_phase", { seq, attempt, phase });
+}
+
+async function releaseQuery(seq, attempt) {
+  return serverPost("/release_query", { seq, attempt });
+}
+
 // ---------------------------------------------------------------------------
 // Keep the service worker alive + auto-poll for pending queries
 // ---------------------------------------------------------------------------
@@ -107,7 +143,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Main poll loop (runs while SW is alive)
 setInterval(pollForQuery, 2000);
 
-// Poll for navigation commands from the Next.js server
+// Poll for navigation commands from the embedded Zotero relay
 setInterval(pollForCommand, 2000);
 
 async function pollForCommand() {
@@ -261,10 +297,19 @@ async function pollForQuery() {
     const data = await serverGet("/poll_query");
 
     if (data.status !== "pending") return;
-    if (data.query.seq <= lastProcessedSeq) return;
+    if (!data.query?.seq) return;
 
-    lastProcessedSeq = data.query.seq;
-    await runPipeline(data.query);
+    const claimed = await claimQuery(data.query.seq);
+    if (!claimed?.ok || !claimed.query) return;
+
+    const token = shared.attemptToken(claimed.query.seq, claimed.query.attempt);
+    const lastToken = shared.attemptToken(lastProcessedSeq, lastProcessedAttempt);
+    if (token === lastToken) return;
+
+    lastProcessedSeq = claimed.query.seq;
+    lastProcessedAttempt = claimed.query.attempt || 0;
+    await ackQueryPhase(claimed.query.seq, claimed.query.attempt || 0, "claimed").catch(() => {});
+    await runPipeline(claimed.query);
   } catch (err) {
     // Server not running — silently skip (expected when server is off)
     if (!err.message.includes("Failed to fetch") && !err.message.includes("NetworkError")) {
@@ -280,53 +325,68 @@ async function pollForQuery() {
 async function runPipeline(query) {
   pipelineRunning  = true;
   const seq        = query.seq;
-  // Follow-up = we have an active conversation tab to continue.
-  // PDF attachment is independent — user can send PDF mid-conversation.
-  const isFollowup = activeChatTabId !== null;
+  const attempt    = query.attempt || 0;
+  const startsFresh = query.force_new_chat === true;
+  const isFollowup = !startsFresh;
 
   broadcastStatus("running", isFollowup
     ? (query.pdf_base64 ? `Attaching PDF to conversation…` : "Sending follow-up to ChatGPT…")
-    : (query.pdf_base64 ? `Attaching PDF: ${query.pdf_filename}…` : "Sending to ChatGPT…")
+    : (query.pdf_base64 ? `Starting fresh chat with PDF: ${query.pdf_filename}…` : "Starting fresh ChatGPT chat…")
   );
 
   try {
-    // ── Get the right ChatGPT tab ──────────────────────────────────
-    let tab;
-
-    // First, process any pending NEW_CHAT command immediately (don't wait for poll)
-    // This handles the race where "+" was clicked but pollForCommand hasn't run yet
-    if (isFollowup) {
+    // ── Drain stale NEW_CHAT command ────────────────────────────────
+    // If this query starts fresh, consume any pending NEW_CHAT command
+    // so it doesn't fire after the pipeline and navigate away.
+    if (startsFresh) {
       try {
-        tab = await chrome.tabs.get(activeChatTabId);
-        if (!tab.url || !tab.url.startsWith("https://chatgpt.com")) {
-          throw new Error("Tab navigated away from ChatGPT");
+        await fetch(`${SERVER}/poll_command`).then(r => r.json());
+      } catch (_) { /* server not running — ignore */ }
+    }
+
+    // ── Get the right ChatGPT tab ──────────────────────────────────
+    let tab = null;
+
+    if (activeChatTabId !== null) {
+      try {
+        const existing = await chrome.tabs.get(activeChatTabId);
+        if (existing?.url?.startsWith("https://chatgpt.com")) {
+          tab = existing;
         }
       } catch (_) {
         activeChatTabId = null;
-        tab = await getChatGPTTab();
-        activeChatTabId = tab.id;
       }
     }
 
-    if (!isFollowup || !tab) {
+    if (!tab) {
       tab = await getChatGPTTab();
       activeChatTabId = tab.id;
     }
 
-    // If the tab shows an old conversation and we're sending a PDF (new context),
-    // navigate to a fresh chat page first
-    if (query.pdf_base64 && tab.url && tab.url.includes("/c/")) {
-      try {
-        await chrome.tabs.update(tab.id, { url: CHATGPT_URL });
-        await waitForTabLoad(tab.id);
-      } catch (_) {}
+    const shouldNavigateFresh = startsFresh;
+
+    if (shouldNavigateFresh) {
+      // Skip navigation if tab is already on the ChatGPT home/new-chat URL
+      // (e.g., a NEW_CHAT command already navigated us there)
+      const currentUrl = tab.url || "";
+      const isAlreadyHome = (
+        currentUrl === CHATGPT_URL ||
+        currentUrl === CHATGPT_URL.slice(0, -1) ||
+        currentUrl === "https://chatgpt.com"
+      );
+      if (!isAlreadyHome) {
+        try {
+          await chrome.tabs.update(tab.id, { url: CHATGPT_URL });
+          await waitForTabLoad(tab.id);
+        } catch (_) {}
+      }
     }
 
     // ── Ensure content script is ready ────────────────────────────
     await ensureTabReady(tab.id);
     await ensureContentScript(tab.id);
 
-    broadcastStatus("running", isFollowup ? "Sending follow-up…" : "Attaching PDF and sending prompt…");
+    broadcastStatus("running", isFollowup ? "Sending follow-up…" : "Preparing fresh chat and prompt…");
 
     // ── Stream via port connection ─────────────────────────────────
     const { text: responseText, thinking: thinkingText } = await streamPipeline(tab.id, {
@@ -335,12 +395,17 @@ async function runPipeline(query) {
       prompt:       query.prompt,
       images:       query.images || null,
       chatgptMode:  query.chatgpt_mode || null,
-      isFollowup,
       seq,
+      attempt,
     });
+
+    if (!shared.hasMeaningfulAssistantText(responseText)) {
+      throw new Error("ChatGPT did not produce a visible final answer.");
+    }
 
     await serverPost("/submit_response", {
       seq,
+      attempt,
       response: responseText,
       thinking: thinkingText ?? null,
       error:    null,
@@ -357,7 +422,17 @@ async function runPipeline(query) {
     broadcastStatus("done", "Response sent to GUI");
 
   } catch (err) {
-    await submitError(seq, err.message);
+    if (err?.name === "PreSubmitDisconnect" && attempt < MAX_PRE_SUBMIT_RELEASES) {
+      try {
+        await releaseQuery(seq, attempt);
+        broadcastStatus("running", "Retrying prompt delivery after a pre-submit disconnect…");
+        return;
+      } catch (_) {
+        // Fall through to surfacing a real error if the release itself failed.
+      }
+    }
+
+    await submitError(seq, err.message, attempt);
 
     const msg = err.message.includes("Failed to fetch")
       ? "Cannot reach local server. Is gui.py running?"
@@ -369,9 +444,9 @@ async function runPipeline(query) {
   }
 }
 
-async function submitError(seq, errorMsg) {
+async function submitError(seq, errorMsg, attempt) {
   try {
-    await serverPost("/submit_response", { seq, response: null, error: errorMsg });
+    await serverPost("/submit_response", { seq, attempt, response: null, error: errorMsg });
   } catch (_) {}
 }
 
@@ -435,15 +510,34 @@ function streamPipeline(tabId, payload) {
     const port = chrome.tabs.connect(tabId, { name: "sync-zotero" });
     activePort = port;
     let resolved = false;
+    let submitted = false;
+    let streamingAcked = false;
 
     port.onMessage.addListener(async (msg) => {
-      if (msg.type === "partial") {
+      if (msg.seq !== undefined && msg.seq !== payload.seq) return;
+      if (msg.attempt !== undefined && msg.attempt !== payload.attempt) return;
+
+      if (msg.type === "phase") {
+        if (msg.phase === "submitted" || msg.phase === "streaming") {
+          submitted = true;
+        }
+        try {
+          await ackQueryPhase(payload.seq, payload.attempt, msg.phase);
+        } catch (_) {}
+      } else if (msg.type === "partial") {
         // Ignore partials from a stale seq (Bug 2 guard)
-        if (msg.seq !== undefined && msg.seq !== payload.seq) return;
+        if (!streamingAcked) {
+          streamingAcked = true;
+          submitted = true;
+          try {
+            await ackQueryPhase(payload.seq, payload.attempt, "streaming");
+          } catch (_) {}
+        }
         broadcastStatus("running", msg.thinking ? "Thinking…" : "Streaming response…");
         try {
           await serverPost("/update_partial", {
             seq:     payload.seq,
+            attempt: payload.attempt,
             text:    msg.text    ?? null,
             thinking: msg.thinking ?? null,
           });
@@ -451,7 +545,7 @@ function streamPipeline(tabId, payload) {
       } else if (msg.type === "visibility") {
         if (!msg.visible) {
           broadcastStatus("running", "Chrome is hidden — waiting for full response…");
-          try { await serverPost("/update_partial", { seq: payload.seq, text: null }); } catch (_) {}
+          try { await serverPost("/update_partial", { seq: payload.seq, attempt: payload.attempt, text: null }); } catch (_) {}
         } else {
           broadcastStatus("running", "Streaming response…");
         }
@@ -475,7 +569,9 @@ function streamPipeline(tabId, payload) {
       if (activePort === port) activePort = null;
       if (!resolved) {
         const err = chrome.runtime.lastError;
-        reject(new Error("Port disconnected unexpectedly" + (err ? ": " + err.message : "")));
+        const error = new Error("Port disconnected unexpectedly" + (err ? ": " + err.message : ""));
+        error.name = submitted ? "PipelineDisconnect" : "PreSubmitDisconnect";
+        reject(error);
       }
     });
 
@@ -583,11 +679,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === "GET_FULL_STATUS") {
     (async () => {
-      // Check web host
-      let webHostAlive = false;
+      // Check embedded relay
+      let relayAlive = false;
       try {
         const res = await fetch(`${SERVER}/poll_response?since=0`);
-        webHostAlive = res.ok;
+        relayAlive = res.ok;
       } catch { /* offline */ }
 
       // Check ChatGPT tab — look for ANY open ChatGPT tab, not just activeChatTabId
@@ -612,7 +708,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const ps = stored.pipelineStatus || { state: "idle", message: "Ready" };
 
       sendResponse({
-        webHostAlive,
+        relayAlive,
         chatTabAlive,
         chatUrl,
         pipelineState: ps.state,

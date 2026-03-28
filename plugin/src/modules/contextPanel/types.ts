@@ -268,6 +268,8 @@ export type SendQuestionOptions = {
   pdfUploadSystemMessages?: string[];
   /** [webchat] When true, attach the paper PDF to the ChatGPT query. */
   webchatSendPdf?: boolean;
+  /** [webchat] When true, send the prompt into a fresh ChatGPT conversation. */
+  webchatForceNewChat?: boolean;
 };
 
 export type EditRetryOptions = {

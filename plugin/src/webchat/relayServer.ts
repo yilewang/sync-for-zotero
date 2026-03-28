@@ -23,6 +23,8 @@
  */
 
 const PREFIX = "/llm-for-zotero/webchat";
+const PRE_SUBMIT_RECLAIM_MS = 120_000;
+const PIPELINE_TIMEOUT_MS = 180_000;
 
 /**
  * Get the actual base URL of the embedded relay server.
@@ -43,7 +45,16 @@ interface PendingCommand {
   chatId?: string;
 }
 
-interface RelayState {
+export type RelayQueryPhase =
+  | "pending"
+  | "claimed"
+  | "prompt_applied"
+  | "submitted"
+  | "streaming"
+  | "done"
+  | "error";
+
+export interface RelayState {
   status: "idle" | "pending" | "running" | "done" | "error";
   query: {
     prompt: string | null;
@@ -51,14 +62,19 @@ interface RelayState {
     pdf_filename: string | null;
     images: string[] | null;
     chatgpt_mode: string | null;
+    force_new_chat: boolean;
     seq: number;
+    attempt: number;
+    phase: RelayQueryPhase;
   };
   active_seq: number;
+  active_attempt: number;
   running_since: number;
   partial_text: string | null;
   partial_thinking: string | null;
   responses: Array<{
     seq: number;
+    attempt?: number;
     text?: string;
     error?: string;
     timestamp: string;
@@ -90,9 +106,13 @@ if (!Z._webchatRelay) {
         pdf_filename: null,
         images: null,
         chatgpt_mode: null,
+        force_new_chat: false,
         seq: 0,
+        attempt: 0,
+        phase: "pending",
       },
       active_seq: 0,
+      active_attempt: 0,
       running_since: 0,
       partial_text: null,
       partial_thinking: null,
@@ -134,9 +154,13 @@ function resetState() {
     pdf_filename: null,
     images: null,
     chatgpt_mode: null,
+    force_new_chat: false,
     seq: prevSeq,
+    attempt: 0,
+    phase: "pending",
   };
   S().active_seq = 0;
+  S().active_attempt = 0;
   S().running_since = 0;
   S().partial_text = null;
   S().partial_thinking = null;
@@ -175,6 +199,72 @@ function parseBody(data: unknown): Record<string, unknown> {
   return {};
 }
 
+function isPreSubmitPhase(phase: RelayQueryPhase): boolean {
+  return phase === "claimed" || phase === "prompt_applied";
+}
+
+function copyQueryState(): RelayState["query"] {
+  return { ...S().query };
+}
+
+function phaseOrder(phase: RelayQueryPhase): number {
+  switch (phase) {
+    case "pending":
+      return 0;
+    case "claimed":
+      return 1;
+    case "prompt_applied":
+      return 2;
+    case "submitted":
+      return 3;
+    case "streaming":
+      return 4;
+    case "done":
+      return 5;
+    case "error":
+      return 6;
+    default:
+      return 0;
+  }
+}
+
+function expireStaleClaimIfNeeded(): void {
+  if (
+    S().status !== "running" ||
+    S().active_seq <= 0 ||
+    !isPreSubmitPhase(S().query.phase) ||
+    S().running_since <= 0
+  ) {
+    return;
+  }
+
+  if (Date.now() - S().running_since <= PRE_SUBMIT_RECLAIM_MS) {
+    return;
+  }
+
+  S().status = "pending";
+  S().query.phase = "pending";
+  S().active_seq = 0;
+  S().active_attempt = 0;
+  S().running_since = 0;
+  S().partial_text = null;
+  S().partial_thinking = null;
+}
+
+function attemptMatches(body: Record<string, unknown>): boolean {
+  if (!("attempt" in body) || body.attempt == null) return true;
+  return Number(body.attempt) === S().active_attempt;
+}
+
+function isRunningExpired(): boolean {
+  if (S().status !== "running" || S().running_since <= 0) return false;
+  const elapsed = Date.now() - S().running_since;
+  if (isPreSubmitPhase(S().query.phase)) {
+    return elapsed > PRE_SUBMIT_RECLAIM_MS;
+  }
+  return elapsed > PIPELINE_TIMEOUT_MS;
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint definitions
 // ---------------------------------------------------------------------------
@@ -200,10 +290,12 @@ function createEndpoint(
 // POST /submit_query
 const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
   const body = parseBody(opts.data);
+  expireStaleClaimIfNeeded();
 
   if (S().status === "pending" || S().status === "running") {
-    if (S().status === "running" && Date.now() - S().running_since > 120_000) {
+    if (S().status === "running" && isRunningExpired()) {
       S().status = "error";
+      S().query.phase = "error";
     } else {
       return jsonReply({ error: "pipeline_busy", status: S().status });
     }
@@ -221,33 +313,121 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().query.pdf_filename = (body.pdf_filename as string) || null;
   S().query.images = (body.images as string[]) || null;
   S().query.chatgpt_mode = (body.chatgpt_mode as string) || null;
+  S().query.force_new_chat = body.force_new_chat === true;
+  S().query.attempt = 0;
+  S().query.phase = "pending";
   S().status = "pending";
+
+  // If this query requests a new chat, clear any pending NEW_CHAT command
+  // to prevent the extension from double-navigating (the query's force_new_chat
+  // flag will handle navigation in runPipeline).
+  if (body.force_new_chat && S().pendingCommand?.type === "NEW_CHAT") {
+    S().pendingCommand = null;
+  }
 
   return jsonReply({ ok: true, seq: S().query.seq });
 });
 
 // GET /poll_query
 const PollQueryEndpoint = createEndpoint(["GET"], () => {
+  expireStaleClaimIfNeeded();
   if (S().status === "pending") {
-    S().status = "running";
-    S().active_seq = S().query.seq;
-    S().running_since = Date.now();
-    return jsonReply({ status: "pending", query: { ...S().query } });
+    return jsonReply({ status: "pending", query: copyQueryState() });
   }
   return jsonReply({ status: S().status, query: null });
 });
 
+// POST /claim_query
+const ClaimQueryEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+  const seq = Number(body.seq || 0);
+  expireStaleClaimIfNeeded();
+
+  if (S().status !== "pending" || seq !== S().query.seq) {
+    return jsonReply({ ok: false, reason: "not_pending", status: S().status });
+  }
+
+  S().status = "running";
+  S().active_seq = S().query.seq;
+  S().query.attempt += 1;
+  S().active_attempt = S().query.attempt;
+  S().query.phase = "claimed";
+  S().running_since = Date.now();
+  S().partial_text = null;
+  S().partial_thinking = null;
+
+  return jsonReply({
+    ok: true,
+    query: copyQueryState(),
+  });
+});
+
+// POST /ack_query_phase
+const AckQueryPhaseEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+  const nextPhase = (body.phase as RelayQueryPhase | undefined) || "claimed";
+  expireStaleClaimIfNeeded();
+
+  if (body.seq !== S().active_seq) {
+    return jsonReply({ ok: false, reason: "seq_mismatch" });
+  }
+  if (!attemptMatches(body)) {
+    return jsonReply({ ok: false, reason: "attempt_mismatch" });
+  }
+  if (phaseOrder(nextPhase) < phaseOrder(S().query.phase)) {
+    return jsonReply({ ok: false, reason: "phase_regression" });
+  }
+
+  S().query.phase = nextPhase;
+  if (nextPhase === "claimed" || nextPhase === "prompt_applied") {
+    S().running_since = Date.now();
+  }
+  if (nextPhase === "submitted" || nextPhase === "streaming") {
+    S().running_since = Date.now();
+  }
+
+  return jsonReply({ ok: true });
+});
+
+// POST /release_query
+const ReleaseQueryEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+
+  if (body.seq !== S().active_seq) {
+    return jsonReply({ ok: false, reason: "seq_mismatch" });
+  }
+  if (!attemptMatches(body)) {
+    return jsonReply({ ok: false, reason: "attempt_mismatch" });
+  }
+  if (!isPreSubmitPhase(S().query.phase)) {
+    return jsonReply({ ok: false, reason: "already_submitted" });
+  }
+
+  S().status = "pending";
+  S().query.phase = "pending";
+  S().active_seq = 0;
+  S().active_attempt = 0;
+  S().running_since = 0;
+  S().partial_text = null;
+  S().partial_thinking = null;
+
+  return jsonReply({ ok: true, query: copyQueryState() });
+});
+
 // GET /poll_response
 const PollResponseEndpoint = createEndpoint(["GET"], () => {
+  expireStaleClaimIfNeeded();
   // Passive timeout
   if (
     S().status === "running" &&
     S().running_since > 0 &&
-    Date.now() - S().running_since > 180_000
+    Date.now() - S().running_since > PIPELINE_TIMEOUT_MS
   ) {
     S().status = "error";
+    S().query.phase = "error";
     S().responses.push({
       seq: S().active_seq,
+      attempt: S().active_attempt || undefined,
       error: "Server-side timeout: pipeline running for > 180s",
       timestamp: new Date().toISOString(),
     });
@@ -265,23 +445,38 @@ const PollResponseEndpoint = createEndpoint(["GET"], () => {
 // POST /update_partial
 const UpdatePartialEndpoint = createEndpoint(["POST"], (opts) => {
   const body = parseBody(opts.data);
+  expireStaleClaimIfNeeded();
   if (body.seq !== S().active_seq) {
     return jsonReply({ ok: false, reason: "seq_mismatch" });
   }
+  if (!attemptMatches(body)) {
+    return jsonReply({ ok: false, reason: "attempt_mismatch" });
+  }
   if ("text" in body) S().partial_text = body.text as string | null;
   if ("thinking" in body) S().partial_thinking = body.thinking as string | null;
+  if (
+    (typeof body.text === "string" && body.text.length > 0) ||
+    (typeof body.thinking === "string" && body.thinking.length > 0)
+  ) {
+    S().query.phase = "streaming";
+  }
   return jsonReply({ ok: true });
 });
 
 // POST /submit_response
 const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
   const body = parseBody(opts.data);
+  expireStaleClaimIfNeeded();
   if (body.seq !== S().active_seq) {
     return jsonReply({ ok: false, reason: "seq_mismatch" });
+  }
+  if (!attemptMatches(body)) {
+    return jsonReply({ ok: false, reason: "attempt_mismatch" });
   }
 
   const entry = {
     seq: body.seq as number,
+    attempt: ("attempt" in body ? Number(body.attempt) : S().active_attempt) || undefined,
     text: body.response as string | undefined,
     error: body.error as string | undefined,
     timestamp: new Date().toISOString(),
@@ -291,6 +486,7 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
   S().partial_text = null;
   S().partial_thinking = null;
   S().status = entry.error ? "error" : "done";
+  S().query.phase = entry.error ? "error" : "done";
 
   return jsonReply({ ok: true });
 });
@@ -301,6 +497,8 @@ const DebugEndpoint = createEndpoint(["GET"], () => {
   return jsonReply({
     stateRef: typeof s,
     status: s?.status,
+    phase: s?.query?.phase,
+    attempt: s?.query?.attempt,
     pendingCommand: s?.pendingCommand,
     storageKeyExists: !!(Zotero.Server.Endpoints as any).__webchatRelayStorage,
     sameRef: s === (Zotero.Server.Endpoints as any).__webchatRelayStorage?.state,
@@ -404,6 +602,9 @@ const ENDPOINTS: Record<string, ReturnType<typeof createEndpoint>> = {
   [`${PREFIX}/debug`]: DebugEndpoint,
   [`${PREFIX}/submit_query`]: SubmitQueryEndpoint,
   [`${PREFIX}/poll_query`]: PollQueryEndpoint,
+  [`${PREFIX}/claim_query`]: ClaimQueryEndpoint,
+  [`${PREFIX}/ack_query_phase`]: AckQueryPhaseEndpoint,
+  [`${PREFIX}/release_query`]: ReleaseQueryEndpoint,
   [`${PREFIX}/poll_response`]: PollResponseEndpoint,
   [`${PREFIX}/update_partial`]: UpdatePartialEndpoint,
   [`${PREFIX}/submit_response`]: SubmitResponseEndpoint,
@@ -427,10 +628,13 @@ export function relaySubmitQuery(opts: {
   pdf_filename?: string | null;
   images?: string[] | null;
   chatgpt_mode?: string | null;
+  force_new_chat?: boolean;
 }): { ok: boolean; seq: number; error?: string } {
+  expireStaleClaimIfNeeded();
   if (S().status === "pending" || S().status === "running") {
-    if (S().status === "running" && Date.now() - S().running_since > 120_000) {
+    if (S().status === "running" && isRunningExpired()) {
       S().status = "error";
+      S().query.phase = "error";
     } else {
       return { ok: false, seq: 0, error: "pipeline_busy" };
     }
@@ -446,9 +650,107 @@ export function relaySubmitQuery(opts: {
   S().query.pdf_filename = opts.pdf_filename || null;
   S().query.images = opts.images || null;
   S().query.chatgpt_mode = opts.chatgpt_mode || null;
+  S().query.force_new_chat = opts.force_new_chat === true;
+  S().query.attempt = 0;
+  S().query.phase = "pending";
   S().status = "pending";
 
+  // If this query requests a new chat, clear any pending NEW_CHAT command
+  // to prevent the extension from double-navigating (the query's force_new_chat
+  // flag will handle navigation in runPipeline).
+  if (opts.force_new_chat && S().pendingCommand?.type === "NEW_CHAT") {
+    S().pendingCommand = null;
+  }
+
   return { ok: true, seq: S().query.seq };
+}
+
+/** Peek at the pending query without consuming it. */
+export function relayPollQuery(): {
+  status: RelayState["status"];
+  query: RelayState["query"] | null;
+} {
+  expireStaleClaimIfNeeded();
+  if (S().status === "pending") {
+    return { status: "pending", query: copyQueryState() };
+  }
+  return { status: S().status, query: null };
+}
+
+/** Claim the current pending query for an extension attempt. */
+export function relayClaimQuery(seq: number): {
+  ok: boolean;
+  reason?: string;
+  query?: RelayState["query"];
+} {
+  expireStaleClaimIfNeeded();
+  if (S().status !== "pending" || seq !== S().query.seq) {
+    return { ok: false, reason: "not_pending" };
+  }
+
+  S().status = "running";
+  S().active_seq = S().query.seq;
+  S().query.attempt += 1;
+  S().active_attempt = S().query.attempt;
+  S().query.phase = "claimed";
+  S().running_since = Date.now();
+  S().partial_text = null;
+  S().partial_thinking = null;
+
+  return {
+    ok: true,
+    query: copyQueryState(),
+  };
+}
+
+/** Advance the claimed query to the reported delivery phase. */
+export function relayAckQueryPhase(
+  seq: number,
+  phase: RelayQueryPhase,
+  attempt?: number,
+): { ok: boolean; reason?: string } {
+  expireStaleClaimIfNeeded();
+  if (seq !== S().active_seq) {
+    return { ok: false, reason: "seq_mismatch" };
+  }
+  if (typeof attempt === "number" && attempt !== S().active_attempt) {
+    return { ok: false, reason: "attempt_mismatch" };
+  }
+  if (phaseOrder(phase) < phaseOrder(S().query.phase)) {
+    return { ok: false, reason: "phase_regression" };
+  }
+
+  S().query.phase = phase;
+  if (phase === "claimed" || phase === "prompt_applied" || phase === "submitted" || phase === "streaming") {
+    S().running_since = Date.now();
+  }
+  return { ok: true };
+}
+
+/** Release a claimed query back to pending before ChatGPT accepts it. */
+export function relayReleaseQuery(
+  seq: number,
+  attempt?: number,
+): { ok: boolean; reason?: string } {
+  if (seq !== S().active_seq) {
+    return { ok: false, reason: "seq_mismatch" };
+  }
+  if (typeof attempt === "number" && attempt !== S().active_attempt) {
+    return { ok: false, reason: "attempt_mismatch" };
+  }
+  if (!isPreSubmitPhase(S().query.phase)) {
+    return { ok: false, reason: "already_submitted" };
+  }
+
+  S().status = "pending";
+  S().query.phase = "pending";
+  S().active_seq = 0;
+  S().active_attempt = 0;
+  S().running_since = 0;
+  S().partial_text = null;
+  S().partial_thinking = null;
+
+  return { ok: true };
 }
 
 /** Poll for response directly from relay state (no HTTP). */
@@ -459,11 +761,14 @@ export function relayPollResponse(): {
   partial_thinking: string | null;
   current_seq: number;
 } {
+  expireStaleClaimIfNeeded();
   // Passive timeout
-  if (S().status === "running" && S().running_since > 0 && Date.now() - S().running_since > 180_000) {
+  if (S().status === "running" && S().running_since > 0 && Date.now() - S().running_since > PIPELINE_TIMEOUT_MS) {
     S().status = "error";
+    S().query.phase = "error";
     S().responses.push({
       seq: S().active_seq,
+      attempt: S().active_attempt || undefined,
       error: "Server-side timeout: pipeline running for > 180s",
       timestamp: new Date().toISOString(),
     });
@@ -522,6 +827,17 @@ export function relayGetScrapedMessages(): Array<{ role: string; text: string }>
   const msgs = getScrapedMessages();
   setScrapedMessages(null);
   return msgs;
+}
+
+/** Test-only visibility into the relay state. */
+export function relayGetStateSnapshot(): RelayState {
+  expireStaleClaimIfNeeded();
+  return JSON.parse(JSON.stringify(S())) as RelayState;
+}
+
+/** Test helper to reset relay state without issuing commands. */
+export function relayResetForTests(): void {
+  resetState();
 }
 
 /**

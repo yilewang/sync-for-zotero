@@ -16,6 +16,36 @@
 // Utility helpers
 // ---------------------------------------------------------------------------
 
+const shared = globalThis.SyncZoteroShared || {
+  attemptToken: (seq, attempt) => `${Number(seq) || 0}:${Number(attempt) || 0}`,
+  composerTextMatchesPrompt: (promptText, composerText) => String(promptText || "").trim() === String(composerText || "").trim(),
+  hasMeaningfulAssistantText: (text) => {
+    const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
+    return normalized.length > 1 &&
+      normalized !== "thinking" &&
+      normalized !== "thinking..." &&
+      normalized !== "stopped thinking" &&
+      normalized !== "quick answer" &&
+      normalized !== "stopped thinking quick answer" &&
+      !/^thought for .+$/.test(normalized) &&
+      !/^reading\s+documents?\.?$/i.test(normalized) &&
+      !/^searching(\s+the\s+web)?\.?$/i.test(normalized) &&
+      !/^analyzing\.?$/i.test(normalized) &&
+      !/^browsing\.?$/i.test(normalized);
+  },
+  hasDeliverySignal: (snapshot) => {
+    if ((snapshot.outboundRequestSerial || 0) > (snapshot.baselineOutboundRequestSerial || 0)) return true;
+    if (snapshot.stopButtonVisible) return true;
+    if ((snapshot.userMessageCount || 0) > (snapshot.baselineUserMessageCount || 0)) return true;
+    return String(snapshot.composerTextAfter || "").trim() === "";
+  },
+  isPlaceholderAssistantText: (text) => {
+    const normalized = String(text || "").trim().toLowerCase();
+    return !normalized || normalized === "thinking" || normalized === "quick answer";
+  },
+  normalizeComposerText: (text) => String(text || "").trim(),
+};
+
 /** Wait until a selector matches, polling every 200 ms up to `timeout` ms. */
 function waitForElement(selector, timeout = 10000) {
   return new Promise((resolve, reject) => {
@@ -54,6 +84,74 @@ function setNativeValue(el, value) {
   }
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function getComposerElement() {
+  let composer = findComposerNow();
+  if (!composer) {
+    composer = await waitForElement("[data-testid='text-input']", 8000).catch(() => null);
+  }
+  if (!composer) {
+    composer = await waitForElement("textarea", 5000);
+  }
+  return composer;
+}
+
+function findComposerNow() {
+  return (
+    document.querySelector("#prompt-textarea") ||
+    document.querySelector("[data-testid='text-input']") ||
+    document.querySelector("textarea") ||
+    null
+  );
+}
+
+function readComposerText(composer) {
+  if (!composer) return "";
+  if (composer.tagName === "TEXTAREA") {
+    return composer.value || "";
+  }
+  return composer.innerText || composer.textContent || "";
+}
+
+function dispatchComposerInput(composer, inputType, data) {
+  try {
+    composer.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      cancelable: true,
+      data: data ?? null,
+      inputType,
+    }));
+  } catch (_) {
+    composer.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+  }
+  composer.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function setContentEditableText(composer, promptText) {
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(composer);
+  range.deleteContents();
+  range.collapse(true);
+
+  if (!promptText) {
+    composer.textContent = "";
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    dispatchComposerInput(composer, "deleteContentBackward", "");
+    return;
+  }
+
+  const textNode = document.createTextNode(promptText);
+  range.insertNode(textNode);
+
+  range.setStartAfter(textNode);
+  range.collapse(true);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+
+  dispatchComposerInput(composer, "insertText", promptText);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,28 +404,30 @@ async function selectChatGPTMode(mode) {
 // Step 2: Type prompt
 // ---------------------------------------------------------------------------
 
-async function typePrompt(promptText) {
-  // ChatGPT's composer is a <div contenteditable> or <textarea>
-  // Try contenteditable first (current ChatGPT), fall back to textarea
-  let composer = document.querySelector("#prompt-textarea");
-  if (!composer) {
-    composer = await waitForElement("[data-testid='text-input']", 8000).catch(() => null);
-  }
-  if (!composer) {
-    composer = await waitForElement("textarea", 5000);
+async function typePromptAndVerify(promptText) {
+  const composer = await getComposerElement();
+  const expectedText = shared.normalizeComposerText(promptText);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    composer.focus();
+
+    if (composer.tagName === "TEXTAREA") {
+      setNativeValue(composer, "");
+      setNativeValue(composer, promptText);
+    } else {
+      setContentEditableText(composer, "");
+      setContentEditableText(composer, promptText);
+    }
+
+    await sleep(300);
+
+    const actualText = shared.normalizeComposerText(readComposerText(composer));
+    if (shared.composerTextMatchesPrompt(expectedText, actualText)) {
+      return composer;
+    }
   }
 
-  composer.focus();
-
-  if (composer.tagName === "TEXTAREA") {
-    setNativeValue(composer, promptText);
-  } else {
-    // contenteditable div — use execCommand for React compat
-    composer.innerHTML = "";
-    document.execCommand("insertText", false, promptText);
-  }
-
-  await sleep(500);
+  throw new Error("Prompt verification failed: ChatGPT composer text did not match the requested prompt.");
 }
 
 // ---------------------------------------------------------------------------
@@ -345,24 +445,64 @@ function findSendButton() {
   );
 }
 
-async function submitMessage() {
+async function waitForSendButtonEnabled() {
   // Wait for the send button to exist AND not be disabled
   // (ChatGPT disables it while the uploaded file is being processed)
-  let sendBtn = null;
   // Wait up to 120 seconds — PDF uploads to ChatGPT can take a while
-  for (let i = 0; i < 240; i++) {
+  // Wait up to 180s — large PDF uploads to ChatGPT can take a while
+  for (let i = 0; i < 360; i++) {
     const btn = findSendButton();
     if (btn && !btn.disabled && !btn.hasAttribute("disabled")) {
-      sendBtn = btn;
-      break;
+      return btn;
     }
     await sleep(500);
   }
+  return null;
+}
 
-  if (!sendBtn) throw new Error("Send button never became enabled");
+async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount) {
+  const deadline = Date.now() + 10_000;
 
-  sendBtn.click();
-  await sleep(500);
+  while (Date.now() < deadline) {
+    const composer = findComposerNow();
+    const signal = shared.hasDeliverySignal({
+      baselineOutboundRequestSerial,
+      outboundRequestSerial,
+      baselineUserMessageCount,
+      userMessageCount: document.querySelectorAll("[data-message-author-role='user']").length,
+      stopButtonVisible: !!findStopButton(),
+      composerTextAfter: readComposerText(composer),
+      promptText,
+    });
+    if (signal) return true;
+    await workerSleep(200);
+  }
+  return false;
+}
+
+async function submitMessageAndVerify(promptText) {
+  const baselineUserMessageCount = document.querySelectorAll(
+    "[data-message-author-role='user']"
+  ).length;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sendBtn = await waitForSendButtonEnabled();
+    if (!sendBtn) throw new Error("Send button never became enabled");
+
+    const baselineOutboundRequestSerial = outboundRequestSerial;
+    sendBtn.click();
+
+    const delivered = await waitForSubmissionSignal(
+      promptText,
+      baselineOutboundRequestSerial,
+      baselineUserMessageCount,
+    );
+    if (delivered) return true;
+
+    await typePromptAndVerify(promptText);
+  }
+
+  throw new Error("Prompt delivery failed: ChatGPT did not accept the prompt after 2 attempts.");
 }
 
 // ---------------------------------------------------------------------------
@@ -372,13 +512,26 @@ async function submitMessage() {
 let sseText = "";
 let sseThinking = null;
 let sseDone = false;
+let outboundRequestSerial = 0;
 
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
-  if (event.data?.type !== "SYNC_ZOTERO_SSE") return;
-  sseText = event.data.text || "";
-  sseThinking = event.data.thinking || null;
-  sseDone = event.data.done || false;
+  if (event.data?.type === "SYNC_ZOTERO_SSE") {
+    sseText = event.data.text || "";
+    sseThinking = event.data.thinking || null;
+    sseDone = event.data.done || false;
+    return;
+  }
+  if (event.data?.type === "SYNC_ZOTERO_STREAM_START") {
+    // A new SSE stream is starting (e.g., tool-use continuation).
+    // Reset done flag so the previous stream's [DONE] doesn't
+    // cause premature pipeline exit.
+    sseDone = false;
+    return;
+  }
+  if (event.data?.type === "SYNC_ZOTERO_REQUEST") {
+    outboundRequestSerial += 1;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -415,7 +568,32 @@ function findStopButton() {
   return null;
 }
 
-async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000, preSubmitBaseline = -1) {
+function getMeaningfulSseText() {
+  return shared.hasMeaningfulAssistantText(sseText) ? sseText : "";
+}
+
+async function waitForMeaningfulAssistantResponse(baselineCount, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const sseAnswer = getMeaningfulSseText();
+    if (sseAnswer) return sseAnswer;
+
+    const baselineText = extractResponseAfter(baselineCount);
+    if (shared.hasMeaningfulAssistantText(baselineText)) {
+      return baselineText;
+    }
+
+    const fallbackText = extractResponse();
+    if (shared.hasMeaningfulAssistantText(fallbackText)) {
+      return fallbackText;
+    }
+
+    await workerSleep(500);
+  }
+  return "";
+}
+
+async function streamResponse(onPartial, onVisibilityChange, onStreamStart, timeoutMs = 180000, preSubmitBaseline = -1) {
   // Reset SSE state for this new response
   sseText = "";
   sseThinking = null;
@@ -433,7 +611,7 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000,
   let streamStarted = false;
   while (Date.now() < startDeadline) {
     if (findStopButton()) { streamStarted = true; break; }
-    if (sseText.length > 0) { streamStarted = true; break; }
+    if (getMeaningfulSseText().length > 0) { streamStarted = true; break; }
     // DOM fallback: new assistant message appeared with content
     const currentCount = document.querySelectorAll(
       "[data-message-author-role='assistant']"
@@ -445,19 +623,26 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000,
     await workerSleep(300);
   }
 
+  if (streamStarted) {
+    onStreamStart?.();
+  }
+
   // --- Phase 2: Stream partials while ChatGPT is generating ---
   const endDeadline = Date.now() + timeoutMs;
   let lastSentText = "";
+  let lastSentThinking = "";
   let stableChecks = 0;
+  let answerlessDoneSince = 0;
   const STABLE_WITH_BUTTON_GONE = 2;   // 2 × 500ms = 1s
   const STABLE_WITHOUT_BUTTON   = 6;   // 6 × 500ms = 3s
+  const ANSWERLESS_DONE_GRACE_MS = 30_000;
 
   while (Date.now() < endDeadline) {
     const stopBtn = findStopButton();
 
     // --- Get text: prefer SSE (network-level), fall back to DOM ---
     // SSE works even when tab is hidden!
-    let text = sseText;
+    let text = getMeaningfulSseText();
     let thinking = sseThinking;
 
     if (!text && !document.hidden) {
@@ -466,10 +651,14 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000,
       if (!thinking) thinking = extractThinking();
     }
 
-    // Emit partial if text changed
-    if (text && text !== lastSentText) {
-      onPartial(text, thinking);
-      lastSentText = text;
+    const textChanged = Boolean(text && text !== lastSentText);
+    const thinkingChanged = Boolean(thinking && thinking !== lastSentThinking);
+
+    // Emit partial if either the answer text or reasoning text changed.
+    if (textChanged || thinkingChanged) {
+      onPartial(textChanged ? text : null, thinkingChanged ? thinking : null);
+      if (textChanged) lastSentText = text;
+      if (thinkingChanged) lastSentThinking = thinking;
       stableChecks = 0;
     } else if (text && !stopBtn) {
       stableChecks++;
@@ -486,14 +675,44 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000,
     }
 
     // --- Completion detection ---
-    // Primary: SSE stream sent [DONE] — emit final text before breaking
+    // Primary: SSE stream sent [DONE] — emit final text before breaking.
+    // BUT: ChatGPT tool-use flows (reading documents, web search, etc.)
+    // create multiple sequential API calls. The first stream's [DONE] fires
+    // before the actual response stream starts. We must wait briefly to
+    // detect follow-up streams before accepting the result as final.
     if (sseDone) {
       // Ensure we emit the very last SSE text (it may have arrived with the done flag)
-      if (sseText && sseText !== lastSentText) {
-        onPartial(sseText, sseThinking);
-        lastSentText = sseText;
+      const finalSseText = getMeaningfulSseText();
+      if (finalSseText && finalSseText !== lastSentText) {
+        onPartial(finalSseText, sseThinking);
+        lastSentText = finalSseText;
       }
-      if (lastSentText.length > 0) break;
+      if (lastSentText.length > 0) {
+        // Wait briefly for a potential follow-up stream (tool-use continuation).
+        // If sseDone gets reset (SYNC_ZOTERO_STREAM_START from a new fetch)
+        // or the stop button reappears, ChatGPT is still working.
+        await workerSleep(2000);
+        if (!sseDone || findStopButton()) {
+          // New stream started or ChatGPT still generating — keep waiting
+          stableChecks = 0;
+        } else {
+          break;
+        }
+      }
+    }
+    if (sseDone && lastSentText.length === 0) {
+      if (!answerlessDoneSince) answerlessDoneSince = Date.now();
+      const delayedText = await waitForMeaningfulAssistantResponse(baselineCount, 1500);
+      if (delayedText) {
+        onPartial(delayedText, extractThinking());
+        lastSentText = delayedText;
+        break;
+      }
+      if (Date.now() - answerlessDoneSince >= ANSWERLESS_DONE_GRACE_MS) {
+        throw new Error("ChatGPT finished thinking without producing a visible answer.");
+      }
+    } else {
+      answerlessDoneSince = 0;
     }
     // Secondary: stop button gone + content stable for 1s
     if (streamStarted && !stopBtn && stableChecks >= STABLE_WITH_BUTTON_GONE && lastSentText.length > 0) break;
@@ -502,7 +721,7 @@ async function streamResponse(onPartial, onVisibilityChange, timeoutMs = 180000,
     // Fallback: if no text found after 30s and no stop button, try extractResponse() (ignores baseline)
     if (!stopBtn && !lastSentText && stableChecks >= 60) {
       const fallbackText = extractResponse();
-      if (fallbackText) {
+      if (fallbackText && shared.hasMeaningfulAssistantText(fallbackText)) {
         onPartial(fallbackText, extractThinking());
         lastSentText = fallbackText;
         break;
@@ -546,6 +765,8 @@ function extractResponseAfter(baselineCount = 0) {
   if (assistantMessages.length <= baselineCount) return "";
 
   const latestAssistant = assistantMessages[assistantMessages.length - 1];
+  const prunedAssistant = latestAssistant.cloneNode(true);
+  pruneAssistantStatusNodes(prunedAssistant);
 
   // Try multiple content selectors within the message (resilient to UI changes)
   const contentSelectors = [
@@ -559,18 +780,20 @@ function extractResponseAfter(baselineCount = 0) {
     "p",
   ];
   for (const sel of contentSelectors) {
-    const el = latestAssistant.querySelector(sel);
+    const el = prunedAssistant.querySelector(sel);
     if (el) {
-      const text = el.textContent.trim();
-      if (text && text.length > 1) {
+      const text = shared.normalizeComposerText(el.textContent || "");
+      if (shared.hasMeaningfulAssistantText(text)) {
         return htmlToMarkdown(el.innerHTML);
       }
     }
   }
 
   // Ultimate fallback: use innerText on the entire container
-  const text = latestAssistant.innerText?.trim() || latestAssistant.textContent?.trim();
-  if (text && text.length > 1) return text;
+  const text = shared.normalizeComposerText(
+    prunedAssistant.innerText || prunedAssistant.textContent || "",
+  );
+  if (shared.hasMeaningfulAssistantText(text)) return text;
 
   return "";
 }
@@ -578,6 +801,23 @@ function extractResponseAfter(baselineCount = 0) {
 /** Extract the last assistant response (used for final extraction after streaming). */
 function extractResponse() {
   return extractResponseAfter(0);
+}
+
+function pruneAssistantStatusNodes(root) {
+  const selectors = [
+    "details",
+    "summary",
+    "button",
+    "[role='button']",
+    "[data-testid='reasoning-content']",
+    "[data-testid='thinking-content']",
+    "[data-testid='thinking']",
+    "[class*='thinking']",
+    "[class*='reasoning']",
+  ];
+  for (const sel of selectors) {
+    root.querySelectorAll(sel).forEach((node) => node.remove());
+  }
 }
 
 function extractThinking() {
@@ -860,6 +1100,7 @@ if (!window.__syncZoteroListenerRegistered) {
       if (msg.type !== "START") return;
 
       const seq = msg.seq; // track seq for end-to-end validation
+      const attempt = msg.attempt || 0;
 
       try {
         // Snapshot existing assistant messages before we start, so we only
@@ -881,33 +1122,45 @@ if (!window.__syncZoteroListenerRegistered) {
           }
         }
         // Mode switching disabled — users control thinking mode directly on chatgpt.com
-        await typePrompt(msg.prompt);
-        await submitMessage();
+        await typePromptAndVerify(msg.prompt);
+        port.postMessage({ type: "phase", seq, attempt, phase: "prompt_applied" });
+
+        await submitMessageAndVerify(msg.prompt);
+        port.postMessage({ type: "phase", seq, attempt, phase: "submitted" });
 
         await streamResponse(
           (partialText, thinkingText) => {
-            try { port.postMessage({ type: "partial", seq, text: partialText, thinking: thinkingText ?? null }); } catch (_) {}
+            try { port.postMessage({ type: "partial", seq, attempt, text: partialText, thinking: thinkingText ?? null }); } catch (_) {}
           },
           (isVisible) => {
             try { port.postMessage({ type: "visibility", visible: isVisible }); } catch (_) {}
+          },
+          () => {
+            try { port.postMessage({ type: "phase", seq, attempt, phase: "streaming" }); } catch (_) {}
           },
           180000,
           baselineCount  // pre-submit count for accurate DOM fallback
         );
 
         // Final response: try multiple extraction methods
-        let finalText = sseText || extractResponseAfter(baselineCount);
+        let finalText = getMeaningfulSseText() || extractResponseAfter(baselineCount);
         // If both SSE and baseline-aware extraction failed, try extracting the
         // very last assistant message regardless of baseline (handles cases where
         // the baseline count was wrong due to page state changes)
-        if (!finalText) {
+        if (!shared.hasMeaningfulAssistantText(finalText)) {
           finalText = extractResponse();
         }
+        if (!shared.hasMeaningfulAssistantText(finalText)) {
+          finalText = await waitForMeaningfulAssistantResponse(baselineCount, 15_000);
+        }
+        if (!shared.hasMeaningfulAssistantText(finalText)) {
+          throw new Error("ChatGPT finished thinking without producing a visible answer.");
+        }
         const finalThinking = sseThinking || extractThinking();
-        port.postMessage({ type: "done", seq, text: finalText, thinking: finalThinking ?? null });
+        port.postMessage({ type: "done", seq, attempt, text: finalText, thinking: finalThinking ?? null });
 
       } catch (err) {
-        try { port.postMessage({ type: "error", seq, error: err.message }); } catch (_) {}
+        try { port.postMessage({ type: "error", seq, attempt, error: err.message }); } catch (_) {}
       }
     });
   });

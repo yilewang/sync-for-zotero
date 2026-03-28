@@ -21,9 +21,10 @@ type ClearConversationControllerDeps = {
   clearAgentToolCaches?: (conversationKey: number) => void;
   setStatusMessage?: (message: string, level: StatusLevel) => void;
   logError?: (message: string, error: unknown) => void;
-  // [webchat] Optional hooks for syncing new-chat to web host
+  // [webchat] Optional hooks for syncing new-chat to the embedded relay
   isWebChatActive?: () => boolean;
   getWebChatHost?: () => string;
+  markNextWebChatSendAsNewChat?: () => void;
 };
 
 export function createClearConversationController(
@@ -81,8 +82,9 @@ export function createClearConversationController(
     await deps.refreshGlobalHistoryHeader();
     deps.scheduleAttachmentGc();
 
-    // [webchat] Sync new-chat to web host so ChatGPT navigates to a fresh conversation
+    // [webchat] Sync new-chat through the embedded relay so ChatGPT navigates to a fresh conversation
     if (deps.isWebChatActive?.()) {
+      deps.markNextWebChatSendAsNewChat?.();
       import("../../../../webchat/client").then(({ sendNewChat }) => {
         sendNewChat(deps.getWebChatHost?.() || "http://127.0.0.1:23119/llm-for-zotero/webchat").catch(() => {});
       }).catch(() => {});

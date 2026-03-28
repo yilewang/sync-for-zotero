@@ -1382,7 +1382,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           doc,
           "span",
           HELPER_STYLE,
-          t("ChatGPT via sync-for-zotero Chrome extension on localhost:7878. Keep the web host and ChatGPT tab running."),
+          t("ChatGPT via sync-for-zotero Chrome extension and the embedded Zotero relay. Keep Zotero and the ChatGPT tab running."),
         );
         webchatInfoWrap.append(webchatInfoLabel, webchatInfoText);
         cardBody.append(

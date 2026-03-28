@@ -4,7 +4,7 @@
  * Unlike the normal LLM pipeline, this:
  *   - Attaches the current paper's PDF when `sendPdf` is true (controlled by chip state)
  *   - Sends only the raw question text (no system messages, no history)
- *   - Submits via the web host relay → Chrome extension → ChatGPT.com
+ *   - Submits via the embedded Zotero relay → Chrome extension → ChatGPT.com
  */
 
 import type { ReasoningEvent } from "../utils/llmClient";
@@ -78,6 +78,8 @@ export type WebChatSendOptions = {
   host: string;
   /** When true, attach the paper PDF to the ChatGPT query. */
   sendPdf?: boolean;
+  /** When true, force the next query into a fresh ChatGPT conversation. */
+  forceNewChat?: boolean;
   /** Screenshot images as base64 data URLs to attach to ChatGPT. */
   images?: string[];
   /** ChatGPT mode: "instant", "thinking_standard", or "thinking_extended". */
@@ -88,7 +90,7 @@ export type WebChatSendOptions = {
 };
 
 /**
- * Send a question to ChatGPT via the web host relay.
+ * Send a question to ChatGPT via the embedded Zotero relay.
  * Attaches the current paper's PDF only when `sendPdf` is true.
  * The caller determines whether to send PDF based on the paper chip state.
  *
@@ -97,7 +99,18 @@ export type WebChatSendOptions = {
 export async function sendWebChatQuestion(
   opts: WebChatSendOptions,
 ): Promise<string> {
-  const { item, question, host, sendPdf, images, chatgptMode, signal, onDelta, onReasoning } = opts;
+  const {
+    item,
+    question,
+    host,
+    sendPdf,
+    forceNewChat,
+    images,
+    chatgptMode,
+    signal,
+    onDelta,
+    onReasoning,
+  } = opts;
 
   ztoolkit.log(`[webchat] sendWebChatQuestion: sendPdf=${sendPdf}`);
 
@@ -119,8 +132,17 @@ export async function sendWebChatQuestion(
     }
   }
 
-  // --- Submit to web host ---
-  const { seq } = await submitQuery(host, question, pdfBase64, pdfFilename, signal, images, chatgptMode);
+  // --- Submit to the embedded relay ---
+  const { seq } = await submitQuery(
+    host,
+    question,
+    pdfBase64,
+    pdfFilename,
+    signal,
+    images,
+    chatgptMode,
+    forceNewChat,
+  );
 
   // --- Poll for streaming response ---
   return pollForResponse(host, seq, onDelta, onReasoning, signal);

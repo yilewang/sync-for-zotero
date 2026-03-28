@@ -18,7 +18,65 @@
 
   const originalFetch = window.fetch;
 
+  function normalizeAssistantText(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function hasMeaningfulAssistantText(text) {
+    const normalized = normalizeAssistantText(text).toLowerCase();
+    if (!normalized) return false;
+    if (
+      normalized === "thinking" ||
+      normalized === "thinking..." ||
+      normalized === "stopped thinking" ||
+      normalized === "quick answer" ||
+      normalized === "stopped thinking quick answer"
+    ) {
+      return false;
+    }
+    if (/^thought for .+$/.test(normalized)) {
+      return false;
+    }
+    // Tool-use status messages (not actual responses)
+    if (/^reading\s+documents?\.?$/i.test(normalized)) return false;
+    if (/^searching(\s+the\s+web)?\.?$/i.test(normalized)) return false;
+    if (/^analyzing\.?$/i.test(normalized)) return false;
+    if (/^browsing\.?$/i.test(normalized)) return false;
+    return true;
+  }
+
   window.fetch = async function (...args) {
+    try {
+      // Determine the request URL
+      const url =
+        args[0] instanceof Request ? args[0].url : String(args[0] || "");
+      const method = (
+        (args[0] instanceof Request ? args[0].method : args[1]?.method) || "GET"
+      ).toUpperCase();
+
+      // Intercept POST to the conversation endpoint (ChatGPT's streaming API)
+      if (
+        method === "POST" &&
+        url.includes("/backend-api/conversation")
+      ) {
+        window.postMessage(
+          {
+            type: "SYNC_ZOTERO_REQUEST",
+            url,
+            method,
+            timestamp: Date.now(),
+          },
+          "*"
+        );
+      }
+    } catch {
+      // Never break the page's fetch
+    }
+
     const response = await originalFetch.apply(this, args);
 
     try {
@@ -29,7 +87,6 @@
         (args[0] instanceof Request ? args[0].method : args[1]?.method) || "GET"
       ).toUpperCase();
 
-      // Intercept POST to the conversation endpoint (ChatGPT's streaming API)
       if (
         method === "POST" &&
         url.includes("/backend-api/conversation")
@@ -55,6 +112,12 @@
   async function processSSEResponse(response) {
     const body = response.body;
     if (!body) return;
+
+    // Notify content script that a new SSE stream is starting.
+    // This resets sseDone so the previous stream's [DONE] doesn't
+    // prematurely end the pipeline (e.g., tool-use multi-stream flows
+    // where "Reading documents" completes before the actual response).
+    window.postMessage({ type: "SYNC_ZOTERO_STREAM_START" }, "*");
 
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -115,7 +178,7 @@
             const text = parts
               .filter((p) => typeof p === "string")
               .join("");
-            if (text && text !== lastText) {
+            if (hasMeaningfulAssistantText(text) && text !== lastText) {
               lastText = text;
               window.postMessage(
                 {
@@ -151,7 +214,7 @@
       }
 
       // Stream ended without [DONE] — still emit final state
-      if (lastText) {
+      if (hasMeaningfulAssistantText(lastText)) {
         window.postMessage(
           {
             type: "SYNC_ZOTERO_SSE",

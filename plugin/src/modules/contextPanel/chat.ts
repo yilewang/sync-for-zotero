@@ -2813,6 +2813,7 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
         question,
         host: getRelayBaseUrl(),
         sendPdf: opts.webchatSendPdf === true,
+        forceNewChat: opts.webchatForceNewChat === true,
         images: screenshotImagesForMessage.length > 0 ? screenshotImagesForMessage : undefined,
         chatgptMode,
         signal: currentAbortController?.signal,

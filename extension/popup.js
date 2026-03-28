@@ -28,7 +28,7 @@ function setPipelineIndicator(state, message) {
 chrome.runtime.sendMessage({ type: "GET_FULL_STATUS" }, (status) => {
   if (!status) return;
 
-  setIndicator(dotHost, valHost, status.webHostAlive, status.webHostAlive ? "Connected" : "Offline");
+  setIndicator(dotHost, valHost, status.relayAlive, status.relayAlive ? "Connected" : "Offline");
   setIndicator(dotTab, valTab, status.chatTabAlive, status.chatTabAlive ? "Tab active" : "No tab");
   setPipelineIndicator(status.pipelineState || "idle", status.pipelineMessage || "Idle");
 

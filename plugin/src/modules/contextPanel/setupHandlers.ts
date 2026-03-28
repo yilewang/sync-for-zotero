@@ -1498,16 +1498,26 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       clearPaperModeOverrides(itemId);
       return;
     }
+    // Standard path: consume full-next mode for non-PDF papers
     const fullTextPaperContexts = getEffectiveFullTextPaperContexts(item);
-    if (!fullTextPaperContexts.length) return;
     for (const paperContext of fullTextPaperContexts) {
       const mode = resolvePaperContextNextSendMode(itemId, paperContext);
       if (mode === "full-next") {
         setPaperModeOverride(itemId, paperContext, "retrieval");
       }
-      // [webchat] Also grey out full-sticky papers after send to prevent duplicate PDF
-      if (opts?.webchatGreyOut && mode === "full-sticky") {
-        setPaperModeOverride(itemId, paperContext, "retrieval");
+    }
+    // [webchat] Also consume full-next for PDF-source papers.
+    // getEffectiveFullTextPaperContexts excludes PDF-source papers,
+    // but in webchat mode these papers also use full-next/full-sticky semantics
+    // for controlling whether to send the PDF binary to ChatGPT.
+    if (opts?.webchatGreyOut) {
+      const allPaperContexts = getAllEffectivePaperContexts(item);
+      for (const paperContext of allPaperContexts) {
+        if (resolvePaperContentSourceMode(itemId, paperContext) !== "pdf") continue;
+        const mode = resolvePaperContextNextSendMode(itemId, paperContext);
+        if (mode === "full-next") {
+          setPaperModeOverride(itemId, paperContext, "retrieval");
+        }
       }
     }
   };
@@ -2107,6 +2117,10 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     const removable = options?.removable === true;
     const fullText = options?.fullText === true;
     const contentSourceMode = options?.contentSourceMode || "text";
+    const showPdfChipStyle =
+      contentSourceMode === "pdf" && (!isWebChatMode() || fullText);
+    const showTextChipStyle =
+      contentSourceMode === "text" || (isWebChatMode() && contentSourceMode === "pdf" && !fullText);
     const chip = createElement(
       ownerDoc,
       "div",
@@ -2125,8 +2139,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     chip.classList.toggle("llm-paper-context-chip-full", fullText);
     chip.dataset.contentSource = contentSourceMode;
     chip.classList.toggle("llm-paper-context-chip-mineru", contentSourceMode === "mineru");
-    chip.classList.toggle("llm-paper-context-chip-pdf", contentSourceMode === "pdf");
-    chip.classList.toggle("llm-paper-context-chip-text", contentSourceMode === "text");
+    chip.classList.toggle("llm-paper-context-chip-pdf", showPdfChipStyle);
+    chip.classList.toggle("llm-paper-context-chip-text", showTextChipStyle);
     chip.classList.add("collapsed");
 
     const chipHeader = createElement(
@@ -4997,8 +5011,20 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       ztoolkit.log(`[webchat] + clicked: authMode=${_debugEntry?.authMode}, entryId=${_debugEntry?.entryId}, isWebChat=${_debugEntry?.authMode === "webchat"}`);
       if (isWebChatMode()) {
         // Clear local chat panel and mark the relay as needing a new chat.
-        // The pipeline will navigate ChatGPT to a fresh page when the next message is sent
-        // (it checks if the tab URL contains "/c/" and navigates to the base URL).
+        // The next send carries an explicit force_new_chat intent to the relay,
+        // and we also trigger a remote new-chat command immediately.
+        markNextWebChatSendAsNewChat();
+        void (async () => {
+          try {
+            const [{ getRelayBaseUrl }, { sendNewChat }] = await Promise.all([
+              import("../../webchat/relayServer"),
+              import("../../webchat/client"),
+            ]);
+            await sendNewChat(getRelayBaseUrl());
+          } catch (err) {
+            ztoolkit.log("[webchat] Failed to trigger immediate new chat", err);
+          }
+        })();
         const key = getConversationKey(item);
         chatHistory.set(key, []);
         refreshChatPreservingScroll();
@@ -6095,6 +6121,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
 
           // [webchat] Entering webchat mode → fresh session, then apply webchat UI AFTER re-render
           if (entry.authMode === "webchat" && !wasWebChat) {
+            markNextWebChatSendAsNewChat();
             void (async () => {
               if (isGlobalMode()) {
                 await createAndSwitchGlobalConversation();
@@ -6248,7 +6275,35 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
 
   // [webchat] Remember the previous model so "Exit" can restore it
   let previousNonWebchatModelId: string | null = null;
+  let webchatForceNewChatOnNextSend = false;
+  let webchatPdfUploadedInCurrentConversation = false;
   let webchatConnectionTimer: ReturnType<typeof setInterval> | null = null;
+
+  const markNextWebChatSendAsNewChat = () => {
+    webchatForceNewChatOnNextSend = true;
+    webchatPdfUploadedInCurrentConversation = false;
+  };
+
+  const clearNextWebChatNewChatIntent = () => {
+    webchatForceNewChatOnNextSend = false;
+  };
+
+  const consumeWebChatForceNewChatIntent = () => {
+    const shouldForce = webchatForceNewChatOnNextSend;
+    webchatForceNewChatOnNextSend = false;
+    return shouldForce;
+  };
+
+  const hasUploadedPdfInCurrentWebChatConversation = () =>
+    webchatPdfUploadedInCurrentConversation;
+
+  const markWebChatPdfUploadedForCurrentConversation = () => {
+    webchatPdfUploadedInCurrentConversation = true;
+  };
+
+  const resetWebChatPdfUploadedForCurrentConversation = () => {
+    webchatPdfUploadedInCurrentConversation = false;
+  };
 
   const startWebChatConnectionCheck = (dot: HTMLElement) => {
     stopWebChatConnectionCheck();
@@ -6653,8 +6708,10 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
             if (status) setStatus(status, "Loading conversation from ChatGPT…", "sending");
 
             const { loadChatSession, fetchScrapedMessages } = await import("../../webchat/client");
+            resetWebChatPdfUploadedForCurrentConversation();
+            clearNextWebChatNewChatIntent();
             const result = await loadChatSession(host, session.id);
-            // The web host sends a LOAD_CHAT command to the extension,
+            // The embedded relay sends a LOAD_CHAT command to the extension,
             // which navigates ChatGPT to the conversation URL.
 
             const messages: Message[] = [];
@@ -8351,6 +8408,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       getEffectivePdfModePaperContexts(currentItem, selectedPaperContexts),
     hasActivePdfFullTextPapers: (currentItem, selectedPaperContexts) =>
       hasActivePdfFullTextPapers(currentItem, selectedPaperContexts),
+    hasUploadedPdfInCurrentWebChatConversation,
+    markWebChatPdfUploadedForCurrentConversation,
     resolvePdfPaperAttachments: async (paperContexts) => {
       const results: import("./types").ChatAttachment[] = [];
       for (const pc of paperContexts) {
@@ -8449,6 +8508,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     isScreenshotUnsupportedModel,
     getSelectedReasoning,
     getAdvancedModelParams,
+    consumeWebChatForceNewChatIntent,
     getActiveEditSession: () => activeEditSession,
     setActiveEditSession: (nextEditSession) => {
       activeEditSession = nextEditSession;
@@ -8541,6 +8601,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       const port = Zotero.Prefs.get("httpServer.port") || 23119;
       return `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
     },
+    markNextWebChatSendAsNewChat,
   });
   const executeSend = async () => {
     // If the inline edit widget is active, route through editUserTurnAndRetry
@@ -10672,6 +10733,8 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
       // [webchat] "Exit" button → restore previous model and leave webchat mode
       if (isWebChatMode()) {
         stopWebChatConnectionCheck();
+        clearNextWebChatNewChatIntent();
+        resetWebChatPdfUploadedForCurrentConversation();
         // Restore previous model, or fall back to first non-webchat model
         const restoreId = previousNonWebchatModelId
           || getAvailableModelEntries().find((e) => e.authMode !== "webchat")?.entryId

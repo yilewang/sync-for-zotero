@@ -58,6 +58,8 @@ type SendFlowControllerDeps = {
     item: Zotero.Item,
     paperContexts: PaperContextRef[],
   ) => boolean;
+  hasUploadedPdfInCurrentWebChatConversation: () => boolean;
+  markWebChatPdfUploadedForCurrentConversation: () => void;
   resolvePdfPaperAttachments: (
     paperContexts: PaperContextRef[],
   ) => Promise<ChatAttachment[]>;
@@ -111,6 +113,7 @@ type SendFlowControllerDeps = {
   getAdvancedModelParams: (
     entryId: string | undefined,
   ) => AdvancedModelParams | undefined;
+  consumeWebChatForceNewChatIntent: () => boolean;
   getActiveEditSession: () => EditLatestTurnMarker | null;
   setActiveEditSession: (value: EditLatestTurnMarker | null) => void;
   getLatestEditablePair: () => Promise<LatestEditablePair | null>;
@@ -423,8 +426,14 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
     // Purple chip (full-text mode) = send PDF; grey chip (retrieval) = skip.
     // Note: fullTextPaperContexts excludes PDF-content-source papers by design,
     // so we use hasActivePdfFullTextPapers which checks both content source AND send mode.
+    const webchatForceNewChat = isWebChat
+      ? deps.consumeWebChatForceNewChatIntent()
+      : false;
     const webchatSendPdf = isWebChat
-      ? deps.hasActivePdfFullTextPapers(item, allSelectedPaperContexts)
+      ? (
+        deps.hasActivePdfFullTextPapers(item, allSelectedPaperContexts) &&
+        (webchatForceNewChat || !deps.hasUploadedPdfInCurrentWebChatConversation())
+      )
       : false;
 
     const sendTask = deps.sendQuestion({
@@ -449,12 +458,8 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       pdfModePaperKeys: pdfModeKeySet.size > 0 ? pdfModeKeySet : undefined,
       pdfUploadSystemMessages: pdfUploadSystemMessages.length ? pdfUploadSystemMessages : undefined,
       webchatSendPdf,
+      webchatForceNewChat,
     });
-    if (hasPaperComposeState) {
-      deps.consumePaperModeState(item.id, { webchatGreyOut: isWebChat });
-      deps.retainPaperState(item.id);
-      deps.updatePaperPreviewPreservingScroll();
-    }
     const win = deps.body.ownerDocument?.defaultView;
     if (win) {
       win.setTimeout(() => {
@@ -462,6 +467,14 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       }, 120);
     }
     await sendTask;
+    if (isWebChat && webchatSendPdf) {
+      deps.markWebChatPdfUploadedForCurrentConversation();
+    }
+    if (hasPaperComposeState) {
+      deps.consumePaperModeState(item.id, { webchatGreyOut: isWebChat });
+      deps.retainPaperState(item.id);
+      deps.updatePaperPreviewPreservingScroll();
+    }
     deps.refreshGlobalHistoryHeader();
     } finally {
       deps.autoUnlockGlobalChat();
