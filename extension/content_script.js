@@ -37,7 +37,7 @@ const shared = globalThis.SyncZoteroShared || {
     if ((snapshot.outboundRequestSerial || 0) > (snapshot.baselineOutboundRequestSerial || 0)) return true;
     if (snapshot.stopButtonVisible) return true;
     if ((snapshot.userMessageCount || 0) > (snapshot.baselineUserMessageCount || 0)) return true;
-    return String(snapshot.composerTextAfter || "").trim() === "";
+    return false;
   },
   isPlaceholderAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase();
@@ -82,28 +82,77 @@ function setNativeValue(el, value) {
   } else {
     el.value = value;
   }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
+  try {
+    el.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      cancelable: true,
+      data: value ?? "",
+      inputType: value ? "insertText" : "deleteContentBackward",
+    }));
+  } catch (_) {
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
   el.dispatchEvent(new Event("change", { bubbles: true }));
+  if (typeof el.setSelectionRange === "function") {
+    const caret = String(value || "").length;
+    el.setSelectionRange(caret, caret);
+  }
 }
 
-async function getComposerElement() {
-  let composer = findComposerNow();
-  if (!composer) {
-    composer = await waitForElement("[data-testid='text-input']", 8000).catch(() => null);
+function isVisibleElement(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden") return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function isUsableComposer(el) {
+  if (!(el instanceof HTMLElement)) return false;
+  if (!isVisibleElement(el)) return false;
+  if (el.getAttribute("aria-hidden") === "true") return false;
+  if (el instanceof HTMLTextAreaElement) {
+    return !el.disabled && !el.readOnly;
   }
-  if (!composer) {
-    composer = await waitForElement("textarea", 5000);
+  const contentEditable = el.getAttribute("contenteditable");
+  if (contentEditable && contentEditable !== "true" && contentEditable !== "plaintext-only") {
+    return false;
   }
-  return composer;
+  return true;
+}
+
+function getComposerCandidates() {
+  const selectors = [
+    "#prompt-textarea",
+    "[data-testid='text-input']",
+    "[role='textbox'][contenteditable='true']",
+    "div[contenteditable='true']",
+    "textarea",
+  ];
+  const candidates = [];
+  for (const selector of selectors) {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) {
+      if (isUsableComposer(node)) {
+        candidates.push(node);
+      }
+    }
+  }
+  return candidates;
+}
+
+async function getComposerElement(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const composer = findComposerNow();
+    if (composer) return composer;
+    await sleep(100);
+  }
+  throw new Error("ChatGPT composer was not ready in time.");
 }
 
 function findComposerNow() {
-  return (
-    document.querySelector("#prompt-textarea") ||
-    document.querySelector("[data-testid='text-input']") ||
-    document.querySelector("textarea") ||
-    null
-  );
+  return getComposerCandidates()[0] || null;
 }
 
 function readComposerText(composer) {
@@ -405,10 +454,10 @@ async function selectChatGPTMode(mode) {
 // ---------------------------------------------------------------------------
 
 async function typePromptAndVerify(promptText) {
-  const composer = await getComposerElement();
   const expectedText = shared.normalizeComposerText(promptText);
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    const composer = await getComposerElement();
     composer.focus();
 
     if (composer.tagName === "TEXTAREA") {
@@ -434,34 +483,85 @@ async function typePromptAndVerify(promptText) {
 // Step 3: Submit
 // ---------------------------------------------------------------------------
 
-function findSendButton() {
-  return (
-    document.querySelector("button[data-testid='send-button']") ||
-    document.querySelector("button[aria-label='Send message']") ||
-    document.querySelector("button[aria-label='Send prompt']") ||
-    document.querySelector("button[type='submit']") ||
-    [...document.querySelectorAll("form button")].at(-1) ||
-    null
-  );
+function isEnabledButton(btn) {
+  return Boolean(btn) && !btn.disabled && !btn.hasAttribute("disabled") && isVisibleElement(btn);
 }
 
-async function waitForSendButtonEnabled() {
-  // Wait for the send button to exist AND not be disabled
-  // (ChatGPT disables it while the uploaded file is being processed)
-  // Wait up to 120 seconds — PDF uploads to ChatGPT can take a while
-  // Wait up to 180s — large PDF uploads to ChatGPT can take a while
-  for (let i = 0; i < 360; i++) {
-    const btn = findSendButton();
-    if (btn && !btn.disabled && !btn.hasAttribute("disabled")) {
-      return btn;
-    }
-    await sleep(500);
+async function waitForSendButton(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const button = findSendButton();
+    if (button) return button;
+    await sleep(100);
   }
   return null;
 }
 
-async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount) {
-  const deadline = Date.now() + 10_000;
+function findSendButton(composer = findComposerNow()) {
+  const roots = [
+    composer?.closest("form") || null,
+    composer?.closest("[class*='composer']") || null,
+    composer?.closest("[data-testid*='composer']") || null,
+    composer?.parentElement || null,
+    document,
+  ];
+
+  for (const root of roots) {
+    if (!root) continue;
+    const match =
+      root.querySelector?.("button[data-testid='send-button']") ||
+      root.querySelector?.("button[aria-label='Send message']") ||
+      root.querySelector?.("button[aria-label='Send prompt']") ||
+      root.querySelector?.("button[aria-label='Send']") ||
+      root.querySelector?.("button[type='submit']");
+    if (match && isVisibleElement(match)) return match;
+  }
+
+  return null;
+}
+
+async function waitForSendButtonEnabled(timeoutMs = 8000) {
+  // Wait for the send button to exist AND not be disabled
+  // (ChatGPT disables it while the uploaded file is being processed)
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const btn = findSendButton();
+    if (isEnabledButton(btn)) {
+      return btn;
+    }
+    await sleep(100);
+  }
+  return null;
+}
+
+function dispatchSubmitViaEnter(composer) {
+  if (!composer) return;
+  composer.focus();
+  const eventInit = {
+    key: "Enter",
+    code: "Enter",
+    keyCode: 13,
+    which: 13,
+    bubbles: true,
+    cancelable: true,
+  };
+  composer.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+  composer.dispatchEvent(new KeyboardEvent("keypress", eventInit));
+  composer.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+}
+
+function dispatchSubmitViaForm(composer) {
+  const form = composer?.closest?.("form");
+  if (!form) return;
+  if (typeof form.requestSubmit === "function") {
+    form.requestSubmit();
+    return;
+  }
+  form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+}
+
+async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     const composer = findComposerNow();
@@ -481,25 +581,44 @@ async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial
 }
 
 async function submitMessageAndVerify(promptText) {
-  const baselineUserMessageCount = document.querySelectorAll(
-    "[data-message-author-role='user']"
-  ).length;
-
   for (let attempt = 0; attempt < 2; attempt++) {
-    const sendBtn = await waitForSendButtonEnabled();
-    if (!sendBtn) throw new Error("Send button never became enabled");
+    const submitStrategies = [
+      async (composer) => {
+        const sendBtn = await waitForSendButtonEnabled(1200);
+        if (!isEnabledButton(sendBtn)) return false;
+        sendBtn.click();
+        return true;
+      },
+      (composer) => dispatchSubmitViaEnter(composer),
+      (composer) => dispatchSubmitViaForm(composer),
+    ];
 
-    const baselineOutboundRequestSerial = outboundRequestSerial;
-    sendBtn.click();
+    for (const submit of submitStrategies) {
+      const composer = await getComposerElement();
+      const sendBtn = await waitForSendButton(4000);
+      if (!sendBtn && attempt === 0) {
+        await sleep(150);
+      }
 
-    const delivered = await waitForSubmissionSignal(
-      promptText,
-      baselineOutboundRequestSerial,
-      baselineUserMessageCount,
-    );
-    if (delivered) return true;
+      const baselineUserMessageCount = document.querySelectorAll(
+        "[data-message-author-role='user']"
+      ).length;
+      const baselineOutboundRequestSerial = outboundRequestSerial;
 
-    await typePromptAndVerify(promptText);
+      const submitStarted = await submit(composer, sendBtn);
+      if (submitStarted === false) {
+        continue;
+      }
+
+      const delivered = await waitForSubmissionSignal(
+        promptText,
+        baselineOutboundRequestSerial,
+        baselineUserMessageCount,
+      );
+      if (delivered) return true;
+
+      await typePromptAndVerify(promptText);
+    }
   }
 
   throw new Error("Prompt delivery failed: ChatGPT did not accept the prompt after 2 attempts.");
@@ -621,6 +740,17 @@ async function streamResponse(onPartial, onVisibilityChange, onStreamStart, time
       if (text && text.length > 0) { streamStarted = true; break; }
     }
     await workerSleep(300);
+  }
+
+  if (!streamStarted) {
+    const delayedText = await waitForMeaningfulAssistantResponse(baselineCount, 2000);
+    if (delayedText) {
+      onPartial(delayedText, extractThinking());
+      onStreamStart?.();
+      await workerSleep(1000);
+      return;
+    }
+    throw new Error("ChatGPT did not start responding after the prompt was submitted.");
   }
 
   if (streamStarted) {

@@ -5014,6 +5014,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
         // The next send carries an explicit force_new_chat intent to the relay,
         // and we also trigger a remote new-chat command immediately.
         markNextWebChatSendAsNewChat();
+        primeFreshWebChatPaperChipState();
         void (async () => {
           try {
             const [{ getRelayBaseUrl }, { sendNewChat }] = await Promise.all([
@@ -6122,6 +6123,7 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
           // [webchat] Entering webchat mode → fresh session, then apply webchat UI AFTER re-render
           if (entry.authMode === "webchat" && !wasWebChat) {
             markNextWebChatSendAsNewChat();
+            primeFreshWebChatPaperChipState();
             void (async () => {
               if (isGlobalMode()) {
                 await createAndSwitchGlobalConversation();
@@ -6292,6 +6294,15 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
     const shouldForce = webchatForceNewChatOnNextSend;
     webchatForceNewChatOnNextSend = false;
     return shouldForce;
+  };
+
+  const primeFreshWebChatPaperChipState = () => {
+    if (!item) return;
+    const autoLoadedPaperContext = resolveAutoLoadedPaperContext();
+    if (autoLoadedPaperContext) {
+      setPaperModeOverride(item.id, autoLoadedPaperContext, "full-next");
+    }
+    updatePaperPreviewPreservingScroll();
   };
 
   const hasUploadedPdfInCurrentWebChatConversation = () =>

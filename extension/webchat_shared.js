@@ -55,9 +55,6 @@
     if ((snapshot.userMessageCount || 0) > (snapshot.baselineUserMessageCount || 0)) {
       return true;
     }
-    if (normalizeComposerText(snapshot.composerTextAfter) === "") {
-      return true;
-    }
     return false;
   }
 

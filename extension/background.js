@@ -31,6 +31,7 @@ const shared = globalThis.SyncZoteroShared || {
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const CHATGPT_URL = "https://chatgpt.com/";
 const MAX_PRE_SUBMIT_RELEASES = 3;
+const RELAY_POLL_INTERVAL_MS = 500;
 
 // Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
 async function discoverZoteroPort() {
@@ -141,10 +142,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // Main poll loop (runs while SW is alive)
-setInterval(pollForQuery, 2000);
+setInterval(pollForQuery, RELAY_POLL_INTERVAL_MS);
 
 // Poll for navigation commands from the embedded Zotero relay
-setInterval(pollForCommand, 2000);
+setInterval(pollForCommand, RELAY_POLL_INTERVAL_MS);
 
 async function pollForCommand() {
   if (pipelineRunning) return;

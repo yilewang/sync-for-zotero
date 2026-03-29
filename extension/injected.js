@@ -49,6 +49,14 @@
     return true;
   }
 
+  function isConversationRequest(url, method) {
+    if (method !== "POST") return false;
+    return (
+      /\/backend-api\/(?:f\/)?conversation\b/.test(url) ||
+      /\/backend-anon\/conversation\b/.test(url)
+    );
+  }
+
   window.fetch = async function (...args) {
     try {
       // Determine the request URL
@@ -59,10 +67,7 @@
       ).toUpperCase();
 
       // Intercept POST to the conversation endpoint (ChatGPT's streaming API)
-      if (
-        method === "POST" &&
-        url.includes("/backend-api/conversation")
-      ) {
+      if (isConversationRequest(url, method)) {
         window.postMessage(
           {
             type: "SYNC_ZOTERO_REQUEST",
@@ -87,10 +92,7 @@
         (args[0] instanceof Request ? args[0].method : args[1]?.method) || "GET"
       ).toUpperCase();
 
-      if (
-        method === "POST" &&
-        url.includes("/backend-api/conversation")
-      ) {
+      if (isConversationRequest(url, method)) {
         // Clone so we can read without consuming the original
         const clone = response.clone();
         processSSEResponse(clone).catch((err) => {

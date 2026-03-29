@@ -40,7 +40,7 @@ describe("webchat shared helpers", function () {
     assert.isTrue(shared.hasMeaningfulAssistantText("Here is the real answer."));
   });
 
-  it("treats outbound requests and visible composer transitions as delivery signals", function () {
+  it("treats outbound requests and visible user/send transitions as delivery signals", function () {
     assert.isTrue(shared.hasDeliverySignal({
       baselineOutboundRequestSerial: 4,
       outboundRequestSerial: 5,
@@ -61,6 +61,15 @@ describe("webchat shared helpers", function () {
   });
 
   it("returns false when submit produced no observable delivery signal", function () {
+    assert.isFalse(shared.hasDeliverySignal({
+      baselineOutboundRequestSerial: 7,
+      outboundRequestSerial: 7,
+      baselineUserMessageCount: 2,
+      userMessageCount: 2,
+      stopButtonVisible: false,
+      composerTextAfter: "",
+    }));
+
     assert.isFalse(shared.hasDeliverySignal({
       baselineOutboundRequestSerial: 7,
       outboundRequestSerial: 7,
