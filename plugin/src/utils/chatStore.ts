@@ -44,6 +44,8 @@ export type StoredChatMessage = {
   modelName?: string;
   modelEntryId?: string;
   modelProviderLabel?: string;
+  webchatRunState?: "done" | "incomplete" | "error";
+  webchatCompletionReason?: "settled" | "forced_cancel" | "timeout" | "error" | null;
   reasoningSummary?: string;
   reasoningDetails?: string;
 };
@@ -177,6 +179,8 @@ export async function initChatStore(): Promise<void> {
         model_name TEXT,
         model_entry_id TEXT,
         model_provider_label TEXT,
+        webchat_run_state TEXT,
+        webchat_completion_reason TEXT,
         reasoning_summary TEXT,
         reasoning_details TEXT
       )`,
@@ -210,6 +214,24 @@ export async function initChatStore(): Promise<void> {
       await Zotero.DB.queryAsync(
         `ALTER TABLE ${CHAT_MESSAGES_TABLE}
          ADD COLUMN model_provider_label TEXT`,
+      );
+    }
+    const hasWebchatRunStateColumn = Boolean(
+      columns?.some((column) => column?.name === "webchat_run_state"),
+    );
+    if (!hasWebchatRunStateColumn) {
+      await Zotero.DB.queryAsync(
+        `ALTER TABLE ${CHAT_MESSAGES_TABLE}
+         ADD COLUMN webchat_run_state TEXT`,
+      );
+    }
+    const hasWebchatCompletionReasonColumn = Boolean(
+      columns?.some((column) => column?.name === "webchat_completion_reason"),
+    );
+    if (!hasWebchatCompletionReasonColumn) {
+      await Zotero.DB.queryAsync(
+        `ALTER TABLE ${CHAT_MESSAGES_TABLE}
+         ADD COLUMN webchat_completion_reason TEXT`,
       );
     }
     const hasRunModeColumn = Boolean(
@@ -398,6 +420,8 @@ export async function loadConversation(
             model_name AS modelName,
             model_entry_id AS modelEntryId,
             model_provider_label AS modelProviderLabel,
+            webchat_run_state AS webchatRunState,
+            webchat_completion_reason AS webchatCompletionReason,
             reasoning_summary AS reasoningSummary,
             reasoning_details AS reasoningDetails
      FROM ${CHAT_MESSAGES_TABLE}
@@ -424,6 +448,8 @@ export async function loadConversation(
         modelName?: unknown;
         modelEntryId?: unknown;
         modelProviderLabel?: unknown;
+        webchatRunState?: unknown;
+        webchatCompletionReason?: unknown;
         reasoningSummary?: unknown;
         reasoningDetails?: unknown;
       }>
@@ -675,6 +701,19 @@ export async function loadConversation(
         typeof row.modelProviderLabel === "string"
           ? row.modelProviderLabel
           : undefined,
+      webchatRunState:
+        row.webchatRunState === "done" ||
+        row.webchatRunState === "incomplete" ||
+        row.webchatRunState === "error"
+          ? row.webchatRunState
+          : undefined,
+      webchatCompletionReason:
+        row.webchatCompletionReason === "settled" ||
+        row.webchatCompletionReason === "forced_cancel" ||
+        row.webchatCompletionReason === "timeout" ||
+        row.webchatCompletionReason === "error"
+          ? row.webchatCompletionReason
+          : undefined,
       reasoningSummary:
         typeof row.reasoningSummary === "string"
           ? row.reasoningSummary
@@ -743,8 +782,8 @@ export async function appendMessage(
     : [];
   await Zotero.DB.queryAsync(
     `INSERT INTO ${CHAT_MESSAGES_TABLE}
-      (conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, paper_contexts_json, full_text_paper_contexts_json, screenshot_images, attachments_json, model_name, model_entry_id, model_provider_label, reasoning_summary, reasoning_details)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, paper_contexts_json, full_text_paper_contexts_json, screenshot_images, attachments_json, model_name, model_entry_id, model_provider_label, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       normalizedKey,
       message.role,
@@ -770,6 +809,8 @@ export async function appendMessage(
       message.modelName || null,
       message.modelEntryId || null,
       message.modelProviderLabel || null,
+      message.webchatRunState || null,
+      message.webchatCompletionReason || null,
       message.reasoningSummary || null,
       message.reasoningDetails || null,
     ],
@@ -902,6 +943,8 @@ export async function updateLatestAssistantMessage(
     | "modelName"
     | "modelEntryId"
     | "modelProviderLabel"
+    | "webchatRunState"
+    | "webchatCompletionReason"
     | "reasoningSummary"
     | "reasoningDetails"
   >,
@@ -919,6 +962,8 @@ export async function updateLatestAssistantMessage(
          model_name = ?,
          model_entry_id = ?,
          model_provider_label = ?,
+         webchat_run_state = ?,
+         webchat_completion_reason = ?,
          reasoning_summary = ?,
          reasoning_details = ?
      WHERE id = (
@@ -936,6 +981,8 @@ export async function updateLatestAssistantMessage(
       message.modelName || null,
       message.modelEntryId || null,
       message.modelProviderLabel || null,
+      message.webchatRunState || null,
+      message.webchatCompletionReason || null,
       message.reasoningSummary || null,
       message.reasoningDetails || null,
       normalizedKey,

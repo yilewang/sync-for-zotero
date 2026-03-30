@@ -45,6 +45,14 @@ interface PendingCommand {
   chatId?: string;
 }
 
+export interface ScrapedChatMessage {
+  messageKey?: string;
+  role: string;
+  text: string;
+  thinking?: string;
+  attachments?: string[];
+}
+
 export type RelayQueryPhase =
   | "pending"
   | "claimed"
@@ -54,8 +62,40 @@ export type RelayQueryPhase =
   | "done"
   | "error";
 
+export type RelayRunState =
+  | "submitted"
+  | "active"
+  | "settling"
+  | "done"
+  | "incomplete"
+  | "error";
+
+export type RelayCompletionReason =
+  | "settled"
+  | "forced_cancel"
+  | "timeout"
+  | "error";
+
+export type RelayTurnStatus =
+  | "navigating"
+  | "ready"
+  | "submitted"
+  | "user_turn_matched"
+  | "assistant_turn_matched"
+  | "assistant_settling"
+  | "done"
+  | "incomplete"
+  | "error";
+
 export interface RelayState {
   status: "idle" | "pending" | "running" | "done" | "error";
+  remote_chat_url: string | null;
+  remote_chat_id: string | null;
+  user_turn_key: string | null;
+  assistant_turn_key: string | null;
+  baseline_transcript_count: number;
+  baseline_transcript_hash: string | null;
+  turn_status: RelayTurnStatus | null;
   query: {
     prompt: string | null;
     pdf_base64: string | null;
@@ -72,6 +112,11 @@ export interface RelayState {
   running_since: number;
   partial_text: string | null;
   partial_thinking: string | null;
+  answer_anchor_id: string | null;
+  answer_revision: number;
+  thinking_revision: number;
+  run_state: RelayRunState | null;
+  completion_reason: RelayCompletionReason | null;
   responses: Array<{
     seq: number;
     attempt?: number;
@@ -79,6 +124,18 @@ export interface RelayState {
     error?: string;
     timestamp: string;
     thinking?: string;
+    answer_anchor_id?: string | null;
+    answer_revision?: number;
+    thinking_revision?: number;
+    run_state?: RelayRunState;
+    completion_reason?: RelayCompletionReason | null;
+    remote_chat_url?: string | null;
+    remote_chat_id?: string | null;
+    user_turn_key?: string | null;
+    assistant_turn_key?: string | null;
+    baseline_transcript_count?: number;
+    baseline_transcript_hash?: string | null;
+    turn_status?: RelayTurnStatus | null;
   }>;
   activeSessionId: string | null;
   pendingCommand: PendingCommand | null;
@@ -92,7 +149,7 @@ const Z = Zotero as unknown as {
   _webchatRelay?: {
     state: RelayState;
     mirroredHistory: Array<{ id: string; title: string; chatUrl: string }>;
-    scrapedMessages: Array<{ role: string; text: string }> | null;
+    scrapedMessages: ScrapedChatMessage[] | null;
   };
 };
 
@@ -100,6 +157,13 @@ if (!Z._webchatRelay) {
   Z._webchatRelay = {
     state: {
       status: "idle",
+      remote_chat_url: null,
+      remote_chat_id: null,
+      user_turn_key: null,
+      assistant_turn_key: null,
+      baseline_transcript_count: 0,
+      baseline_transcript_hash: null,
+      turn_status: null,
       query: {
         prompt: null,
         pdf_base64: null,
@@ -116,6 +180,11 @@ if (!Z._webchatRelay) {
       running_since: 0,
       partial_text: null,
       partial_thinking: null,
+      answer_anchor_id: null,
+      answer_revision: 0,
+      thinking_revision: 0,
+      run_state: null,
+      completion_reason: null,
       responses: [],
       activeSessionId: null,
       pendingCommand: null,
@@ -131,7 +200,11 @@ if (!Z._webchatRelay) {
 // because we register endpoint classes directly on it.
 const STORAGE_KEY = "__webchatRelayStorage";
 
-function _store(): { state: RelayState; mirroredHistory: Array<{ id: string; title: string; chatUrl: string }>; scrapedMessages: Array<{ role: string; text: string }> | null } {
+function _store(): {
+  state: RelayState;
+  mirroredHistory: Array<{ id: string; title: string; chatUrl: string }>;
+  scrapedMessages: ScrapedChatMessage[] | null;
+} {
   const ep = Zotero.Server.Endpoints as any;
   if (!ep[STORAGE_KEY]) {
     ep[STORAGE_KEY] = Z._webchatRelay;
@@ -142,12 +215,19 @@ function _store(): { state: RelayState; mirroredHistory: Array<{ id: string; tit
 function S(): RelayState { return _store().state; }
 function getMirroredHistory(): Array<{ id: string; title: string; chatUrl: string }> { return _store().mirroredHistory; }
 function setMirroredHistory(h: Array<{ id: string; title: string; chatUrl: string }>) { _store().mirroredHistory = h; }
-function getScrapedMessages(): Array<{ role: string; text: string }> | null { return _store().scrapedMessages; }
-function setScrapedMessages(m: Array<{ role: string; text: string }> | null) { _store().scrapedMessages = m; }
+function getScrapedMessages(): ScrapedChatMessage[] | null { return _store().scrapedMessages; }
+function setScrapedMessages(m: ScrapedChatMessage[] | null) { _store().scrapedMessages = m; }
 
 function resetState() {
   const prevSeq = S().query.seq; // preserve seq counter so background.js doesn't skip new queries
   S().status = "idle";
+  S().remote_chat_url = null;
+  S().remote_chat_id = null;
+  S().user_turn_key = null;
+  S().assistant_turn_key = null;
+  S().baseline_transcript_count = 0;
+  S().baseline_transcript_hash = null;
+  S().turn_status = null;
   S().query = {
     prompt: null,
     pdf_base64: null,
@@ -164,6 +244,11 @@ function resetState() {
   S().running_since = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  S().answer_anchor_id = null;
+  S().answer_revision = 0;
+  S().thinking_revision = 0;
+  S().run_state = null;
+  S().completion_reason = null;
   S().responses = [];
   S().activeSessionId = null;
   S().pendingCommand = null;
@@ -249,11 +334,117 @@ function expireStaleClaimIfNeeded(): void {
   S().running_since = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  S().answer_anchor_id = null;
+  S().answer_revision = 0;
+  S().thinking_revision = 0;
+  S().run_state = null;
+  S().completion_reason = null;
 }
 
 function attemptMatches(body: Record<string, unknown>): boolean {
   if (!("attempt" in body) || body.attempt == null) return true;
   return Number(body.attempt) === S().active_attempt;
+}
+
+function normalizeRunState(
+  value: unknown,
+  fallback: RelayRunState | null = null,
+): RelayRunState | null {
+  return value === "submitted" ||
+    value === "active" ||
+    value === "settling" ||
+    value === "done" ||
+    value === "incomplete" ||
+    value === "error"
+    ? value
+    : fallback;
+}
+
+function normalizeCompletionReason(
+  value: unknown,
+  fallback: RelayCompletionReason | null = null,
+): RelayCompletionReason | null {
+  return value === "settled" ||
+    value === "forced_cancel" ||
+    value === "timeout" ||
+    value === "error"
+    ? value
+    : fallback;
+}
+
+function normalizeTurnStatus(
+  value: unknown,
+  fallback: RelayTurnStatus | null = null,
+): RelayTurnStatus | null {
+  return value === "navigating" ||
+    value === "ready" ||
+    value === "submitted" ||
+    value === "user_turn_matched" ||
+    value === "assistant_turn_matched" ||
+    value === "assistant_settling" ||
+    value === "done" ||
+    value === "incomplete" ||
+    value === "error"
+    ? value
+    : fallback;
+}
+
+function applyRemoteTurnMetadata(body: Record<string, unknown>): void {
+  if ("remote_chat_url" in body) {
+    S().remote_chat_url =
+      typeof body.remote_chat_url === "string"
+        ? body.remote_chat_url
+        : null;
+  }
+  if ("remote_chat_id" in body) {
+    S().remote_chat_id =
+      typeof body.remote_chat_id === "string"
+        ? body.remote_chat_id
+        : null;
+  }
+  if ("user_turn_key" in body) {
+    S().user_turn_key =
+      typeof body.user_turn_key === "string"
+        ? body.user_turn_key
+        : null;
+  }
+  if ("assistant_turn_key" in body) {
+    S().assistant_turn_key =
+      typeof body.assistant_turn_key === "string"
+        ? body.assistant_turn_key
+        : null;
+  }
+  if ("baseline_transcript_count" in body) {
+    const count = Number(body.baseline_transcript_count);
+    if (Number.isFinite(count) && count >= 0) {
+      S().baseline_transcript_count = Math.floor(count);
+    }
+  }
+  if ("baseline_transcript_hash" in body) {
+    S().baseline_transcript_hash =
+      typeof body.baseline_transcript_hash === "string"
+        ? body.baseline_transcript_hash
+        : null;
+  }
+  if ("turn_status" in body) {
+    S().turn_status = normalizeTurnStatus(body.turn_status, S().turn_status);
+  }
+}
+
+function resetPerTurnTracking(): void {
+  S().user_turn_key = null;
+  S().assistant_turn_key = null;
+  S().baseline_transcript_count = 0;
+  S().baseline_transcript_hash = null;
+  S().answer_anchor_id = null;
+  S().answer_revision = 0;
+  S().thinking_revision = 0;
+  S().run_state = null;
+  S().completion_reason = null;
+  if (S().turn_status !== "navigating") {
+    S().turn_status =
+      S().remote_chat_url || S().remote_chat_id ? "ready" : null;
+  }
 }
 
 function isRunningExpired(): boolean {
@@ -306,6 +497,7 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().active_seq = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
 
   S().query.seq += 1;
   S().query.prompt = (body.prompt as string) || "";
@@ -355,6 +547,7 @@ const ClaimQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().running_since = Date.now();
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
 
   return jsonReply({
     ok: true,
@@ -385,6 +578,12 @@ const AckQueryPhaseEndpoint = createEndpoint(["POST"], (opts) => {
   if (nextPhase === "submitted" || nextPhase === "streaming") {
     S().running_since = Date.now();
   }
+  if (nextPhase === "submitted" && !S().run_state) {
+    S().run_state = "submitted";
+  }
+  if (nextPhase === "submitted") {
+    S().turn_status = "submitted";
+  }
 
   return jsonReply({ ok: true });
 });
@@ -410,6 +609,7 @@ const ReleaseQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().running_since = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
 
   return jsonReply({ ok: true, query: copyQueryState() });
 });
@@ -438,6 +638,18 @@ const PollResponseEndpoint = createEndpoint(["GET"], () => {
     responses: S().responses,
     partial_text: S().partial_text,
     partial_thinking: S().partial_thinking,
+    answer_anchor_id: S().answer_anchor_id,
+    answer_revision: S().answer_revision,
+    thinking_revision: S().thinking_revision,
+    run_state: S().run_state,
+    completion_reason: S().completion_reason,
+    remote_chat_url: S().remote_chat_url,
+    remote_chat_id: S().remote_chat_id,
+    user_turn_key: S().user_turn_key,
+    assistant_turn_key: S().assistant_turn_key,
+    baseline_transcript_count: S().baseline_transcript_count,
+    baseline_transcript_hash: S().baseline_transcript_hash,
+    turn_status: S().turn_status,
     current_seq: S().query.seq,
   });
 });
@@ -452,15 +664,92 @@ const UpdatePartialEndpoint = createEndpoint(["POST"], (opts) => {
   if (!attemptMatches(body)) {
     return jsonReply({ ok: false, reason: "attempt_mismatch" });
   }
-  if ("text" in body) S().partial_text = body.text as string | null;
-  if ("thinking" in body) S().partial_thinking = body.thinking as string | null;
+  if ("answer_snapshot" in body) {
+    S().partial_text = body.answer_snapshot as string | null;
+  } else if ("text" in body) {
+    S().partial_text = body.text as string | null;
+  }
+  if ("thinking_snapshot" in body) {
+    S().partial_thinking = body.thinking_snapshot as string | null;
+  } else if ("thinking" in body) {
+    S().partial_thinking = body.thinking as string | null;
+  }
+  applyRemoteTurnMetadata(body);
+  if ("answer_anchor_id" in body) {
+    S().answer_anchor_id = typeof body.answer_anchor_id === "string"
+      ? body.answer_anchor_id
+      : null;
+  }
+  if ("answer_revision" in body) {
+    const revision = Number(body.answer_revision);
+    if (Number.isFinite(revision) && revision >= 0) {
+      S().answer_revision = revision;
+    }
+  }
+  if ("thinking_revision" in body) {
+    const revision = Number(body.thinking_revision);
+    if (Number.isFinite(revision) && revision >= 0) {
+      S().thinking_revision = revision;
+    }
+  }
+  if ("run_state" in body) {
+    S().run_state = normalizeRunState(body.run_state, S().run_state);
+  }
+  if ("completion_reason" in body) {
+    S().completion_reason = normalizeCompletionReason(
+      body.completion_reason,
+      S().completion_reason,
+    );
+  }
+  const partialText = S().partial_text;
+  const partialThinking = S().partial_thinking;
   if (
-    (typeof body.text === "string" && body.text.length > 0) ||
-    (typeof body.thinking === "string" && body.thinking.length > 0)
+    (typeof partialText === "string" && partialText.length > 0) ||
+    (typeof partialThinking === "string" && partialThinking.length > 0)
   ) {
     S().query.phase = "streaming";
+    if (!S().run_state || S().run_state === "submitted") {
+      S().run_state = "active";
+    }
+  }
+  if (!S().turn_status) {
+    S().turn_status = "submitted";
   }
   return jsonReply({ ok: true });
+});
+
+// POST /update_turn_state
+const UpdateTurnStateEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+  expireStaleClaimIfNeeded();
+
+  if ("seq" in body && body.seq != null && S().active_seq > 0 && body.seq !== S().active_seq) {
+    return jsonReply({ ok: false, reason: "seq_mismatch" });
+  }
+  if ("attempt" in body && body.attempt != null && S().active_attempt > 0 && !attemptMatches(body)) {
+    return jsonReply({ ok: false, reason: "attempt_mismatch" });
+  }
+
+  applyRemoteTurnMetadata(body);
+
+  if ("turn_status" in body) {
+    const nextStatus = normalizeTurnStatus(body.turn_status, S().turn_status);
+    S().turn_status = nextStatus;
+    if (nextStatus === "ready" && S().status === "running" && !S().run_state) {
+      S().run_state = "submitted";
+    }
+  }
+
+  return jsonReply({
+    ok: true,
+    remote_chat_url: S().remote_chat_url,
+    remote_chat_id: S().remote_chat_id,
+    user_turn_key: S().user_turn_key,
+    assistant_turn_key: S().assistant_turn_key,
+    baseline_transcript_count: S().baseline_transcript_count,
+    baseline_transcript_hash: S().baseline_transcript_hash,
+    turn_status: S().turn_status,
+  });
 });
 
 // POST /submit_response
@@ -481,10 +770,71 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
     error: body.error as string | undefined,
     timestamp: new Date().toISOString(),
     thinking: body.thinking as string | undefined,
+    answer_anchor_id:
+      typeof body.answer_anchor_id === "string"
+        ? (body.answer_anchor_id as string)
+        : S().answer_anchor_id,
+    answer_revision: Number.isFinite(Number(body.answer_revision))
+      ? Number(body.answer_revision)
+      : S().answer_revision,
+    thinking_revision: Number.isFinite(Number(body.thinking_revision))
+      ? Number(body.thinking_revision)
+      : S().thinking_revision,
+    run_state: normalizeRunState(
+      body.run_state,
+      body.error ? "error" : "done",
+    ) || (body.error ? "error" : "done"),
+    completion_reason: normalizeCompletionReason(
+      body.completion_reason,
+      body.error ? "error" : "settled",
+    ),
+    remote_chat_url:
+      typeof body.remote_chat_url === "string"
+        ? (body.remote_chat_url as string)
+        : S().remote_chat_url,
+    remote_chat_id:
+      typeof body.remote_chat_id === "string"
+        ? (body.remote_chat_id as string)
+        : S().remote_chat_id,
+    user_turn_key:
+      typeof body.user_turn_key === "string"
+        ? (body.user_turn_key as string)
+        : S().user_turn_key,
+    assistant_turn_key:
+      typeof body.assistant_turn_key === "string"
+        ? (body.assistant_turn_key as string)
+        : S().assistant_turn_key,
+    baseline_transcript_count: Number.isFinite(Number(body.baseline_transcript_count))
+      ? Number(body.baseline_transcript_count)
+      : S().baseline_transcript_count,
+    baseline_transcript_hash:
+      typeof body.baseline_transcript_hash === "string"
+        ? (body.baseline_transcript_hash as string)
+        : S().baseline_transcript_hash,
+    turn_status: normalizeTurnStatus(
+      body.turn_status,
+      body.error
+        ? "error"
+        : body.run_state === "incomplete"
+          ? "incomplete"
+          : "done",
+    ),
   };
   S().responses.push(entry);
   S().partial_text = null;
   S().partial_thinking = null;
+  S().remote_chat_url = entry.remote_chat_url || null;
+  S().remote_chat_id = entry.remote_chat_id || null;
+  S().user_turn_key = entry.user_turn_key || null;
+  S().assistant_turn_key = entry.assistant_turn_key || null;
+  S().baseline_transcript_count = entry.baseline_transcript_count || 0;
+  S().baseline_transcript_hash = entry.baseline_transcript_hash || null;
+  S().turn_status = entry.turn_status || null;
+  S().answer_anchor_id = entry.answer_anchor_id || null;
+  S().answer_revision = entry.answer_revision || 0;
+  S().thinking_revision = entry.thinking_revision || 0;
+  S().run_state = entry.run_state;
+  S().completion_reason = entry.completion_reason || null;
   S().status = entry.error ? "error" : "done";
   S().query.phase = entry.error ? "error" : "done";
 
@@ -518,6 +868,7 @@ const PollCommandEndpoint = createEndpoint(["GET"], () => {
 // POST /new_chat
 const NewChatEndpoint = createEndpoint(["POST"], () => {
   resetState();
+  S().turn_status = "navigating";
   S().pendingCommand = { type: "NEW_CHAT" };
   return jsonReply({ ok: true });
 });
@@ -527,7 +878,7 @@ const ChatHistoryEndpoint = createEndpoint(["GET", "POST"], (opts) => {
   if (opts.method === "POST") {
     const body = parseBody(opts.data);
     if (body.action === "submit_scraped") {
-      setScrapedMessages((body.messages as Array<{ role: string; text: string }>) || []);
+      setScrapedMessages((body.messages as ScrapedChatMessage[]) || []);
       return jsonReply({ ok: true });
     }
     return jsonReply({ error: "Unknown action" }, 400);
@@ -583,7 +934,14 @@ const LoadChatEndpoint = createEndpoint(["POST"], (opts) => {
   resetState();
 
   if (session?.chatUrl) {
-    S().pendingCommand = { type: "LOAD_CHAT", chatUrl: session.chatUrl };
+    S().remote_chat_url = session.chatUrl;
+    S().remote_chat_id = session.id;
+    S().turn_status = "navigating";
+    S().pendingCommand = {
+      type: "LOAD_CHAT",
+      chatUrl: session.chatUrl,
+      chatId: session.id,
+    };
   }
 
   return jsonReply({
@@ -606,6 +964,7 @@ const ENDPOINTS: Record<string, ReturnType<typeof createEndpoint>> = {
   [`${PREFIX}/ack_query_phase`]: AckQueryPhaseEndpoint,
   [`${PREFIX}/release_query`]: ReleaseQueryEndpoint,
   [`${PREFIX}/poll_response`]: PollResponseEndpoint,
+  [`${PREFIX}/update_turn_state`]: UpdateTurnStateEndpoint,
   [`${PREFIX}/update_partial`]: UpdatePartialEndpoint,
   [`${PREFIX}/submit_response`]: SubmitResponseEndpoint,
   [`${PREFIX}/poll_command`]: PollCommandEndpoint,
@@ -644,6 +1003,7 @@ export function relaySubmitQuery(opts: {
   S().active_seq = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
   S().query.seq += 1;
   S().query.prompt = opts.prompt || "";
   S().query.pdf_base64 = opts.pdf_base64 || null;
@@ -696,6 +1056,7 @@ export function relayClaimQuery(seq: number): {
   S().running_since = Date.now();
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
 
   return {
     ok: true,
@@ -724,6 +1085,12 @@ export function relayAckQueryPhase(
   if (phase === "claimed" || phase === "prompt_applied" || phase === "submitted" || phase === "streaming") {
     S().running_since = Date.now();
   }
+  if (phase === "submitted" && !S().run_state) {
+    S().run_state = "submitted";
+  }
+  if (phase === "submitted") {
+    S().turn_status = "submitted";
+  }
   return { ok: true };
 }
 
@@ -749,6 +1116,7 @@ export function relayReleaseQuery(
   S().running_since = 0;
   S().partial_text = null;
   S().partial_thinking = null;
+  resetPerTurnTracking();
 
   return { ok: true };
 }
@@ -759,6 +1127,18 @@ export function relayPollResponse(): {
   responses: RelayState["responses"];
   partial_text: string | null;
   partial_thinking: string | null;
+  answer_anchor_id: string | null;
+  answer_revision: number;
+  thinking_revision: number;
+  run_state: RelayRunState | null;
+  completion_reason: RelayCompletionReason | null;
+  remote_chat_url: string | null;
+  remote_chat_id: string | null;
+  user_turn_key: string | null;
+  assistant_turn_key: string | null;
+  baseline_transcript_count: number;
+  baseline_transcript_hash: string | null;
+  turn_status: RelayTurnStatus | null;
   current_seq: number;
 } {
   expireStaleClaimIfNeeded();
@@ -779,6 +1159,18 @@ export function relayPollResponse(): {
     responses: S().responses,
     partial_text: S().partial_text,
     partial_thinking: S().partial_thinking,
+    answer_anchor_id: S().answer_anchor_id,
+    answer_revision: S().answer_revision,
+    thinking_revision: S().thinking_revision,
+    run_state: S().run_state,
+    completion_reason: S().completion_reason,
+    remote_chat_url: S().remote_chat_url,
+    remote_chat_id: S().remote_chat_id,
+    user_turn_key: S().user_turn_key,
+    assistant_turn_key: S().assistant_turn_key,
+    baseline_transcript_count: S().baseline_transcript_count,
+    baseline_transcript_hash: S().baseline_transcript_hash,
+    turn_status: S().turn_status,
     current_seq: S().query.seq,
   };
 }
@@ -786,6 +1178,7 @@ export function relayPollResponse(): {
 /** Send new chat command directly (no HTTP). */
 export function relayNewChat(): void {
   resetState();
+  S().turn_status = "navigating";
   S().pendingCommand = { type: "NEW_CHAT" };
 }
 
@@ -802,7 +1195,14 @@ export function relayLoadChat(sessionId: string): {
   const session = getMirroredHistory().find((s) => s.id === sessionId);
   resetState();
   if (session?.chatUrl) {
-    S().pendingCommand = { type: "LOAD_CHAT", chatUrl: session.chatUrl };
+    S().remote_chat_url = session.chatUrl;
+    S().remote_chat_id = session.id;
+    S().turn_status = "navigating";
+    S().pendingCommand = {
+      type: "LOAD_CHAT",
+      chatUrl: session.chatUrl,
+      chatId: session.id,
+    };
   }
   return {
     ok: true,
@@ -810,6 +1210,19 @@ export function relayLoadChat(sessionId: string): {
       ? { id: session.id, title: session.title, chatUrl: session.chatUrl, messages: [] }
       : { id: sessionId, title: "Unknown", chatUrl: null, messages: [] },
   };
+}
+
+/** Update remote ChatGPT/session metadata directly (no HTTP). */
+export function relayUpdateTurnState(opts: {
+  remote_chat_url?: string | null;
+  remote_chat_id?: string | null;
+  user_turn_key?: string | null;
+  assistant_turn_key?: string | null;
+  baseline_transcript_count?: number;
+  baseline_transcript_hash?: string | null;
+  turn_status?: RelayTurnStatus | null;
+}): void {
+  applyRemoteTurnMetadata(opts as Record<string, unknown>);
 }
 
 /** Get mirrored chat history directly (no HTTP). */
@@ -823,7 +1236,7 @@ export function relayGetReportedMode(): string | null {
 }
 
 /** Get and clear scraped messages directly (no HTTP). */
-export function relayGetScrapedMessages(): Array<{ role: string; text: string }> | null {
+export function relayGetScrapedMessages(): ScrapedChatMessage[] | null {
   const msgs = getScrapedMessages();
   setScrapedMessages(null);
   return msgs;

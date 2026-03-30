@@ -797,6 +797,8 @@ function toPanelMessage(message: StoredChatMessage): Message {
     modelName: message.modelName,
     modelEntryId: message.modelEntryId,
     modelProviderLabel: message.modelProviderLabel,
+    webchatRunState: message.webchatRunState,
+    webchatCompletionReason: message.webchatCompletionReason,
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: isReasoningExpandedByDefault(),
@@ -1364,6 +1366,8 @@ type AssistantMessageSnapshot = Pick<
   | "modelName"
   | "modelEntryId"
   | "modelProviderLabel"
+  | "webchatRunState"
+  | "webchatCompletionReason"
   | "reasoningSummary"
   | "reasoningDetails"
   | "reasoningOpen"
@@ -1391,6 +1395,8 @@ function takeAssistantSnapshot(message: Message): AssistantMessageSnapshot {
     modelName: message.modelName,
     modelEntryId: message.modelEntryId,
     modelProviderLabel: message.modelProviderLabel,
+    webchatRunState: message.webchatRunState,
+    webchatCompletionReason: message.webchatCompletionReason,
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: message.reasoningOpen,
@@ -1406,6 +1412,8 @@ function restoreAssistantSnapshot(
   message.modelName = snapshot.modelName;
   message.modelEntryId = snapshot.modelEntryId;
   message.modelProviderLabel = snapshot.modelProviderLabel;
+  message.webchatRunState = snapshot.webchatRunState;
+  message.webchatCompletionReason = snapshot.webchatCompletionReason;
   message.reasoningSummary = snapshot.reasoningSummary;
   message.reasoningDetails = snapshot.reasoningDetails;
   message.reasoningOpen = snapshot.reasoningOpen;
@@ -1428,7 +1436,71 @@ function finalizeCancelledAssistantMessage(
   message.reasoningOpen = hasReasoning
     ? message.reasoningOpen !== false
     : false;
+  message.webchatRunState = undefined;
+  message.webchatCompletionReason = null;
   message.streaming = false;
+}
+
+function applyWebChatAnswerSnapshot(
+  message: Message,
+  text: string,
+  snapshot: {
+    runState?: "submitted" | "active" | "settling" | "done" | "incomplete" | "error" | null;
+    completionReason?: "settled" | "forced_cancel" | "timeout" | "error" | null;
+  },
+): void {
+  message.text = sanitizeText(text || "");
+  message.timestamp = Date.now();
+  if (
+    snapshot.runState === "done" ||
+    snapshot.runState === "incomplete" ||
+    snapshot.runState === "error"
+  ) {
+    message.webchatRunState = snapshot.runState;
+    message.webchatCompletionReason = snapshot.completionReason || null;
+  } else {
+    message.webchatRunState = undefined;
+    message.webchatCompletionReason = null;
+  }
+}
+
+function applyWebChatThinkingSnapshot(
+  message: Message,
+  text: string,
+  snapshot: {
+    runState?: "submitted" | "active" | "settling" | "done" | "incomplete" | "error" | null;
+    completionReason?: "settled" | "forced_cancel" | "timeout" | "error" | null;
+  },
+): void {
+  const sanitized = sanitizeText(text || "");
+  message.reasoningDetails = sanitized || undefined;
+  message.reasoningOpen = sanitized ? isReasoningExpandedByDefault() : false;
+  if (
+    snapshot.runState === "done" ||
+    snapshot.runState === "incomplete" ||
+    snapshot.runState === "error"
+  ) {
+    message.webchatRunState = snapshot.runState;
+    message.webchatCompletionReason = snapshot.completionReason || null;
+  }
+}
+
+function getWebChatRunStateLabel(message: Message): string | null {
+  if (message.webchatRunState === "incomplete") {
+    switch (message.webchatCompletionReason) {
+      case "forced_cancel":
+        return "Partial only — ChatGPT stayed busy and needed a forced stop";
+      case "timeout":
+        return "Partial only — final answer was not verified before timeout";
+      case "error":
+      default:
+        return "Partial only — final answer not verified";
+    }
+  }
+  if (message.webchatRunState === "error") {
+    return "Web sync ended with an error";
+  }
+  return null;
 }
 
 function reconstructRetryPayload(userMessage: Message): {
@@ -2781,6 +2853,8 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
       modelName: assistantMessage.modelName,
       modelEntryId: assistantMessage.modelEntryId,
       modelProviderLabel: assistantMessage.modelProviderLabel,
+      webchatRunState: assistantMessage.webchatRunState,
+      webchatCompletionReason: assistantMessage.webchatCompletionReason,
       reasoningSummary: assistantMessage.reasoningSummary,
       reasoningDetails: assistantMessage.reasoningDetails,
     });
@@ -2817,17 +2891,12 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
         images: screenshotImagesForMessage.length > 0 ? screenshotImagesForMessage : undefined,
         chatgptMode,
         signal: currentAbortController?.signal,
-        onDelta: (delta) => {
-          assistantMessage.text += sanitizeText(delta);
+        onAnswerSnapshot: (text, snapshot) => {
+          applyWebChatAnswerSnapshot(assistantMessage, text, snapshot);
           webChatQueueRefresh();
         },
-        onReasoning: (reasoning) => {
-          if (reasoning.details) {
-            assistantMessage.reasoningDetails = appendReasoningPart(
-              assistantMessage.reasoningDetails,
-              reasoning.details,
-            );
-          }
+        onThinkingSnapshot: (text, snapshot) => {
+          applyWebChatThinkingSnapshot(assistantMessage, text, snapshot);
           webChatQueueRefresh();
         },
       });
@@ -2837,13 +2906,29 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
         return;
       }
 
-      assistantMessage.text = sanitizeText(answer) || assistantMessage.text || "No response.";
+      assistantMessage.text = sanitizeText(answer.text) || assistantMessage.text || "No response.";
+      assistantMessage.reasoningDetails = sanitizeText(answer.thinking || "") || assistantMessage.reasoningDetails;
+      assistantMessage.reasoningOpen = assistantMessage.reasoningDetails
+        ? isReasoningExpandedByDefault()
+        : false;
+      assistantMessage.webchatRunState =
+        answer.runState === "incomplete" || answer.runState === "error"
+          ? answer.runState
+          : "done";
+      assistantMessage.webchatCompletionReason =
+        answer.completionReason ||
+        (answer.runState === "done" ? "settled" : null);
       assistantMessage.streaming = false;
 
       refreshChatSafely();
       await persistAssistantOnce();
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      setStatusSafely("Ready", "ready");
+      setStatusSafely(
+        answer.runState === "incomplete"
+          ? "Captured partial response — final answer not verified"
+          : "Ready",
+        answer.runState === "incomplete" ? "error" : "ready",
+      );
     } catch (err) {
       const isCancelled =
         cancelledRequestId >= thisRequestId ||
@@ -2854,12 +2939,24 @@ export async function sendQuestion(opts: import("./types").SendQuestionOptions) 
         restoreRequestUIIdle(body, conversationKey, thisRequestId);
         return;
       }
-      assistantMessage.text = `Error: ${(err as Error).message || "Error"}`;
+      const errMsg = (err as Error).message || "Error";
+      const hasSnapshot = Boolean(
+        sanitizeText(assistantMessage.text || "") ||
+          sanitizeText(assistantMessage.reasoningDetails || ""),
+      );
+      if (hasSnapshot) {
+        assistantMessage.webchatRunState = "incomplete";
+        assistantMessage.webchatCompletionReason = "error";
+      } else {
+        assistantMessage.text = `Error: ${errMsg}`;
+        assistantMessage.webchatRunState = "error";
+        assistantMessage.webchatCompletionReason = "error";
+      }
       assistantMessage.streaming = false;
       refreshChatSafely();
       await persistAssistantOnce();
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      setStatusSafely((err as Error).message || "Error", "error");
+      setStatusSafely(errMsg, "error");
     }
     return;
   }
@@ -4063,6 +4160,16 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
     time.className = "llm-message-time";
     time.textContent = formatTime(msg.timestamp);
     meta.appendChild(time);
+
+    if (!isUser) {
+      const webchatStateLabel = getWebChatRunStateLabel(msg);
+      if (webchatStateLabel) {
+        const status = doc.createElement("span") as HTMLSpanElement;
+        status.className = "llm-message-webchat-status";
+        status.textContent = webchatStateLabel;
+        meta.appendChild(status);
+      }
+    }
     if (
       !isUser &&
       index === latestAssistantIndex &&

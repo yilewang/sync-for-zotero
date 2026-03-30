@@ -62,6 +62,8 @@ export interface Message {
   modelEntryId?: string;
   modelProviderLabel?: string;
   streaming?: boolean;
+  webchatRunState?: "done" | "incomplete" | "error";
+  webchatCompletionReason?: "settled" | "forced_cancel" | "timeout" | "error" | null;
   reasoningSummary?: string;
   reasoningDetails?: string;
   reasoningOpen?: boolean;

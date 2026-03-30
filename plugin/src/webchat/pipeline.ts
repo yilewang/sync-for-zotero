@@ -7,9 +7,16 @@
  *   - Submits via the embedded Zotero relay → Chrome extension → ChatGPT.com
  */
 
-import type { ReasoningEvent } from "../utils/llmClient";
 import { readLocalFileBytes } from "../utils/llmClient";
-import { submitQuery, pollForResponse, bytesToBase64 } from "./client";
+import {
+  submitQuery,
+  pollForResponse,
+  waitForRemoteReadyIfNavigating,
+  bytesToBase64,
+  type WebChatAnswerSnapshot,
+  type WebChatPollResult,
+  type WebChatThinkingSnapshot,
+} from "./client";
 
 // ---------------------------------------------------------------------------
 // PDF resolution helpers
@@ -85,8 +92,11 @@ export type WebChatSendOptions = {
   /** ChatGPT mode: "instant", "thinking_standard", or "thinking_extended". */
   chatgptMode?: string;
   signal?: AbortSignal;
-  onDelta: (delta: string) => void;
-  onReasoning?: (event: ReasoningEvent) => void;
+  onAnswerSnapshot: (text: string, snapshot: WebChatAnswerSnapshot) => void;
+  onThinkingSnapshot?: (
+    text: string,
+    snapshot: WebChatThinkingSnapshot,
+  ) => void;
 };
 
 /**
@@ -98,7 +108,7 @@ export type WebChatSendOptions = {
  */
 export async function sendWebChatQuestion(
   opts: WebChatSendOptions,
-): Promise<string> {
+): Promise<WebChatPollResult> {
   const {
     item,
     question,
@@ -108,8 +118,8 @@ export async function sendWebChatQuestion(
     images,
     chatgptMode,
     signal,
-    onDelta,
-    onReasoning,
+    onAnswerSnapshot,
+    onThinkingSnapshot,
   } = opts;
 
   ztoolkit.log(`[webchat] sendWebChatQuestion: sendPdf=${sendPdf}`);
@@ -132,6 +142,10 @@ export async function sendWebChatQuestion(
     }
   }
 
+  // If the extension is still navigating to a loaded history item or a fresh
+  // chat, wait for the remote composer/transcript to settle before submitting.
+  await waitForRemoteReadyIfNavigating(host, signal);
+
   // --- Submit to the embedded relay ---
   const { seq } = await submitQuery(
     host,
@@ -145,5 +159,11 @@ export async function sendWebChatQuestion(
   );
 
   // --- Poll for streaming response ---
-  return pollForResponse(host, seq, onDelta, onReasoning, signal);
+  return pollForResponse(
+    host,
+    seq,
+    onAnswerSnapshot,
+    onThinkingSnapshot,
+    signal,
+  );
 }

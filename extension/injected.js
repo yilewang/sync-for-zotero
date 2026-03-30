@@ -17,6 +17,18 @@
   window.__syncZoteroFetchPatched = true;
 
   const originalFetch = window.fetch;
+  let activeConversationStreamCount = 0;
+
+  function postActiveStreamCount() {
+    window.postMessage(
+      {
+        type: "SYNC_ZOTERO_STREAM_STATE",
+        activeCount: activeConversationStreamCount,
+        timestamp: Date.now(),
+      },
+      "*"
+    );
+  }
 
   function normalizeAssistantText(text) {
     return String(text || "")
@@ -114,6 +126,9 @@
   async function processSSEResponse(response) {
     const body = response.body;
     if (!body) return;
+
+    activeConversationStreamCount += 1;
+    postActiveStreamCount();
 
     // Notify content script that a new SSE stream is starting.
     // This resets sseDone so the previous stream's [DONE] doesn't
@@ -228,6 +243,8 @@
         );
       }
     } finally {
+      activeConversationStreamCount = Math.max(0, activeConversationStreamCount - 1);
+      postActiveStreamCount();
       try {
         reader.releaseLock();
       } catch {

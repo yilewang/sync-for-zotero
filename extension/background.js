@@ -32,6 +32,12 @@ let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const CHATGPT_URL = "https://chatgpt.com/";
 const MAX_PRE_SUBMIT_RELEASES = 3;
 const RELAY_POLL_INTERVAL_MS = 500;
+const WEBCHAT_DEBUG = false;
+
+function debugLog(event, payload) {
+  if (!WEBCHAT_DEBUG) return;
+  console.log("[sync-zotero][webchat]", event, payload || "");
+}
 
 // Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
 async function discoverZoteroPort() {
@@ -126,6 +132,48 @@ async function releaseQuery(seq, attempt) {
   return serverPost("/release_query", { seq, attempt });
 }
 
+async function reportTurnState(body) {
+  return serverPost("/update_turn_state", body);
+}
+
+async function waitForChatReadyInTab(tabId, expectedChatUrl = null, timeoutMs = 30_000) {
+  const response = await sendToContentScript(tabId, {
+    type: "WAIT_FOR_CHAT_READY",
+    expectedChatUrl,
+    timeoutMs,
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "ChatGPT did not become ready.");
+  }
+  return response;
+}
+
+async function publishReadyConversationState(
+  tabId,
+  expectedChatUrl = null,
+  { submitScraped = false } = {},
+) {
+  const ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
+  debugLog("ready_ack", ready);
+
+  if (submitScraped) {
+    await serverPost("/chat_history", {
+      action: "submit_scraped",
+      messages: ready.messages || [],
+    });
+  }
+
+  await reportTurnState({
+    remote_chat_url: ready.chatUrl || null,
+    remote_chat_id: ready.chatId || null,
+    baseline_transcript_count: ready.transcriptCount || 0,
+    baseline_transcript_hash: ready.transcriptHash || null,
+    turn_status: "ready",
+  });
+
+  return ready;
+}
+
 // ---------------------------------------------------------------------------
 // Keep the service worker alive + auto-poll for pending queries
 // ---------------------------------------------------------------------------
@@ -155,6 +203,14 @@ async function pollForCommand() {
 
     const cmd = data.command;
     if (cmd.type === "NEW_CHAT") {
+      await reportTurnState({
+        remote_chat_url: null,
+        remote_chat_id: null,
+        baseline_transcript_count: 0,
+        baseline_transcript_hash: null,
+        turn_status: "navigating",
+      }).catch(() => {});
+
       // Navigate a ChatGPT tab to a fresh page
       let tabId = activeChatTabId;
 
@@ -169,11 +225,31 @@ async function pollForCommand() {
           await chrome.tabs.update(tabId, { url: CHATGPT_URL });
           await waitForTabLoad(tabId);
         } catch (_) {}
+      } else {
+        const tab = await chrome.tabs.create({ url: CHATGPT_URL, active: false });
+        await waitForTabLoad(tab.id);
+        tabId = tab.id;
       }
-      // Reset so next message is treated as a new conversation (not follow-up)
-      activeChatTabId = null;
+
+      if (tabId !== null) {
+        activeChatTabId = tabId;
+        try {
+          await publishReadyConversationState(tabId, null, { submitScraped: false });
+        } catch (err) {
+          broadcastStatus("error", err.message || "New chat did not become ready");
+          return;
+        }
+      }
       broadcastStatus("idle", "New chat — ready for next query");
     } else if (cmd.type === "LOAD_CHAT" && cmd.chatUrl) {
+      await reportTurnState({
+        remote_chat_url: cmd.chatUrl,
+        remote_chat_id: cmd.chatId || null,
+        baseline_transcript_count: 0,
+        baseline_transcript_hash: null,
+        turn_status: "navigating",
+      }).catch(() => {});
+
       // Navigate to a specific past chat URL
       let tabId = null;
 
@@ -222,32 +298,22 @@ async function pollForCommand() {
 
       broadcastStatus("idle", "Loaded past chat — scraping messages…");
 
-      // Scrape all messages from the loaded conversation.
-      // The content script waits for messages to appear in DOM (up to 15s).
       try {
-        // Wait for page to fully reload and content script to initialize
-        await new Promise(r => setTimeout(r, 3000));
-        await ensureContentScript(tabId);
-
-        const response = await new Promise((resolve) => {
-          chrome.tabs.sendMessage(tabId, { type: "SCRAPE_MESSAGES" }, (res) => {
-            if (chrome.runtime.lastError) {
-              console.warn("[sync-zotero] SCRAPE_MESSAGES failed:", chrome.runtime.lastError.message);
-              resolve({ ok: false, messages: [] });
-            } else {
-              resolve(res || { ok: false, messages: [] });
-            }
-          });
+        await publishReadyConversationState(tabId, cmd.chatUrl, {
+          submitScraped: true,
         });
-
-        if (response.ok && response.messages?.length > 0) {
-          console.log(`[sync-zotero] Scraped ${response.messages.length} messages, posting to server`);
-          await serverPost("/chat_history", { action: "submit_scraped", messages: response.messages });
-        } else {
-          console.warn("[sync-zotero] No messages scraped from ChatGPT page");
-        }
       } catch (err) {
         console.warn("[sync-zotero] Scraping error:", err);
+        await reportTurnState({
+          remote_chat_url: cmd.chatUrl,
+          remote_chat_id: cmd.chatId || null,
+          turn_status: "error",
+        }).catch(() => {});
+        broadcastStatus(
+          "error",
+          err.message || "Failed to load the selected ChatGPT conversation",
+        );
+        return;
       }
 
       broadcastStatus("idle", "Loaded past chat — ready for follow-up");
@@ -386,11 +452,46 @@ async function runPipeline(query) {
     // ── Ensure content script is ready ────────────────────────────
     await ensureTabReady(tab.id);
     await ensureContentScript(tab.id);
+    activeChatTabId = tab.id;
 
-    broadcastStatus("running", isFollowup ? "Sending follow-up…" : "Preparing fresh chat and prompt…");
+    const readyState = await publishReadyConversationState(
+      tab.id,
+      shouldNavigateFresh ? null : null,
+      { submitScraped: false },
+    );
+
+    broadcastStatus(
+      "running",
+      isFollowup
+        ? "Sending follow-up…"
+        : "Preparing fresh chat and prompt…",
+    );
+    debugLog("pipeline_ready", {
+      seq,
+      attempt,
+      startsFresh,
+      readyState,
+    });
 
     // ── Stream via port connection ─────────────────────────────────
-    const { text: responseText, thinking: thinkingText } = await streamPipeline(tab.id, {
+    const {
+      text: responseText,
+      thinking: thinkingText,
+      answerAnchorId,
+      answerRevision,
+      thinkingRevision,
+      runState,
+      completionReason,
+      finalTranscriptHash,
+      verifiedAt,
+      remoteChatUrl,
+      remoteChatId,
+      userTurnKey,
+      assistantTurnKey,
+      baselineTranscriptCount,
+      baselineTranscriptHash,
+      turnStatus,
+    } = await streamPipeline(tab.id, {
       pdfBase64:    query.pdf_base64 || null,
       pdfFilename:  query.pdf_base64 ? (query.pdf_filename || "document.pdf") : null,
       prompt:       query.prompt,
@@ -400,16 +501,30 @@ async function runPipeline(query) {
       attempt,
     });
 
-    if (!shared.hasMeaningfulAssistantText(responseText)) {
+    if (runState === "done" && !shared.hasMeaningfulAssistantText(responseText)) {
       throw new Error("ChatGPT did not produce a visible final answer.");
     }
 
     await serverPost("/submit_response", {
       seq,
       attempt,
-      response: responseText,
+      response: responseText || null,
       thinking: thinkingText ?? null,
       error:    null,
+      answer_anchor_id: answerAnchorId || null,
+      answer_revision: answerRevision || 0,
+      thinking_revision: thinkingRevision || 0,
+      run_state: runState,
+      completion_reason: completionReason || null,
+      final_transcript_hash: finalTranscriptHash || null,
+      verified_at: verifiedAt || null,
+      remote_chat_url: remoteChatUrl || null,
+      remote_chat_id: remoteChatId || null,
+      user_turn_key: userTurnKey || null,
+      assistant_turn_key: assistantTurnKey || null,
+      baseline_transcript_count: baselineTranscriptCount || 0,
+      baseline_transcript_hash: baselineTranscriptHash || null,
+      turn_status: turnStatus || (runState === "incomplete" ? "incomplete" : "done"),
     });
 
     // Capture the ChatGPT URL for history persistence
@@ -420,7 +535,12 @@ async function runPipeline(query) {
       }
     } catch (_) {}
 
-    broadcastStatus("done", "Response sent to GUI");
+    broadcastStatus(
+      runState === "incomplete" ? "error" : "done",
+      runState === "incomplete"
+        ? "Captured partial response — final answer not verified"
+        : "Response sent to GUI",
+    );
 
   } catch (err) {
     if (err?.name === "PreSubmitDisconnect" && attempt < MAX_PRE_SUBMIT_RELEASES) {
@@ -525,8 +645,21 @@ function streamPipeline(tabId, payload) {
         try {
           await ackQueryPhase(payload.seq, payload.attempt, msg.phase);
         } catch (_) {}
-      } else if (msg.type === "partial") {
-        // Ignore partials from a stale seq (Bug 2 guard)
+      } else if (msg.type === "turn_state") {
+        try {
+          await reportTurnState({
+            seq: payload.seq,
+            attempt: payload.attempt,
+            remote_chat_url: msg.remoteChatUrl ?? null,
+            remote_chat_id: msg.remoteChatId ?? null,
+            user_turn_key: msg.userTurnKey ?? null,
+            assistant_turn_key: msg.assistantTurnKey ?? null,
+            baseline_transcript_count: msg.baselineTranscriptCount ?? 0,
+            baseline_transcript_hash: msg.baselineTranscriptHash ?? null,
+            turn_status: msg.turnStatus ?? null,
+          });
+        } catch (_) {}
+      } else if (msg.type === "snapshot") {
         if (!streamingAcked) {
           streamingAcked = true;
           submitted = true;
@@ -534,30 +667,59 @@ function streamPipeline(tabId, payload) {
             await ackQueryPhase(payload.seq, payload.attempt, "streaming");
           } catch (_) {}
         }
-        broadcastStatus("running", msg.thinking ? "Thinking…" : "Streaming response…");
+        broadcastStatus(
+          "running",
+          msg.runState === "settling"
+            ? "Settling visible response…"
+            : (msg.thinking ? "Thinking…" : "Streaming response…"),
+        );
         try {
           await serverPost("/update_partial", {
             seq:     payload.seq,
             attempt: payload.attempt,
+            answer_snapshot: msg.answerSnapshot ?? msg.text ?? null,
+            thinking_snapshot: msg.thinkingSnapshot ?? msg.thinking ?? null,
             text:    msg.text    ?? null,
             thinking: msg.thinking ?? null,
+            answer_anchor_id: msg.answerAnchorId ?? null,
+            answer_revision: msg.answerRevision ?? 0,
+            thinking_revision: msg.thinkingRevision ?? 0,
+            run_state: msg.runState ?? null,
+            completion_reason: msg.completionReason ?? null,
+            remote_chat_url: msg.remoteChatUrl ?? null,
+            remote_chat_id: msg.remoteChatId ?? null,
+            user_turn_key: msg.userTurnKey ?? null,
+            assistant_turn_key: msg.assistantTurnKey ?? null,
+            baseline_transcript_count: msg.baselineTranscriptCount ?? 0,
+            baseline_transcript_hash: msg.baselineTranscriptHash ?? null,
+            turn_status: msg.turnStatus ?? null,
           });
         } catch (_) {}
-      } else if (msg.type === "visibility") {
-        if (!msg.visible) {
-          broadcastStatus("running", "Chrome is hidden — waiting for full response…");
-          try { await serverPost("/update_partial", { seq: payload.seq, attempt: payload.attempt, text: null }); } catch (_) {}
-        } else {
-          broadcastStatus("running", "Streaming response…");
-        }
       } else if (msg.type === "mode_report") {
         // Forward ChatGPT's actual mode back to the plugin relay
         serverPost("/update_mode", { seq: payload.seq, mode: msg.mode }).catch(() => {});
-      } else if (msg.type === "done") {
+      } else if (msg.type === "terminal") {
         resolved = true;
         if (activePort === port) activePort = null;
         port.disconnect();
-        resolve({ text: msg.text, thinking: msg.thinking ?? null });
+        resolve({
+          text: msg.text || "",
+          thinking: msg.thinking ?? null,
+          answerAnchorId: msg.answerAnchorId ?? null,
+          answerRevision: msg.answerRevision ?? 0,
+          thinkingRevision: msg.thinkingRevision ?? 0,
+          runState: msg.runState || "done",
+          completionReason: msg.completionReason ?? null,
+          finalTranscriptHash: msg.finalTranscriptHash ?? null,
+          verifiedAt: msg.verifiedAt ?? null,
+          remoteChatUrl: msg.remoteChatUrl ?? null,
+          remoteChatId: msg.remoteChatId ?? null,
+          userTurnKey: msg.userTurnKey ?? null,
+          assistantTurnKey: msg.assistantTurnKey ?? null,
+          baselineTranscriptCount: msg.baselineTranscriptCount ?? 0,
+          baselineTranscriptHash: msg.baselineTranscriptHash ?? null,
+          turnStatus: msg.turnStatus ?? null,
+        });
       } else if (msg.type === "error") {
         resolved = true;
         if (activePort === port) activePort = null;

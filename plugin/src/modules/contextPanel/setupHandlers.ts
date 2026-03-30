@@ -6718,16 +6718,15 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
             refreshChatPreservingScroll();
             if (status) setStatus(status, "Loading conversation from ChatGPT…", "sending");
 
-            const { loadChatSession, fetchScrapedMessages } = await import("../../webchat/client");
+            const { loadChatSession } = await import("../../webchat/client");
             resetWebChatPdfUploadedForCurrentConversation();
             clearNextWebChatNewChatIntent();
             const result = await loadChatSession(host, session.id);
-            // The embedded relay sends a LOAD_CHAT command to the extension,
-            // which navigates ChatGPT to the conversation URL.
+            // The embedded relay now waits for the extension to confirm the
+            // ChatGPT thread is loaded, transcript-stable, and composer-ready.
 
             const messages: Message[] = [];
 
-            // Try local history first (plugin-initiated conversations)
             if (result?.messages && Array.isArray(result.messages) && result.messages.length > 0) {
               for (const m of result.messages) {
                 messages.push({
@@ -6739,23 +6738,14 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
                   reasoningDetails: m.thinking || undefined,
                 });
               }
+              if (status) setStatus(status, `Loaded ${result.messages.length} messages`, "ready");
             } else {
-              // No local history — wait for extension to scrape messages from ChatGPT DOM
-              if (status) setStatus(status, "Loading conversation from ChatGPT…", "sending");
-              const scraped = await fetchScrapedMessages(host, 20_000);
-              for (const m of scraped) {
-                messages.push({
-                  role: m.role === "user" ? "user" : "assistant",
-                  text: m.text || "",
-                  timestamp: Date.now(),
-                  modelName: m.role === "bot" ? "chatgpt.com" : undefined,
-                  modelProviderLabel: m.role === "bot" ? "ChatGPT" : undefined,
-                });
-              }
-              if (scraped.length === 0) {
-                if (status) setStatus(status, "No messages found — open the ChatGPT tab to load", "ready");
-              } else {
-                if (status) setStatus(status, `Loaded ${scraped.length} messages`, "ready");
+              if (status) {
+                setStatus(
+                  status,
+                  "No messages found in the selected ChatGPT conversation",
+                  "ready",
+                );
               }
             }
 

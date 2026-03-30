@@ -152,4 +152,52 @@ describe("webchat relay", function () {
     assert.isTrue(finalReply.ok);
     assert.equal(relay.relayGetStateSnapshot().query.phase, "done");
   });
+
+  it("tracks load-chat navigation targets and remote ready metadata", async function () {
+    const UpdateHistory = globalThis.Zotero.Server.Endpoints[
+      "/llm-for-zotero/webchat/update_chat_history"
+    ] as new () => { init: (opts: unknown) => Promise<number | EndpointReply> };
+
+    await new UpdateHistory().init({
+      method: "POST",
+      pathname: "/llm-for-zotero/webchat/update_chat_history",
+      query: {},
+      headers: {},
+      data: {
+        sessions: [
+          {
+            id: "chat-123",
+            title: "Figure 4 follow-up",
+            chatUrl: "https://chatgpt.com/c/chat-123",
+          },
+        ],
+      },
+    });
+
+    const loaded = relay.relayLoadChat("chat-123");
+    const navigating = relay.relayGetStateSnapshot();
+
+    assert.isTrue(loaded.ok);
+    assert.equal(navigating.turn_status, "navigating");
+    assert.equal(navigating.remote_chat_url, "https://chatgpt.com/c/chat-123");
+    assert.equal(navigating.remote_chat_id, "chat-123");
+    assert.deepEqual(navigating.pendingCommand, {
+      type: "LOAD_CHAT",
+      chatUrl: "https://chatgpt.com/c/chat-123",
+      chatId: "chat-123",
+    });
+
+    relay.relayUpdateTurnState({
+      remote_chat_url: "https://chatgpt.com/c/chat-123",
+      remote_chat_id: "chat-123",
+      baseline_transcript_count: 8,
+      baseline_transcript_hash: "hash-123",
+      turn_status: "ready",
+    });
+
+    const ready = relay.relayGetStateSnapshot();
+    assert.equal(ready.turn_status, "ready");
+    assert.equal(ready.baseline_transcript_count, 8);
+    assert.equal(ready.baseline_transcript_hash, "hash-123");
+  });
 });
