@@ -2458,10 +2458,14 @@ async function scrapeHistory() {
   const historyJson = JSON.stringify(history);
   if (historyJson !== lastHistoryJson && history.length > 0) {
     lastHistoryJson = historyJson;
-    chrome.runtime.sendMessage({ type: "HISTORY_UPDATE", history }, () => {
-      // Suppress "Receiving end does not exist" when service worker is inactive
-      void chrome.runtime.lastError;
-    });
+    try {
+      chrome.runtime.sendMessage({ type: "HISTORY_UPDATE", history }, () => {
+        // Suppress "Receiving end does not exist" when service worker is inactive
+        void chrome.runtime.lastError;
+      });
+    } catch (e) {
+      // Extension context invalidated (extension reloaded while page still open)
+    }
   }
 }
 
