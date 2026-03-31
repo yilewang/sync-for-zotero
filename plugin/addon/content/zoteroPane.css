@@ -347,6 +347,114 @@
 .llm-webchat-dot-connected { background: #4ade80; box-shadow: 0 0 3px #4ade8066; }
 .llm-webchat-dot-disconnected { background: #f87171; box-shadow: 0 0 3px #f8717166; }
 
+/* ---- Webchat preload overlay ---- */
+
+.llm-webchat-preload {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--material-background, #fff);
+  transition: opacity 0.4s ease;
+}
+.llm-webchat-preload-fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+.llm-webchat-preload-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: 260px;
+  gap: 6px;
+}
+.llm-webchat-preload-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fill-primary);
+  margin-bottom: 10px;
+}
+.llm-webchat-preload-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+.llm-webchat-preload-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  transition: opacity 0.3s ease;
+}
+.llm-webchat-preload-icon {
+  width: 16px;
+  text-align: center;
+  font-size: 13px;
+  flex-shrink: 0;
+  color: var(--fill-tertiary);
+}
+.llm-webchat-preload-icon.is-checking {
+  animation: llm-preload-spin 0.9s linear infinite;
+  color: var(--fill-secondary);
+}
+.llm-webchat-preload-icon.is-pass {
+  color: #4ade80;
+  animation: none;
+}
+.llm-webchat-preload-icon.is-fail {
+  color: #f87171;
+  animation: none;
+}
+.llm-webchat-preload-label {
+  font-size: 12px;
+  color: var(--fill-secondary);
+}
+.llm-webchat-preload-ready {
+  margin-top: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #4ade80;
+  animation: llm-preload-fade-in 0.3s ease;
+}
+.llm-webchat-preload-error {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: llm-preload-fade-in 0.3s ease;
+}
+.llm-webchat-preload-error-msg {
+  font-size: 11px;
+  color: #f87171;
+  line-height: 1.4;
+}
+.llm-webchat-preload-retry {
+  appearance: none;
+  -moz-appearance: none;
+  border: 1px solid var(--fill-quinary, #ddd);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fill-primary);
+  font-size: 11px;
+  padding: 4px 14px;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: background 0.15s;
+}
+.llm-webchat-preload-retry:hover {
+  background: var(--fill-quinary, #f0f0f0);
+}
+@keyframes llm-preload-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes llm-preload-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* ---- Lock icon (after 'Open chat' label) ---- */
 
 .llm-mode-lock {

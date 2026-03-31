@@ -112,6 +112,22 @@ async function heartbeat() {
         console.log("[sync-zotero] Heartbeat: reconnected to Zotero");
         resetExtensionState();
       }
+
+      // Report extension status (ChatGPT tab alive, URL) to the relay
+      try {
+        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        const chatTabAlive = tabs.length > 0;
+        const preferred = activeChatTabId !== null
+          ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
+          : tabs[0];
+        const chatUrl = preferred?.url || null;
+        fetch(`${SERVER}/extension_status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatTabAlive, chatUrl }),
+        }).catch(() => {});
+      } catch { /* non-critical */ }
+
       return;
     }
   } catch { /* server unreachable — fall through to rediscovery */ }

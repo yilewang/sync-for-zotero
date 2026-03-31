@@ -6130,6 +6130,18 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
               } else {
                 await createAndSwitchPaperConversation();
               }
+
+              // Show preloading screen to verify connectivity before enabling webchat
+              const chatShellEl = body.querySelector(".llm-chat-shell") as HTMLElement | null;
+              if (chatShellEl) {
+                try {
+                  const { showWebChatPreloadScreen } = await import("../../webchat/preloadScreen");
+                  await showWebChatPreloadScreen(chatShellEl);
+                } catch {
+                  // Preload failed or was aborted — still apply UI (dot will show status)
+                }
+              }
+
               // Apply webchat UI after the conversation switch re-renders
               applyWebChatModeUI();
             })();

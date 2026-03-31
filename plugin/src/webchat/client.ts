@@ -689,12 +689,11 @@ export function getReportedMode(): string | null {
 // Connection test
 // ---------------------------------------------------------------------------
 
-/** Returns true if the relay is registered (always true when plugin is loaded). */
+/** Returns true if the Chrome extension has contacted the relay recently. */
 export async function testConnection(_host: string): Promise<boolean> {
-  // The relay is embedded — if this code is running, the relay is registered.
-  // But check if the extension can reach us by verifying Zotero.Server exists.
   try {
-    return !!Zotero.Server?.Endpoints;
+    const { relayGetExtensionLiveness } = await import("./relayServer");
+    return relayGetExtensionLiveness().aliveSinceMs < 15_000;
   } catch {
     return false;
   }

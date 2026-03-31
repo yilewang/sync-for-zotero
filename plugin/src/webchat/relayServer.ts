@@ -145,11 +145,19 @@ export interface RelayState {
 
 // Use Zotero object as shared namespace — guaranteed same across all contexts
 // in the plugin (globalThis may differ between sandbox scopes in Gecko)
+interface ExtensionStatus {
+  chatTabAlive: boolean;
+  chatUrl: string | null;
+  ts: number;
+}
+
 const Z = Zotero as unknown as {
   _webchatRelay?: {
     state: RelayState;
     mirroredHistory: Array<{ id: string; title: string; chatUrl: string }>;
     scrapedMessages: ScrapedChatMessage[] | null;
+    lastExtensionContact: number;
+    extensionStatus: ExtensionStatus | null;
   };
 };
 
@@ -192,6 +200,8 @@ if (!Z._webchatRelay) {
     },
     mirroredHistory: [],
     scrapedMessages: null,
+    lastExtensionContact: 0,
+    extensionStatus: null,
   };
 }
 
@@ -204,6 +214,8 @@ function _store(): {
   state: RelayState;
   mirroredHistory: Array<{ id: string; title: string; chatUrl: string }>;
   scrapedMessages: ScrapedChatMessage[] | null;
+  lastExtensionContact: number;
+  extensionStatus: ExtensionStatus | null;
 } {
   const ep = Zotero.Server.Endpoints as any;
   if (!ep[STORAGE_KEY]) {
@@ -522,6 +534,7 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
 
 // GET /poll_query
 const PollQueryEndpoint = createEndpoint(["GET"], () => {
+  _store().lastExtensionContact = Date.now();
   expireStaleClaimIfNeeded();
   if (S().status === "pending") {
     return jsonReply({ status: "pending", query: copyQueryState() });
@@ -843,6 +856,7 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
 
 // GET /heartbeat — lightweight connectivity check for the extension
 const HeartbeatEndpoint = createEndpoint(["GET"], () => {
+  _store().lastExtensionContact = Date.now();
   return jsonReply({ ok: true, ts: Date.now(), seq: S().query.seq });
 });
 
@@ -957,12 +971,25 @@ const LoadChatEndpoint = createEndpoint(["POST"], (opts) => {
   });
 });
 
+// POST /extension_status — extension reports its tab status
+const ExtensionStatusEndpoint = createEndpoint(["POST"], (opts) => {
+  const body = parseBody(opts.data);
+  _store().extensionStatus = {
+    chatTabAlive: !!body.chatTabAlive,
+    chatUrl: (body.chatUrl as string) || null,
+    ts: Date.now(),
+  };
+  _store().lastExtensionContact = Date.now();
+  return jsonReply({ ok: true });
+});
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
 const ENDPOINTS: Record<string, ReturnType<typeof createEndpoint>> = {
   [`${PREFIX}/heartbeat`]: HeartbeatEndpoint,
+  [`${PREFIX}/extension_status`]: ExtensionStatusEndpoint,
   [`${PREFIX}/debug`]: DebugEndpoint,
   [`${PREFIX}/submit_query`]: SubmitQueryEndpoint,
   [`${PREFIX}/poll_query`]: PollQueryEndpoint,
@@ -1252,6 +1279,19 @@ export function relayGetScrapedMessages(): ScrapedChatMessage[] | null {
 export function relayGetStateSnapshot(): RelayState {
   expireStaleClaimIfNeeded();
   return JSON.parse(JSON.stringify(S())) as RelayState;
+}
+
+/** Check if the Chrome extension has contacted the relay recently. */
+export function relayGetExtensionLiveness(): { lastContact: number; aliveSinceMs: number } {
+  const lc = _store().lastExtensionContact || 0;
+  return { lastContact: lc, aliveSinceMs: lc ? Date.now() - lc : Infinity };
+}
+
+/** Get the latest extension status report (chatTabAlive, etc.). Returns null if stale (>20s). */
+export function relayGetExtensionStatus(): ExtensionStatus | null {
+  const s = _store().extensionStatus;
+  if (!s || Date.now() - s.ts > 30_000) return null; // 30s staleness — heartbeat posts every 10s
+  return s;
 }
 
 /** Test helper to reset relay state without issuing commands. */
