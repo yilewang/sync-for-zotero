@@ -757,7 +757,7 @@ function dispatchSubmitViaForm(composer) {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
-async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount, timeoutMs = 5000) {
+async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -781,7 +781,7 @@ async function submitMessageAndVerify(promptText) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const submitStrategies = [
       async (composer) => {
-        const sendBtn = await waitForSendButtonEnabled(1200);
+        const sendBtn = await waitForSendButtonEnabled(30000);
         if (!isEnabledButton(sendBtn)) return false;
         sendBtn.click();
         return true;
