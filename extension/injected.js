@@ -12,11 +12,16 @@
 (function () {
   "use strict";
 
-  // Guard: only patch once per page load
-  if (window.__syncZoteroFetchPatched) return;
-  window.__syncZoteroFetchPatched = true;
+  // Version guard: re-patch when the extension updates (new version).
+  // Without versioning, reloading the extension wouldn't update the fetch
+  // patch because the old guard blocks re-injection.
+  const PATCH_VERSION = 2;
+  if (window.__syncZoteroFetchPatched >= PATCH_VERSION) return;
+  window.__syncZoteroFetchPatched = PATCH_VERSION;
 
-  const originalFetch = window.fetch;
+  // Use the ORIGINAL fetch (before any prior patch), or current if first time
+  const originalFetch = window.__syncZoteroOriginalFetch || window.fetch;
+  window.__syncZoteroOriginalFetch = originalFetch;
   let activeConversationStreamCount = 0;
 
   function postActiveStreamCount() {
@@ -160,12 +165,16 @@
 
           // SSE termination
           if (data === "[DONE]") {
+            // Include how many streams are still active (including this one,
+            // which hasn't decremented yet). The content script uses this to
+            // avoid setting sseDone when other streams are still in flight.
             window.postMessage(
               {
                 type: "SYNC_ZOTERO_SSE",
                 text: lastText,
                 thinking: lastThinking || null,
                 done: true,
+                activeStreamCount: activeConversationStreamCount,
               },
               "*"
             );
@@ -185,9 +194,17 @@
           if (!msg) continue;
           if (msg.author?.role !== "assistant") continue;
 
-          // Skip non-content message types (e.g., title generation, status)
+          // Skip known non-content message types (title generation, status).
+          // Use a blocklist rather than allowlist so we don't miss responses
+          // with unexpected content_types (e.g., "multimodal_text" for image queries).
           const msgType = msg.content?.content_type;
-          if (msgType && msgType !== "text" && msgType !== "code") continue;
+          if (
+            msgType === "system_error" ||
+            msgType === "title_generation" ||
+            msgType === "conversation_title"
+          ) {
+            continue;
+          }
 
           // Extract main text content
           const parts = msg.content?.parts;
@@ -238,6 +255,7 @@
             text: lastText,
             thinking: lastThinking || null,
             done: true,
+            activeStreamCount: activeConversationStreamCount,
           },
           "*"
         );

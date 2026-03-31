@@ -32,7 +32,12 @@ let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const CHATGPT_URL = "https://chatgpt.com/";
 const MAX_PRE_SUBMIT_RELEASES = 3;
 const RELAY_POLL_INTERVAL_MS = 500;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 const WEBCHAT_DEBUG = false;
+
+// Connection state tracking
+let zoteroConnected = false;
+let lastSuccessfulContact = 0;
 
 function debugLog(event, payload) {
   if (!WEBCHAT_DEBUG) return;
@@ -40,26 +45,84 @@ function debugLog(event, payload) {
 }
 
 // Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
+let _portDiscoveryInFlight = false;
 async function discoverZoteroPort() {
-  for (let port = 23119; port <= 23128; port++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/debug`);
-      if (!res.ok) continue;
-      const data = await res.json();
-      // Verify this is actually our relay, not Zotero returning generic text
-      if (data && typeof data.status === "string") {
-        SERVER = `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
-        console.log(`[sync-zotero] Found Zotero server on port ${port}`);
-        return;
-      }
-    } catch { /* try next port */ }
+  if (_portDiscoveryInFlight) return;
+  _portDiscoveryInFlight = true;
+  try {
+    const previousServer = SERVER;
+    for (let port = 23119; port <= 23128; port++) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/debug`);
+        if (!res.ok) continue;
+        const data = await res.json();
+        // Verify this is actually our relay, not Zotero returning generic text
+        if (data && typeof data.status === "string") {
+          SERVER = `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
+          lastSuccessfulContact = Date.now();
+
+          const wasConnected = zoteroConnected;
+          zoteroConnected = true;
+
+          if (SERVER !== previousServer) {
+            console.log(`[sync-zotero] Found Zotero server on port ${port} (port changed)`);
+            resetExtensionState();
+          } else if (!wasConnected) {
+            console.log(`[sync-zotero] Reconnected to Zotero server on port ${port}`);
+            resetExtensionState();
+          } else {
+            console.log(`[sync-zotero] Found Zotero server on port ${port}`);
+          }
+          return;
+        }
+      } catch { /* try next port */ }
+    }
+    if (zoteroConnected) {
+      zoteroConnected = false;
+      console.warn("[sync-zotero] Lost connection to Zotero server");
+      broadcastStatus("disconnected", "Lost connection to Zotero — will retry automatically");
+    }
+  } finally {
+    _portDiscoveryInFlight = false;
   }
-  console.warn("[sync-zotero] Could not find Zotero server on ports 23119-23128");
 }
 
-// Discover port on startup and periodically
+/** Reset stale extension state after Zotero reconnection. */
+function resetExtensionState() {
+  pipelineRunning = false;
+  lastProcessedSeq = 0;
+  lastProcessedAttempt = 0;
+  if (activePort) {
+    try { activePort.disconnect(); } catch (_) {}
+    activePort = null;
+  }
+  broadcastStatus("idle", "Reconnected to Zotero — ready for queries");
+  // Immediately pick up any pending query
+  pollForQuery();
+}
+
+// Heartbeat: checks connectivity and triggers port rediscovery when needed
+async function heartbeat() {
+  try {
+    const res = await fetch(`${SERVER}/heartbeat`);
+    if (res.ok) {
+      lastSuccessfulContact = Date.now();
+      if (!zoteroConnected) {
+        zoteroConnected = true;
+        console.log("[sync-zotero] Heartbeat: reconnected to Zotero");
+        resetExtensionState();
+      }
+      return;
+    }
+  } catch { /* server unreachable — fall through to rediscovery */ }
+
+  // Current SERVER URL is stale — try to find the new port
+  await discoverZoteroPort();
+}
+
+// Discover port on startup and run heartbeat periodically
 discoverZoteroPort();
-setInterval(discoverZoteroPort, 30_000);
+setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
 
 // Auto-discover existing ChatGPT tabs on startup and trigger initial history scrape
 (async () => {
@@ -90,12 +153,51 @@ let lastProcessedSeq = 0;
 let lastProcessedAttempt = 0;
 let activePort       = null;   // current port connection to content script
 
+// Persist critical state to chrome.storage.session so it survives SW restarts
+function persistState() {
+  chrome.storage.session.set({
+    _syncState: {
+      lastProcessedSeq,
+      lastProcessedAttempt,
+      activeChatTabId,
+      server: SERVER,
+    },
+  });
+}
+
+// Restore state from storage on SW restart
+async function loadPersistedState() {
+  try {
+    const data = await chrome.storage.session.get("_syncState");
+    if (data._syncState) {
+      lastProcessedSeq = data._syncState.lastProcessedSeq || 0;
+      lastProcessedAttempt = data._syncState.lastProcessedAttempt || 0;
+      activeChatTabId = data._syncState.activeChatTabId || null;
+      if (data._syncState.server) SERVER = data._syncState.server;
+      // Never restore pipelineRunning = true — relay's stale claim expiration handles it
+      console.log("[sync-zotero] Restored persisted state", data._syncState);
+    }
+  } catch (_) {}
+}
+
+// Load persisted state on startup
+loadPersistedState();
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
 async function serverGet(path) {
-  const res  = await fetch(`${SERVER}${path}`);
+  let res;
+  try {
+    res = await fetch(`${SERVER}${path}`);
+  } catch (err) {
+    zoteroConnected = false;
+    discoverZoteroPort();
+    throw err;
+  }
+  lastSuccessfulContact = Date.now();
+  zoteroConnected = true;
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch {
@@ -106,11 +208,20 @@ async function serverGet(path) {
 }
 
 async function serverPost(path, body) {
-  const res = await fetch(`${SERVER}${path}`, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(`${SERVER}${path}`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+    });
+  } catch (err) {
+    zoteroConnected = false;
+    discoverZoteroPort();
+    throw err;
+  }
+  lastSuccessfulContact = Date.now();
+  zoteroConnected = true;
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch {
@@ -153,8 +264,17 @@ async function publishReadyConversationState(
   expectedChatUrl = null,
   { submitScraped = false } = {},
 ) {
-  const ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
+  let ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
   debugLog("ready_ack", ready);
+
+  // If we got empty messages on a conversation page, retry once after a delay
+  const isConversationPage = expectedChatUrl && expectedChatUrl.includes("/c/");
+  if (submitScraped && isConversationPage && (!ready.messages || ready.messages.length === 0)) {
+    debugLog("ready_retry", "empty messages on conversation page, retrying…");
+    await new Promise(r => setTimeout(r, 2000));
+    ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
+    debugLog("ready_retry_ack", ready);
+  }
 
   if (submitScraped) {
     await serverPost("/chat_history", {
@@ -180,23 +300,43 @@ async function publishReadyConversationState(
 
 // MV3 service workers are killed after ~30s of inactivity.
 // A Chrome API call every 25s prevents the idle timeout from triggering.
-setInterval(() => chrome.storage.session.set({ _keepalive: Date.now() }), 25_000);
+// Also persist state on each keepalive tick to survive SW restarts.
+setInterval(() => {
+  chrome.storage.session.set({ _keepalive: Date.now() });
+  persistState();
+}, 25_000);
 
 // Backup: chrome.alarms wakes the SW up even if it was killed.
 // The SW module re-executes on restart, so setInterval below auto-resumes.
-chrome.alarms.create("pollAlarm", { periodInMinutes: 1 });
+chrome.alarms.create("pollAlarm", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "pollAlarm") pollForQuery();
+  if (alarm.name === "pollAlarm") {
+    pollForQuery();
+    pollForCommand();
+  }
 });
 
-// Main poll loop (runs while SW is alive)
-setInterval(pollForQuery, RELAY_POLL_INTERVAL_MS);
+// Clean initialization after browser restart
+chrome.runtime.onStartup.addListener(() => {
+  loadPersistedState().then(() => discoverZoteroPort());
+});
 
-// Poll for navigation commands from the embedded Zotero relay
-setInterval(pollForCommand, RELAY_POLL_INTERVAL_MS);
+// Adaptive polling: 500ms when active, 2000ms when idle (saves CPU/network)
+let lastQueryActivity = 0;
+const IDLE_POLL_INTERVAL_MS = 2000;
+
+function adaptivePoll() {
+  const isActive = pipelineRunning || (Date.now() - lastQueryActivity < 30_000);
+  const interval = isActive ? RELAY_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
+  pollForQuery();
+  pollForCommand();
+  setTimeout(adaptivePoll, interval);
+}
+setTimeout(adaptivePoll, RELAY_POLL_INTERVAL_MS);
 
 async function pollForCommand() {
   if (pipelineRunning) return;
+  if (!zoteroConnected) return;
   try {
     const data = await fetch(`${SERVER}/poll_command`).then(r => r.json());
     if (!data.command) return;
@@ -359,6 +499,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 async function pollForQuery() {
   if (pipelineRunning) return;
+  if (!zoteroConnected) return;
 
   try {
     const data = await serverGet("/poll_query");
@@ -375,6 +516,7 @@ async function pollForQuery() {
 
     lastProcessedSeq = claimed.query.seq;
     lastProcessedAttempt = claimed.query.attempt || 0;
+    lastQueryActivity = Date.now();
     await ackQueryPhase(claimed.query.seq, claimed.query.attempt || 0, "claimed").catch(() => {});
     await runPipeline(claimed.query);
   } catch (err) {
@@ -872,6 +1014,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       sendResponse({
         relayAlive,
+        zoteroConnected,
         chatTabAlive,
         chatUrl,
         pipelineState: ps.state,

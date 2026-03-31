@@ -841,6 +841,11 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
   return jsonReply({ ok: true });
 });
 
+// GET /heartbeat — lightweight connectivity check for the extension
+const HeartbeatEndpoint = createEndpoint(["GET"], () => {
+  return jsonReply({ ok: true, ts: Date.now(), seq: S().query.seq });
+});
+
 // GET /debug (temporary — shows which state object the endpoint sees)
 const DebugEndpoint = createEndpoint(["GET"], () => {
   const s = S();
@@ -957,6 +962,7 @@ const LoadChatEndpoint = createEndpoint(["POST"], (opts) => {
 // ---------------------------------------------------------------------------
 
 const ENDPOINTS: Record<string, ReturnType<typeof createEndpoint>> = {
+  [`${PREFIX}/heartbeat`]: HeartbeatEndpoint,
   [`${PREFIX}/debug`]: DebugEndpoint,
   [`${PREFIX}/submit_query`]: SubmitQueryEndpoint,
   [`${PREFIX}/poll_query`]: PollQueryEndpoint,

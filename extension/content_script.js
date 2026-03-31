@@ -837,7 +837,15 @@ window.addEventListener("message", (event) => {
   if (event.data?.type === "SYNC_ZOTERO_SSE") {
     sseText = event.data.text || "";
     sseThinking = event.data.thinking || null;
-    sseDone = event.data.done || false;
+    // Only mark SSE as done when this is the last active stream.
+    // During multi-tool-use flows, earlier streams finish before the
+    // actual answer stream — their [DONE] should not end the pipeline.
+    if (event.data.done) {
+      const activeCount = Number(event.data.activeStreamCount) || 0;
+      sseDone = activeCount <= 1;
+    } else {
+      sseDone = false;
+    }
     lastTransportActivityAt = Date.now();
     return;
   }
@@ -931,7 +939,11 @@ function hasBusyComposerHint() {
 }
 
 function isConversationStillRunning(stopBtn = findStopButton()) {
-  return Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint();
+  // Grace period: treat the conversation as still running if we saw transport
+  // activity within the last 3 seconds. This bridges brief gaps between
+  // tool-use streams where the stop button may momentarily vanish.
+  const recentActivity = (Date.now() - lastTransportActivityAt) < 3000;
+  return Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint() || recentActivity;
 }
 
 function getAssistantMessageNodes() {
@@ -1112,6 +1124,7 @@ async function streamResponseSnapshots(
   let reportedUserTurn = false;
   let reportedAssistantTurn = false;
   let lastActiveRun = null;
+  let toolUseDetected = false;
   let completionTracker = shared.createTurnCompletionTracker(Date.now());
 
   recordTurnDebug("baseline_transcript", {
@@ -1189,16 +1202,75 @@ async function streamResponseSnapshots(
             turnStatus: "user_turn_matched",
           });
         }
-      } else if (!activeRun && Date.now() > userTurnDeadline) {
-        throw new Error("ChatGPT never created the submitted user turn in the conversation transcript.");
+      } else if (Date.now() > userTurnDeadline) {
+        // Use strict active-run check (no transport grace period) for the deadline,
+        // so SSE activity doesn't keep the deadline from firing indefinitely.
+        const strictActiveRun = Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint();
+
+        if (!strictActiveRun) {
+          // Fallback: take the last user message after baseline (position-based).
+          const fallbackCandidates = transcript.messages
+            .slice(Math.max(0, baselineTranscriptCount))
+            .filter((m) => m.role === "user");
+          if (fallbackCandidates.length > 0) {
+            const fallback = fallbackCandidates[fallbackCandidates.length - 1];
+            userTurnKey = fallback.messageKey;
+            console.warn("[sync-zotero] User turn text match failed — using position-based fallback");
+            recordTurnDebug("user_turn_fallback", { seq, attempt, userTurnKey });
+            postTurnState(port, {
+              seq, attempt, remoteChatUrl, remoteChatId,
+              baselineTranscriptCount, baselineTranscriptHash,
+              userTurnKey, turnStatus: "user_turn_matched",
+            });
+          } else if (shared.hasMeaningfulAssistantText(sseText)) {
+            // Nuclear fallback: SSE captured the response but DOM scraping failed.
+            // Emit the SSE text directly as the terminal response.
+            console.warn("[sync-zotero] User turn not found — using SSE response fallback");
+            recordTurnDebug("sse_fallback", { seq, attempt, sseTextLen: sseText.length });
+            port.postMessage({
+              type: "terminal",
+              seq,
+              attempt,
+              text: sseText,
+              thinking: sseThinking || null,
+              answerAnchorId: null,
+              answerRevision: 0,
+              thinkingRevision: 0,
+              runState: "done",
+              completionReason: "settled",
+              finalTranscriptHash: transcript.hash,
+              verifiedAt: Date.now(),
+              remoteChatUrl,
+              remoteChatId,
+              userTurnKey: null,
+              assistantTurnKey: null,
+              baselineTranscriptCount,
+              baselineTranscriptHash,
+              turnStatus: "done",
+            });
+            return;
+          } else {
+            throw new Error("ChatGPT never created the submitted user turn in the conversation transcript.");
+          }
+        }
       }
     }
 
-    const assistantTurn = resolveBoundAssistantTurn(
-      transcript,
-      userTurnKey,
-      assistantTurnKey,
-    );
+    // Re-resolve the assistant turn when:
+    // 1. No key set yet
+    // 2. Locked key no longer exists in transcript (DOM node was replaced,
+    //    e.g., "Analyzing the image..." replaced by the actual response)
+    // 3. Locked key exists but has empty text+thinking (still rendering)
+    let shouldResolveAssistant = !assistantTurnKey;
+    if (assistantTurnKey) {
+      const bound = transcript.messages.find(m => m.messageKey === assistantTurnKey);
+      if (!bound || (!bound.text && !bound.thinking)) {
+        shouldResolveAssistant = true;
+      }
+    }
+    const assistantTurn = shouldResolveAssistant
+      ? resolveBoundAssistantTurn(transcript, userTurnKey, assistantTurnKey)
+      : transcript.messages.find(m => m.messageKey === assistantTurnKey) || null;
     if (assistantTurn?.messageKey) {
       assistantTurnKey = assistantTurn.messageKey;
       if (!reportedAssistantTurn) {
@@ -1225,7 +1297,13 @@ async function streamResponseSnapshots(
       }
     }
 
-    const answerText = assistantTurn?.text || "";
+    // Use DOM-extracted answer text, but fall back to SSE-captured text when
+    // DOM extraction fails (e.g., thinking model responses where the answer
+    // isn't extractable from the DOM during/after the thinking phase).
+    const domAnswerText = assistantTurn?.text || "";
+    const answerText = shared.hasMeaningfulAssistantText(domAnswerText)
+      ? domAnswerText
+      : (shared.hasMeaningfulAssistantText(sseText) ? sseText : domAnswerText);
     const domThinking = assistantTurn?.thinking || "";
     const thinkingText = shared.normalizeComposerText(
       domThinking || sseThinking || "",
@@ -1258,6 +1336,37 @@ async function streamResponseSnapshots(
     const answerVisible = shared.hasMeaningfulAssistantText(answerText);
     const thinkingVisible = Boolean(thinkingText);
     const quietSinceMs = nowMs - Math.max(lastAnyProgressAt, lastTransportActivityAt || 0);
+
+    // Detect tool-use patterns in SSE text to adapt completion timing.
+    // Once detected, stays true for the entire turn.
+    if (!toolUseDetected) {
+      const rawSse = (sseText || "").toLowerCase();
+      if (
+        /reading\s+documents?/i.test(rawSse) ||
+        /searching(\s+the\s+web)?/i.test(rawSse) ||
+        /analyzing/i.test(rawSse) ||
+        /browsing/i.test(rawSse) ||
+        activeConversationStreamCount > 1
+      ) {
+        toolUseDetected = true;
+      }
+    }
+
+    // Adaptive quiet/rebound windows:
+    // - Tool-use: longer windows to bridge gaps between tool streams
+    // - SSE-done simple responses: shorter windows for faster completion
+    let quietWindowMs, reboundWindowMs;
+    if (toolUseDetected) {
+      quietWindowMs = 15000;
+      reboundWindowMs = 3000;
+    } else if (sseDone && activeConversationStreamCount === 0 && answerVisible) {
+      quietWindowMs = 2000;
+      reboundWindowMs = 500;
+    } else {
+      quietWindowMs = undefined; // use default (7000)
+      reboundWindowMs = undefined; // use default (1500)
+    }
+
     const completion = shared.advanceTurnCompletionTracker(completionTracker, {
       nowMs,
       answerVisible,
@@ -1268,6 +1377,8 @@ async function streamResponseSnapshots(
       transcriptRevision,
       hasUserTurn: Boolean(userTurnKey),
       hasAssistantTurn: Boolean(assistantTurnKey),
+      quietWindowMs,
+      reboundWindowMs,
     });
     const previousPhase = completionTracker.phase;
     completionTracker = completion.tracker;
@@ -1345,6 +1456,52 @@ async function streamResponseSnapshots(
         attempt,
         text: lastAnswerText,
         thinking: lastThinkingText || null,
+        answerAnchorId: assistantTurnKey,
+        answerRevision,
+        thinkingRevision,
+        runState: "done",
+        completionReason: "settled",
+        finalTranscriptHash: transcript.hash,
+        verifiedAt: nowMs,
+        remoteChatUrl,
+        remoteChatId,
+        userTurnKey,
+        assistantTurnKey,
+        baselineTranscriptCount,
+        baselineTranscriptHash,
+        turnStatus: "done",
+      });
+      return;
+    }
+
+    // SSE-based fast completion: when the SSE stream has ended with meaningful
+    // answer text AND ChatGPT's stop button is gone, emit the response directly.
+    // This bypasses the DOM-based completion tracker which can fail for thinking
+    // model responses where DOM answer extraction returns empty.
+    if (
+      sseDone &&
+      activeConversationStreamCount === 0 &&
+      shared.hasMeaningfulAssistantText(sseText) &&
+      !stopBtn &&
+      !hasBusyComposerHint() &&
+      completion.phase !== "verified_done"
+    ) {
+      // Use DOM answer if available, otherwise SSE answer
+      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
+        ? lastAnswerText : sseText;
+      const finalThinking = lastThinkingText || sseThinking || null;
+      recordTurnDebug("sse_fast_completion", {
+        seq,
+        attempt,
+        sseTextLen: sseText.length,
+        domAnswerLen: lastAnswerText.length,
+        usedSse: finalText === sseText,
+      });
+      postTerminal(port, {
+        seq,
+        attempt,
+        text: finalText,
+        thinking: finalThinking,
         answerAnchorId: assistantTurnKey,
         answerRevision,
         thinkingRevision,
@@ -1441,11 +1598,17 @@ async function streamResponseSnapshots(
     await workerSleep(500);
   }
 
-  if (shared.hasMeaningfulAssistantText(lastAnswerText)) {
+  // Use SSE text as fallback if DOM-based answer extraction failed
+  const timeoutAnswerText = shared.hasMeaningfulAssistantText(lastAnswerText)
+    ? lastAnswerText
+    : (shared.hasMeaningfulAssistantText(sseText) ? sseText : lastAnswerText);
+  const timeoutThinkingText = lastThinkingText || sseThinking || null;
+
+  if (shared.hasMeaningfulAssistantText(timeoutAnswerText)) {
     completionTracker = shared.advanceTurnCompletionTracker(completionTracker, {
       nowMs: Date.now(),
       answerVisible: true,
-      thinkingVisible: Boolean(lastThinkingText),
+      thinkingVisible: Boolean(timeoutThinkingText),
       activeRun: false,
       answerRevision,
       thinkingRevision,
@@ -1459,12 +1622,13 @@ async function streamResponseSnapshots(
       attempt,
       answerRevision,
       thinkingRevision,
+      usedSseFallback: timeoutAnswerText !== lastAnswerText,
     });
     postTerminal(port, {
       seq,
       attempt,
-      text: lastAnswerText,
-      thinking: lastThinkingText || null,
+      text: timeoutAnswerText,
+      thinking: timeoutThinkingText,
       answerAnchorId: assistantTurnKey,
       answerRevision,
       thinkingRevision,
@@ -1726,7 +1890,8 @@ function removeTransientMessageNodes(root) {
 
 function extractAttachmentNames(node) {
   if (!node) return [];
-  const selectors = [
+  // File/document attachment selectors
+  const fileSelectors = [
     "[data-testid*='file']",
     "[class*='attachment']",
     "[class*='file-pill']",
@@ -1735,7 +1900,7 @@ function extractAttachmentNames(node) {
     "[class*='FileIcon']",
   ];
   const names = [];
-  for (const selector of selectors) {
+  for (const selector of fileSelectors) {
     node.querySelectorAll(selector).forEach((element) => {
       const text = shared.normalizeComposerText(
         element.getAttribute?.("aria-label") ||
@@ -1749,6 +1914,28 @@ function extractAttachmentNames(node) {
       }
     });
   }
+  // Image attachment detection — ChatGPT renders uploaded images as <img> elements
+  // inside the user message node. Detect these so image-only messages aren't
+  // skipped by extractConversationTranscript's filter.
+  const imageSelectors = [
+    "img[src]",
+    "picture",
+    "[data-testid*='image']",
+    "[class*='image-preview']",
+    "[class*='uploaded-image']",
+  ];
+  let imageCount = 0;
+  for (const selector of imageSelectors) {
+    const matches = node.querySelectorAll(selector);
+    if (matches.length > 0) {
+      imageCount += matches.length;
+      break; // avoid double-counting
+    }
+  }
+  for (let i = 0; i < imageCount; i++) {
+    const name = imageCount === 1 ? "image" : `image_${i + 1}`;
+    if (!names.includes(name)) names.push(name);
+  }
   return names;
 }
 
@@ -1756,6 +1943,9 @@ function extractUserMessageText(node) {
   if (!node) return "";
   const root = node.cloneNode(true);
   removeTransientMessageNodes(root);
+  // Remove media elements that inject alt text or empty strings into innerText,
+  // corrupting text extraction for image/video messages.
+  root.querySelectorAll("img, picture, video, canvas, svg").forEach((el) => el.remove());
   const text = shared.normalizeComposerText(
     root.innerText || root.textContent || "",
   );
@@ -1864,41 +2054,64 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
   let lastSignature = "";
   let stableChecks = 0;
 
-  while (Date.now() < deadline) {
-    const transcript = extractConversationTranscript();
-    const composerReady = Boolean(findComposerNow());
-    const urlMatches =
-      !normalizedExpected ||
-      normalizeUrl(transcript.chatUrl) === normalizedExpected;
-    const activeRun = isConversationStillRunning();
-    const signature = `${transcript.hash}:${transcript.count}`;
-
-    if (urlMatches && composerReady && !activeRun) {
-      stableChecks = signature === lastSignature ? stableChecks + 1 : 1;
-      lastSignature = signature;
-      if (stableChecks >= 2) {
-        debugLog("chat_ready", {
-          chatUrl: transcript.chatUrl,
-          chatId: transcript.chatId,
-          count: transcript.count,
-          hash: transcript.hash,
-        });
-        return {
-          ok: true,
-          ready: true,
-          chatUrl: transcript.chatUrl,
-          chatId: transcript.chatId,
-          transcriptHash: transcript.hash,
-          transcriptCount: transcript.count,
-          messages: mapTranscriptToRelayMessages(transcript),
-        };
-      }
-    } else {
-      stableChecks = 0;
-      lastSignature = signature;
+  // MutationObserver tracks DOM activity so we don't falsely stabilize
+  // during React hydration when the DOM is being actively rebuilt.
+  let lastDomMutationAt = Date.now();
+  const DOM_SETTLE_MS = 800;
+  let observer = null;
+  try {
+    const mainEl = document.querySelector("main") || document.querySelector('[role="main"]');
+    if (mainEl) {
+      observer = new MutationObserver(() => {
+        lastDomMutationAt = Date.now();
+      });
+      observer.observe(mainEl, { childList: true, subtree: true });
     }
 
-    await workerSleep(400);
+    // If navigating to a new conversation, wait briefly for React to start rendering
+    if (normalizedExpected && normalizeUrl(getCurrentChatUrl()) !== normalizedExpected) {
+      await workerSleep(1000);
+    }
+
+    while (Date.now() < deadline) {
+      const transcript = extractConversationTranscript();
+      const composerReady = Boolean(findComposerNow());
+      const urlMatches =
+        !normalizedExpected ||
+        normalizeUrl(transcript.chatUrl) === normalizedExpected;
+      const activeRun = isConversationStillRunning();
+      const domSettled = (Date.now() - lastDomMutationAt) >= DOM_SETTLE_MS;
+      const signature = `${transcript.hash}:${transcript.count}`;
+
+      if (urlMatches && composerReady && !activeRun && domSettled) {
+        stableChecks = signature === lastSignature ? stableChecks + 1 : 1;
+        lastSignature = signature;
+        if (stableChecks >= 2) {
+          debugLog("chat_ready", {
+            chatUrl: transcript.chatUrl,
+            chatId: transcript.chatId,
+            count: transcript.count,
+            hash: transcript.hash,
+          });
+          return {
+            ok: true,
+            ready: true,
+            chatUrl: transcript.chatUrl,
+            chatId: transcript.chatId,
+            transcriptHash: transcript.hash,
+            transcriptCount: transcript.count,
+            messages: mapTranscriptToRelayMessages(transcript),
+          };
+        }
+      } else {
+        stableChecks = 0;
+        lastSignature = signature;
+      }
+
+      await workerSleep(400);
+    }
+  } finally {
+    if (observer) observer.disconnect();
   }
 
   const transcript = extractConversationTranscript();
@@ -1914,25 +2127,52 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
   };
 }
 
+/** Word-level Jaccard similarity for fuzzy text matching. */
+function wordJaccardSimilarity(a, b) {
+  const wordsA = new Set(a.split(/\s+/).filter(Boolean));
+  const wordsB = new Set(b.split(/\s+/).filter(Boolean));
+  if (wordsA.size === 0 && wordsB.size === 0) return 1;
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+  return intersection / (wordsA.size + wordsB.size - intersection);
+}
+
 function findMatchingUserTurn(transcript, baselineCount, promptText) {
-  const normalizedPrompt = shared.normalizeComposerText(promptText).toLowerCase();
+  const normalizedPrompt = shared.normalizeComposerText(promptText).normalize("NFC").toLowerCase();
   const candidates = transcript.messages
     .slice(Math.max(0, baselineCount))
     .filter((message) => message.role === "user");
   if (candidates.length === 0) return null;
 
+  // Tier 1: exact match
   const exact = candidates.find(
     (message) =>
-      shared.normalizeComposerText(message.text).toLowerCase() === normalizedPrompt,
+      shared.normalizeComposerText(message.text).normalize("NFC").toLowerCase() === normalizedPrompt,
   );
   if (exact) return exact;
 
+  // Tier 2: substring containment
   const contains = candidates.find((message) => {
-    const normalized = shared.normalizeComposerText(message.text).toLowerCase();
+    const normalized = shared.normalizeComposerText(message.text).normalize("NFC").toLowerCase();
     return normalized.includes(normalizedPrompt) || normalizedPrompt.includes(normalized);
   });
   if (contains) return contains;
 
+  // Tier 3: fuzzy match (word-level Jaccard similarity)
+  let bestMatch = null;
+  let bestScore = 0;
+  for (const candidate of candidates) {
+    const normalized = shared.normalizeComposerText(candidate.text).normalize("NFC").toLowerCase();
+    const score = wordJaccardSimilarity(normalizedPrompt, normalized);
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = candidate;
+    }
+  }
+  if (bestMatch && bestScore >= 0.7) return bestMatch;
+
+  // Tier 4: single candidate fallback
   return candidates.length === 1 ? candidates[0] : null;
 }
 
@@ -2038,13 +2278,28 @@ function htmlToMarkdown(html) {
  * Returns them in chronological order as { role, text } objects.
  */
 async function scrapeAllMessages() {
-  const ready = await waitForChatReady(getCurrentChatUrl(), 15000);
-  if (!ready.ok) {
+  const chatUrl = getCurrentChatUrl();
+  let ready = await waitForChatReady(chatUrl, 15000);
+
+  // If first attempt failed or returned empty messages on a conversation page,
+  // retry once after a brief delay (handles stale SPA state)
+  const isConversationPage = chatUrl && chatUrl.includes("/c/");
+  const firstMessages = (ready.messages || []).filter(
+    (message) => message.text || message.thinking,
+  );
+
+  if (isConversationPage && firstMessages.length === 0) {
+    console.warn("[sync-zotero] scrapeAllMessages: no messages on first attempt, retrying…");
+    await workerSleep(2000);
+    ready = await waitForChatReady(chatUrl, 15000);
+  }
+
+  if (!ready.ok && (!ready.messages || ready.messages.length === 0)) {
     console.warn("[sync-zotero] scrapeAllMessages: page never became ready");
     return [];
   }
 
-  const messages = ready.messages.filter(
+  const messages = (ready.messages || []).filter(
     (message) => message.text || message.thinking,
   );
   console.log(`[sync-zotero] scrapeAllMessages: found ${messages.length} messages`);
