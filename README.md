@@ -21,12 +21,13 @@ A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero]
 
 ### Chrome (load as unpacked extension)
 
-1. Download or clone this repository
-2. Open Chrome and go to `chrome://extensions/`
-3. Enable **Developer mode** (toggle in the top-right corner)
-4. Click **Load unpacked**
-5. Select the `extension/` folder from this repository
-6. The "Sync for Zotero" icon should appear in your toolbar
+1. Download the `extension.zip` or clone this repository
+2. Unzip the file to your local machine
+3. Open Chrome and go to `chrome://extensions/`
+4. Enable **Developer mode** (toggle in the top-right corner)
+5. Click **Load unpacked**
+6. Select the `extension/` folder from the unzipped file
+7. The "Sync for Zotero" icon should appear in your toolbar
 
 ### Updating
 
