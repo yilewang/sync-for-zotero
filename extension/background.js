@@ -346,9 +346,25 @@ function adaptivePoll() {
   const interval = isActive ? RELAY_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
   pollForQuery();
   pollForCommand();
+  pollForStop();
   setTimeout(adaptivePoll, interval);
 }
 setTimeout(adaptivePoll, RELAY_POLL_INTERVAL_MS);
+
+// Poll for stop signal — runs even during active pipeline (unlike pollForCommand)
+async function pollForStop() {
+  if (!pipelineRunning) return; // only needed during active generation
+  if (!zoteroConnected) return;
+  try {
+    const data = await fetch(`${SERVER}/poll_stop`).then(r => r.json());
+    if (data.stop && activeChatTabId !== null) {
+      // Tell content script to click ChatGPT's stop button
+      chrome.tabs.sendMessage(activeChatTabId, { type: "STOP" }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  } catch (_) {}
+}
 
 async function pollForCommand() {
   if (pipelineRunning) return;

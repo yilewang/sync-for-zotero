@@ -18,7 +18,13 @@
   }
 
   function composerTextMatchesPrompt(promptText, composerText) {
-    return normalizeComposerText(promptText) === normalizeComposerText(composerText);
+    const a = normalizeComposerText(promptText);
+    const b = normalizeComposerText(composerText);
+    if (a === b) return true;
+    // Lenient match: collapse all whitespace and compare — contentEditable
+    // may reformat newlines, merge paragraphs, or strip trailing spaces.
+    const collapse = (s) => s.replace(/\s+/g, " ").trim();
+    return collapse(a) === collapse(b);
   }
 
   function isPlaceholderAssistantText(text) {

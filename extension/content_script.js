@@ -2325,6 +2325,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
 
+  // [webchat] Stop ChatGPT generation by clicking the stop button
+  if (msg.type === "STOP") {
+    const stopBtn = findStopButton();
+    if (stopBtn) {
+      stopBtn.click();
+      sendResponse({ ok: true });
+    } else {
+      sendResponse({ ok: false, error: "Stop button not found" });
+    }
+    return false;
+  }
+
   // [webchat] Navigate to a URL (forces full page reload for SPA)
   if (msg.type === "NAVIGATE") {
     _lastSetChatGPTMode = null; // Reset mode tracking for new page
