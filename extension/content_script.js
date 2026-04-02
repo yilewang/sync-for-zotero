@@ -946,6 +946,66 @@ function isConversationStillRunning(stopBtn = findStopButton()) {
   return Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint() || recentActivity;
 }
 
+/**
+ * Detect ChatGPT's response action bar (copy, regenerate, thumbs up/down).
+ * This bar only appears when the response is truly complete — it's a strong
+ * positive completion signal, unlike the stop button which is a negative signal.
+ * Returns true if the action bar is visible on the last assistant message.
+ */
+function hasResponseActionBar() {
+  // Get the last assistant message container
+  const assistantMessages = document.querySelectorAll(
+    "[data-message-author-role='assistant']"
+  );
+  if (!assistantMessages.length) return false;
+  const lastMsg = assistantMessages[assistantMessages.length - 1];
+
+  // Search within the conversation turn container (action bar can be a sibling
+  // of the message node, not a child).
+  const searchRoot = lastMsg.closest("[data-testid^='conversation-turn']") || lastMsg.parentElement || lastMsg;
+
+  // --- Primary: known selectors for ChatGPT action buttons ---
+  const ACTION_SELECTORS = [
+    'button[aria-label="Copy"]',
+    'button[aria-label="Regenerate"]',
+    'button[aria-label="Read aloud"]',
+    'button[aria-label="Good response"]',
+    'button[aria-label="Bad response"]',
+    'button[data-testid="copy-turn-action-button"]',
+    'button[data-testid="regenerate-turn-action-button"]',
+    'button[data-testid="thumbs-up-turn-action-button"]',
+    'button[data-testid="thumbs-down-turn-action-button"]',
+    'button[data-testid*="voice-play"]',
+  ];
+  for (const sel of ACTION_SELECTORS) {
+    const el = searchRoot.querySelector(sel);
+    if (el && isVisibleElement(el)) return true;
+  }
+
+  // --- Fallback: heuristic detection ---
+  // ChatGPT's action bar is a row of small icon-only buttons (no text, just SVGs)
+  // that appears below the response content. If the known selectors fail (ChatGPT
+  // changed their attributes), look for a cluster of 3+ small visible icon buttons
+  // that are NOT inside the prose/markdown content area.
+  const contentArea = searchRoot.querySelector(".markdown, [class*='markdown'], .prose, [class*='prose']");
+  const allButtons = searchRoot.querySelectorAll("button");
+  let iconButtonCount = 0;
+  for (const btn of allButtons) {
+    // Skip buttons inside the content area (e.g., code copy buttons)
+    if (contentArea && contentArea.contains(btn)) continue;
+    if (!isVisibleElement(btn)) continue;
+    // Icon buttons: contain an SVG and have very little or no text
+    const hasSvg = btn.querySelector("svg") !== null;
+    const textLen = (btn.textContent || "").trim().length;
+    if (hasSvg && textLen <= 2) {
+      iconButtonCount++;
+    }
+  }
+  // The action bar typically has 4-5 buttons; require 3+ to avoid false positives
+  // from stray icon buttons (e.g., a single code-block copy button).
+  return iconButtonCount >= 3;
+}
+
 function getAssistantMessageNodes() {
   const selectors = [
     "[data-message-author-role='assistant']",
@@ -1352,11 +1412,18 @@ async function streamResponseSnapshots(
       }
     }
 
+    // Detect ChatGPT's action bar — strong positive completion signal.
+    const actionBarVisible = hasResponseActionBar();
+
     // Adaptive quiet/rebound windows:
+    // - Action bar visible: very short — ChatGPT itself considers the response done
     // - Tool-use: longer windows to bridge gaps between tool streams
     // - SSE-done simple responses: shorter windows for faster completion
     let quietWindowMs, reboundWindowMs;
-    if (toolUseDetected) {
+    if (actionBarVisible && answerVisible) {
+      quietWindowMs = 500;
+      reboundWindowMs = 200;
+    } else if (toolUseDetected) {
       quietWindowMs = 15000;
       reboundWindowMs = 3000;
     } else if (sseDone && activeConversationStreamCount === 0 && answerVisible) {
@@ -1518,6 +1585,49 @@ async function streamResponseSnapshots(
         turnStatus: "done",
       });
       return;
+    }
+
+    // Action-bar-based fast completion: the action bar (copy, regenerate, etc.)
+    // only appears when ChatGPT considers the response fully complete.
+    // This works even when SSE interception fails.
+    if (
+      actionBarVisible &&
+      answerVisible &&
+      !stopBtn &&
+      !hasBusyComposerHint() &&
+      completion.phase !== "verified_done"
+    ) {
+      const finalText = lastAnswerText || sseText;
+      const finalThinking = lastThinkingText || sseThinking || null;
+      if (shared.hasMeaningfulAssistantText(finalText)) {
+        recordTurnDebug("action_bar_fast_completion", {
+          seq,
+          attempt,
+          domAnswerLen: lastAnswerText.length,
+          sseTextLen: (sseText || "").length,
+        });
+        postTerminal(port, {
+          seq,
+          attempt,
+          text: finalText,
+          thinking: finalThinking,
+          answerAnchorId: assistantTurnKey,
+          answerRevision,
+          thinkingRevision,
+          runState: "done",
+          completionReason: "settled",
+          finalTranscriptHash: transcript.hash,
+          verifiedAt: nowMs,
+          remoteChatUrl,
+          remoteChatId,
+          userTurnKey,
+          assistantTurnKey,
+          baselineTranscriptCount,
+          baselineTranscriptHash,
+          turnStatus: "done",
+        });
+        return;
+      }
     }
 
     if (
@@ -1946,6 +2056,10 @@ function extractUserMessageText(node) {
   // Remove media elements that inject alt text or empty strings into innerText,
   // corrupting text extraction for image/video messages.
   root.querySelectorAll("img, picture, video, canvas, svg").forEach((el) => el.remove());
+  // Use htmlToMarkdown to preserve math delimiters from KaTeX elements
+  const markdown = htmlToMarkdown(root.innerHTML).trim();
+  if (markdown) return markdown;
+  // Fallback to plain text extraction
   const text = shared.normalizeComposerText(
     root.innerText || root.textContent || "",
   );
@@ -2201,6 +2315,13 @@ function resolveBoundAssistantTurn(transcript, userTurnKey, assistantTurnKey = n
   return null;
 }
 
+/** Extract original LaTeX source from a KaTeX-rendered element. */
+function extractLatexFromKatex(el) {
+  const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
+  if (annotation) return annotation.textContent.trim();
+  return null;
+}
+
 /** Very lightweight HTML → Markdown converter for ChatGPT's response format. */
 function htmlToMarkdown(html) {
   // Use a temporary DOM element
@@ -2212,6 +2333,26 @@ function htmlToMarkdown(html) {
 
     const tag = node.tagName?.toLowerCase();
     const children = () => Array.from(node.childNodes).map(nodeToMd).join("");
+
+    // Handle KaTeX math elements before the main switch
+    if (tag === "span") {
+      const cls = String(node.className || "");
+
+      // Display math: <span class="katex-display">
+      if (cls.includes("katex-display")) {
+        const latex = extractLatexFromKatex(node);
+        if (latex) return `\n$$${latex}$$\n`;
+      }
+
+      // Inline math: <span class="katex"> (but not katex-display, katex-mathml, katex-html, etc.)
+      if (/\bkatex\b/.test(cls) && !cls.includes("katex-")) {
+        const latex = extractLatexFromKatex(node);
+        if (latex) return `$${latex}$`;
+      }
+
+      // Skip internal KaTeX sub-elements to avoid duplicating content
+      if (cls.includes("katex-mathml") || cls.includes("katex-html")) return "";
+    }
 
     switch (tag) {
       case "h1": return `\n# ${children()}\n`;
@@ -2238,10 +2379,12 @@ function htmlToMarkdown(html) {
         return `\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
       }
       case "ul": {
-        return "\n" + Array.from(node.children).map(li => `- ${li.textContent.trim()}`).join("\n") + "\n";
+        const liContent = (li) => Array.from(li.childNodes).map(nodeToMd).join("").trim();
+        return "\n" + Array.from(node.children).map(li => `- ${liContent(li)}`).join("\n") + "\n";
       }
       case "ol": {
-        return "\n" + Array.from(node.children).map((li, i) => `${i + 1}. ${li.textContent.trim()}`).join("\n") + "\n";
+        const liContent = (li) => Array.from(li.childNodes).map(nodeToMd).join("").trim();
+        return "\n" + Array.from(node.children).map((li, i) => `${i + 1}. ${liContent(li)}`).join("\n") + "\n";
       }
       case "li": return `\n- ${children()}`;
       case "a": return `[${children()}](${node.getAttribute("href") ?? ""})`;
@@ -2257,7 +2400,7 @@ function htmlToMarkdown(html) {
     if (!rows.length) return "";
     const lines = rows.map((row) => {
       const cells = Array.from(row.querySelectorAll("td, th")).map(
-        (c) => c.textContent.trim().replace(/\|/g, "\\|")
+        (c) => nodeToMd(c).trim().replace(/\|/g, "\\|")
       );
       return `| ${cells.join(" | ")} |`;
     });

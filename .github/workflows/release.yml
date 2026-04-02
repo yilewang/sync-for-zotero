@@ -1,0 +1,22 @@
+name: Release Extension
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  upload-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip extension folder
+        run: zip -r extension.zip extension/
+
+      - name: Upload to release
+        run: gh release upload "${{ github.event.release.tag_name }}" extension.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
