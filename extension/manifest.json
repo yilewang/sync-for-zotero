@@ -12,6 +12,7 @@
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
+    "https://chat.deepseek.com/*",
     "http://127.0.0.1:*/*"
   ],
   "background": {
@@ -19,13 +20,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
       "js": ["injected.js"],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
       "js": ["webchat_shared.js", "content_script.js"],
       "run_at": "document_idle"
     }

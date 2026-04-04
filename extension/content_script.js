@@ -1,8 +1,8 @@
 /**
- * content_script.js — Runs on https://chatgpt.com/*
+ * content_script.js — Runs on supported chat sites (chatgpt.com, chat.deepseek.com).
  *
  * Handles the RUN_PIPELINE message:
- *   1. Attach the PDF to ChatGPT's file input
+ *   1. Attach the PDF to the chat's file input
  *   2. Type the prompt into the composer
  *   3. Submit the message
  *   4. Wait for the response to finish streaming
@@ -10,6 +10,8 @@
  *   6. Return it to the background script
  *
  * Also continuously scrapes the sidebar history and handles DELETE_CHAT commands.
+ *
+ * Site-specific logic is abstracted via SITE_ADAPTER (selected by hostname).
  */
 
 // ---------------------------------------------------------------------------
@@ -243,6 +245,224 @@ globalThis.__syncZoteroWebchatDebug = {
   getActiveToken: () => activeTurnDebugToken,
 };
 
+// ---------------------------------------------------------------------------
+// Site adapter — abstracts DOM selectors and site-specific behavior
+// ---------------------------------------------------------------------------
+
+const SITE_ADAPTERS = {
+  "chatgpt.com": {
+    siteId: "chatgpt",
+    homeUrl: "https://chatgpt.com/",
+    composerSelectors: [
+      "#prompt-textarea",
+      "[data-testid='text-input']",
+      "[role='textbox'][contenteditable='true']",
+      "div[contenteditable='true']",
+      "textarea",
+    ],
+    sendButtonSelectors(composer) {
+      const roots = [
+        composer?.closest("form") || null,
+        composer?.closest("[class*='composer']") || null,
+        composer?.closest("[data-testid*='composer']") || null,
+        composer?.parentElement || null,
+        document,
+      ];
+      for (const root of roots) {
+        if (!root) continue;
+        const match =
+          root.querySelector?.("button[data-testid='send-button']") ||
+          root.querySelector?.("button[aria-label='Send message']") ||
+          root.querySelector?.("button[aria-label='Send prompt']") ||
+          root.querySelector?.("button[aria-label='Send']") ||
+          root.querySelector?.("button[type='submit']");
+        if (match && isVisibleElement(match)) return match;
+      }
+      return null;
+    },
+    stopButtonSelectors: [
+      '[data-testid="stop-button"]',
+      'button[aria-label="Stop generating"]',
+      'button[aria-label="Stop"]',
+      'button[aria-label="Cancel"]',
+      'button[aria-label="Cancel response"]',
+      'button[title="Cancel"]',
+      'button[title="Stop"]',
+      '[data-testid*="cancel"]',
+    ],
+    userMessageSelector: "[data-message-author-role='user']",
+    assistantMessageSelectors: [
+      "[data-message-author-role='assistant']",
+      "article[data-testid*='assistant']",
+    ],
+    conversationMessageSelector: "[data-message-author-role]",
+    getMessageRole(node) {
+      return node.getAttribute("data-message-author-role");
+    },
+    getMessageId(node) {
+      return node.getAttribute?.("data-message-id") || node.id || null;
+    },
+    conversationTurnSelector: "[data-testid^='conversation-turn']",
+    actionBarSelectors: [
+      'button[aria-label="Copy"]',
+      'button[aria-label="Regenerate"]',
+      'button[aria-label="Read aloud"]',
+      'button[aria-label="Good response"]',
+      'button[aria-label="Bad response"]',
+      'button[data-testid="copy-turn-action-button"]',
+      'button[data-testid="regenerate-turn-action-button"]',
+      'button[data-testid="thumbs-up-turn-action-button"]',
+      'button[data-testid="thumbs-down-turn-action-button"]',
+      'button[data-testid*="voice-play"]',
+    ],
+    thinkingSelectors: [
+      "[data-testid='reasoning-content']",
+      "[data-testid='thinking-content']",
+      "[data-testid='thinking']",
+      "[class*='thinking'] .markdown",
+      "[class*='reasoning'] .markdown",
+    ],
+    pruneThinkingSelectors: [
+      "[data-testid='reasoning-content']",
+      "[data-testid='thinking-content']",
+      "[data-testid='thinking']",
+      "[class*='thinking']",
+      "[class*='reasoning']",
+    ],
+    dropTargetSelectors: [
+      "#prompt-textarea",
+      "[data-testid='text-input']",
+      "form",
+    ],
+    attachmentPillSelector:
+      '[data-testid*="file"], [class*="attachment"], [class*="file-pill"], ' +
+      '[aria-label*="pdf"], [aria-label*="PDF"], [class*="FileIcon"]',
+    getChatIdFromUrl(url) {
+      try {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
+        return match ? match[1] : null;
+      } catch (_) {
+        return null;
+      }
+    },
+    historyLinkSelector: 'nav a[href^="/c/"]',
+    buildHistoryEntry(a) {
+      const href = a.getAttribute("href");
+      const chatId = href.replace("/c/", "");
+      const title = a.textContent.trim();
+      return { id: chatId, title, chatUrl: `https://chatgpt.com${href}` };
+    },
+    deleteChatLinkSelector(chatId) {
+      return `nav a[href="/c/${chatId}"]`;
+    },
+    supportsFileUpload: true,
+    supportsModelSelector: true,
+    /** Whether composer uses a <form> wrapper (enables form.requestSubmit). */
+    hasFormWrapper: true,
+  },
+
+  "chat.deepseek.com": {
+    siteId: "deepseek",
+    homeUrl: "https://chat.deepseek.com/",
+    composerSelectors: [
+      'textarea[placeholder="Message DeepSeek"]',
+      "textarea",
+    ],
+    sendButtonSelectors(composer) {
+      // DeepSeek uses div[role="button"] for the send button — it's the last
+      // icon-button in the composer area that is NOT the attachment button.
+      const container =
+        composer?.closest("div")?.parentElement?.parentElement?.parentElement ||
+        document.body;
+      const btns = container.querySelectorAll(
+        'div.ds-icon-button[role="button"]'
+      );
+      // The send button is the last one; the one before it is the attach button
+      for (let i = btns.length - 1; i >= 0; i--) {
+        const btn = btns[i];
+        // Skip the attachment button (has a sibling file input)
+        if (btn.parentElement?.querySelector('input[type="file"]')) continue;
+        if (isVisibleElement(btn)) return btn;
+      }
+      return null;
+    },
+    stopButtonSelectors: [
+      // DeepSeek transforms the send button into a stop button during streaming
+      // (same element, different SVG). We can't distinguish stop vs send by selector
+      // alone, so we rely entirely on SSE [DONE] + turn completion tracker for
+      // completion detection. Empty array = findStopButton() always returns null.
+    ],
+    userMessageSelector: "div.ds-message.d29f3d7d",
+    assistantMessageSelectors: [
+      "div.ds-message:not(.d29f3d7d)",
+    ],
+    conversationMessageSelector: "div.ds-message",
+    getMessageRole(node) {
+      // DeepSeek uses an extra CSS class (d29f3d7d) for user messages
+      if (node.classList?.contains("d29f3d7d")) return "user";
+      if (node.classList?.contains("ds-message")) return "assistant";
+      return null;
+    },
+    getMessageId(node) {
+      return node.id || null;
+    },
+    conversationTurnSelector: null, // DeepSeek doesn't use conversation-turn wrappers
+    actionBarSelectors: [
+      // DeepSeek's action bar buttons are ds-icon-button siblings of the message
+      "div.db183363.ds-icon-button",
+    ],
+    thinkingSelectors: [
+      // DeepSeek's DeepThink thinking content
+      "[class*='thinking'] .ds-markdown",
+      "[class*='thinking']",
+      "[class*='reasoning'] .ds-markdown",
+      "[class*='reasoning']",
+    ],
+    pruneThinkingSelectors: [
+      "[class*='thinking']",
+      "[class*='reasoning']",
+    ],
+    dropTargetSelectors: [
+      'textarea[placeholder="Message DeepSeek"]',
+      "textarea",
+    ],
+    attachmentPillSelector:
+      '[class*="attachment"], [class*="file-pill"], [class*="upload"]',
+    getChatIdFromUrl(url) {
+      try {
+        const parsed = new URL(url);
+        // DeepSeek URL: /a/chat/s/{session-uuid}
+        const match = parsed.pathname.match(/\/a\/chat\/s\/([^/?#]+)/);
+        return match ? match[1] : null;
+      } catch (_) {
+        return null;
+      }
+    },
+    historyLinkSelector: 'a[href*="/a/chat/s/"]',
+    buildHistoryEntry(a) {
+      const href = a.getAttribute("href");
+      const match = href.match(/\/a\/chat\/s\/([^/?#]+)/);
+      const chatId = match ? match[1] : href;
+      const title = a.textContent.trim();
+      return { id: chatId, title, chatUrl: `https://chat.deepseek.com${href}` };
+    },
+    deleteChatLinkSelector(chatId) {
+      return `a[href*="/a/chat/s/${chatId}"]`;
+    },
+    supportsFileUpload: true,
+    supportsModelSelector: false,
+    hasFormWrapper: false,
+  },
+
+};
+
+const SITE_ADAPTER = SITE_ADAPTERS[window.location.hostname];
+if (!SITE_ADAPTER) {
+  // Unknown site — content script should not run
+  console.warn("[sync-zotero] Unsupported site:", window.location.hostname);
+}
+
 /** Wait until a selector matches, polling every 200 ms up to `timeout` ms. */
 function waitForElement(selector, timeout = 10000) {
   return new Promise((resolve, reject) => {
@@ -319,13 +539,7 @@ function isUsableComposer(el) {
 }
 
 function getComposerCandidates() {
-  const selectors = [
-    "#prompt-textarea",
-    "[data-testid='text-input']",
-    "[role='textbox'][contenteditable='true']",
-    "div[contenteditable='true']",
-    "textarea",
-  ];
+  const selectors = SITE_ADAPTER?.composerSelectors || ["textarea"];
   const candidates = [];
   for (const selector of selectors) {
     const nodes = document.querySelectorAll(selector);
@@ -345,7 +559,7 @@ async function getComposerElement(timeoutMs = 10000) {
     if (composer) return composer;
     await sleep(100);
   }
-  throw new Error("ChatGPT composer was not ready in time.");
+  throw new Error("Chat composer was not ready in time.");
 }
 
 function findComposerNow() {
@@ -422,11 +636,11 @@ async function attachImages(imageDataUrls) {
     const dt = new DataTransfer();
     dt.items.add(file);
 
-    const dropTarget =
-      document.querySelector("#prompt-textarea") ||
-      document.querySelector("[data-testid='text-input']") ||
-      document.querySelector("form") ||
-      document.body;
+    let dropTarget = document.body;
+    for (const sel of (SITE_ADAPTER?.dropTargetSelectors || [])) {
+      const el = document.querySelector(sel);
+      if (el) { dropTarget = el; break; }
+    }
 
     dropTarget.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: dt }));
     await sleep(100);
@@ -454,11 +668,11 @@ async function attachPDF(pdfBase64, pdfFilename) {
   dt.items.add(file);
 
   // Find the composer / drop target
-  const dropTarget =
-    document.querySelector("#prompt-textarea") ||
-    document.querySelector("[data-testid='text-input']") ||
-    document.querySelector("form") ||
-    document.body;
+  let dropTarget = document.body;
+  for (const sel of (SITE_ADAPTER?.dropTargetSelectors || [])) {
+    const el = document.querySelector(sel);
+    if (el) { dropTarget = el; break; }
+  }
 
   // Simulate drag-and-drop (same as manually dragging a file into the window)
   dropTarget.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: dt }));
@@ -468,12 +682,11 @@ async function attachPDF(pdfBase64, pdfFilename) {
   dropTarget.dispatchEvent(new DragEvent("drop",      { bubbles: true, cancelable: true, dataTransfer: dt }));
 
   // Wait for the attachment pill to appear (confirms upload was accepted)
+  const pillSelector = SITE_ADAPTER?.attachmentPillSelector ||
+    '[data-testid*="file"], [class*="attachment"], [class*="file-pill"]';
   for (let i = 0; i < 20; i++) {
     await sleep(500);
-    const pill = document.querySelector(
-      '[data-testid*="file"], [class*="attachment"], [class*="file-pill"], ' +
-      '[aria-label*="pdf"], [aria-label*="PDF"], [class*="FileIcon"]'
-    );
+    const pill = document.querySelector(pillSelector);
     if (pill) return; // success
   }
 
@@ -673,7 +886,7 @@ async function typePromptAndVerify(promptText) {
     }
   }
 
-  throw new Error("Prompt verification failed: ChatGPT composer text did not match the requested prompt.");
+  throw new Error("Prompt verification failed: composer text did not match the requested prompt.");
 }
 
 // ---------------------------------------------------------------------------
@@ -695,25 +908,9 @@ async function waitForSendButton(timeoutMs = 10000) {
 }
 
 function findSendButton(composer = findComposerNow()) {
-  const roots = [
-    composer?.closest("form") || null,
-    composer?.closest("[class*='composer']") || null,
-    composer?.closest("[data-testid*='composer']") || null,
-    composer?.parentElement || null,
-    document,
-  ];
-
-  for (const root of roots) {
-    if (!root) continue;
-    const match =
-      root.querySelector?.("button[data-testid='send-button']") ||
-      root.querySelector?.("button[aria-label='Send message']") ||
-      root.querySelector?.("button[aria-label='Send prompt']") ||
-      root.querySelector?.("button[aria-label='Send']") ||
-      root.querySelector?.("button[type='submit']");
-    if (match && isVisibleElement(match)) return match;
+  if (SITE_ADAPTER?.sendButtonSelectors && typeof SITE_ADAPTER.sendButtonSelectors === "function") {
+    return SITE_ADAPTER.sendButtonSelectors(composer);
   }
-
   return null;
 }
 
@@ -766,7 +963,7 @@ async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial
       baselineOutboundRequestSerial,
       outboundRequestSerial,
       baselineUserMessageCount,
-      userMessageCount: document.querySelectorAll("[data-message-author-role='user']").length,
+      userMessageCount: document.querySelectorAll(SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']").length,
       stopButtonVisible: !!findStopButton(),
       composerTextAfter: readComposerText(composer),
       promptText,
@@ -798,7 +995,7 @@ async function submitMessageAndVerify(promptText) {
       }
 
       const baselineUserMessageCount = document.querySelectorAll(
-        "[data-message-author-role='user']"
+        SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']"
       ).length;
       const baselineOutboundRequestSerial = outboundRequestSerial;
 
@@ -818,7 +1015,7 @@ async function submitMessageAndVerify(promptText) {
     }
   }
 
-  throw new Error("Prompt delivery failed: ChatGPT did not accept the prompt after 2 attempts.");
+  throw new Error("Prompt delivery failed: chat did not accept the prompt after 2 attempts.");
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +1085,7 @@ function workerSleep(ms) {
   });
 }
 
-const STOP_SELECTORS = [
+const STOP_SELECTORS = SITE_ADAPTER?.stopButtonSelectors || [
   '[data-testid="stop-button"]',
   'button[aria-label="Stop generating"]',
   'button[aria-label="Stop"]',
@@ -934,7 +1131,7 @@ function hasBusyComposerHint() {
   const bodyText = document.body?.textContent || "";
   return (
     bodyText.includes("Wait for the current response to finish before starting a new chat") ||
-    bodyText.includes("Wait for ChatGPT to finish responding")
+    bodyText.includes("Wait for the model to finish responding")
   );
 }
 
@@ -954,29 +1151,22 @@ function isConversationStillRunning(stopBtn = findStopButton()) {
  */
 function hasResponseActionBar() {
   // Get the last assistant message container
-  const assistantMessages = document.querySelectorAll(
-    "[data-message-author-role='assistant']"
-  );
+  const assistantSelectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
+  let assistantMessages = [];
+  for (const sel of assistantSelectors) {
+    assistantMessages = Array.from(document.querySelectorAll(sel));
+    if (assistantMessages.length > 0) break;
+  }
   if (!assistantMessages.length) return false;
   const lastMsg = assistantMessages[assistantMessages.length - 1];
 
   // Search within the conversation turn container (action bar can be a sibling
   // of the message node, not a child).
-  const searchRoot = lastMsg.closest("[data-testid^='conversation-turn']") || lastMsg.parentElement || lastMsg;
+  const turnSel = SITE_ADAPTER?.conversationTurnSelector;
+  const searchRoot = (turnSel ? lastMsg.closest(turnSel) : null) || lastMsg.parentElement || lastMsg;
 
-  // --- Primary: known selectors for ChatGPT action buttons ---
-  const ACTION_SELECTORS = [
-    'button[aria-label="Copy"]',
-    'button[aria-label="Regenerate"]',
-    'button[aria-label="Read aloud"]',
-    'button[aria-label="Good response"]',
-    'button[aria-label="Bad response"]',
-    'button[data-testid="copy-turn-action-button"]',
-    'button[data-testid="regenerate-turn-action-button"]',
-    'button[data-testid="thumbs-up-turn-action-button"]',
-    'button[data-testid="thumbs-down-turn-action-button"]',
-    'button[data-testid*="voice-play"]',
-  ];
+  // --- Primary: known selectors for action buttons ---
+  const ACTION_SELECTORS = SITE_ADAPTER?.actionBarSelectors || [];
   for (const sel of ACTION_SELECTORS) {
     const el = searchRoot.querySelector(sel);
     if (el && isVisibleElement(el)) return true;
@@ -1007,10 +1197,7 @@ function hasResponseActionBar() {
 }
 
 function getAssistantMessageNodes() {
-  const selectors = [
-    "[data-message-author-role='assistant']",
-    "article[data-testid*='assistant']",
-  ];
+  const selectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
   for (const selector of selectors) {
     const nodes = Array.from(document.querySelectorAll(selector));
     if (nodes.length > 0) return nodes;
@@ -1020,6 +1207,7 @@ function getAssistantMessageNodes() {
 
 function buildAssistantAnchorId(node, index) {
   return (
+    SITE_ADAPTER?.getMessageId?.(node) ||
     node.getAttribute?.("data-message-id") ||
     node.id ||
     `assistant-anchor-${index + 1}`
@@ -1310,7 +1498,7 @@ async function streamResponseSnapshots(
             });
             return;
           } else {
-            throw new Error("ChatGPT never created the submitted user turn in the conversation transcript.");
+            throw new Error("Chat never created the submitted user turn in the conversation transcript.");
           }
         }
       }
@@ -1756,7 +1944,7 @@ async function streamResponseSnapshots(
     return;
   }
 
-  throw new Error("ChatGPT did not produce a visible assistant turn before timeout.");
+  throw new Error("Chat did not produce a visible assistant turn before timeout.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,6 +1964,8 @@ function extractAssistantAnswerText(node) {
 
   const contentSelectors = [
     ".markdown",
+    ".ds-markdown",
+    ".markdown-container",
     "[class*='markdown']",
     ".prose",
     "[class*='prose']",
@@ -1844,16 +2034,19 @@ function extractResponse() {
 }
 
 function pruneAssistantStatusNodes(root) {
-  const selectors = [
-    "details",
-    "summary",
-    "button",
-    "[role='button']",
+  const thinkingPrune = SITE_ADAPTER?.pruneThinkingSelectors || [
     "[data-testid='reasoning-content']",
     "[data-testid='thinking-content']",
     "[data-testid='thinking']",
     "[class*='thinking']",
     "[class*='reasoning']",
+  ];
+  const selectors = [
+    "details",
+    "summary",
+    "button",
+    "[role='button']",
+    ...thinkingPrune,
     "[role='status']",
     "[aria-live]",
     "progress",
@@ -1868,7 +2061,7 @@ function extractAssistantThinkingText(node) {
   const root = node.cloneNode(true);
   root.querySelectorAll("button, [role='button']").forEach((el) => el.remove());
 
-  const explicit = [
+  const explicit = SITE_ADAPTER?.thinkingSelectors || [
     "[data-testid='reasoning-content']",
     "[data-testid='thinking-content']",
     "[data-testid='thinking']",
@@ -1959,6 +2152,9 @@ function getCurrentChatUrl() {
 }
 
 function getCurrentChatId(url = getCurrentChatUrl()) {
+  if (SITE_ADAPTER?.getChatIdFromUrl) {
+    return SITE_ADAPTER.getChatIdFromUrl(url);
+  }
   try {
     const parsed = new URL(url);
     const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
@@ -2067,11 +2263,10 @@ function extractUserMessageText(node) {
 }
 
 function getConversationMessageNodes() {
-  const nodes = Array.from(
-    document.querySelectorAll("[data-message-author-role]"),
-  );
+  const selector = SITE_ADAPTER?.conversationMessageSelector || "[data-message-author-role]";
+  const nodes = Array.from(document.querySelectorAll(selector));
   return nodes.filter((node) => {
-    const role = node.getAttribute("data-message-author-role");
+    const role = SITE_ADAPTER?.getMessageRole?.(node) || node.getAttribute("data-message-author-role");
     return role === "user" || role === "assistant";
   });
 }
@@ -2093,7 +2288,7 @@ function buildTranscriptMessageKey(node, role, index, text, attachments = []) {
 }
 
 function extractNormalizedMessage(node, index) {
-  const role = node.getAttribute("data-message-author-role");
+  const role = SITE_ADAPTER?.getMessageRole?.(node) || node.getAttribute("data-message-author-role");
   if (role !== "user" && role !== "assistant") return null;
 
   const attachments = extractAttachmentNames(node);
@@ -2232,7 +2427,7 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
   return {
     ok: false,
     ready: false,
-    error: "Timed out waiting for the ChatGPT conversation to become ready.",
+    error: "Timed out waiting for the conversation to become ready.",
     chatUrl: transcript.chatUrl,
     chatId: transcript.chatId,
     transcriptHash: transcript.hash,
@@ -2426,7 +2621,7 @@ async function scrapeAllMessages() {
 
   // If first attempt failed or returned empty messages on a conversation page,
   // retry once after a brief delay (handles stale SPA state)
-  const isConversationPage = chatUrl && chatUrl.includes("/c/");
+  const isConversationPage = chatUrl && (chatUrl.includes("/c/") || chatUrl.includes("/a/chat/s/") || /\/chat\/[a-f0-9-]+/.test(chatUrl));
   const firstMessages = (ready.messages || []).filter(
     (message) => message.text || message.thinking,
   );
@@ -2495,7 +2690,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({
           ok: false,
           ready: false,
-          error: err?.message || "Failed to wait for ChatGPT readiness.",
+          error: err?.message || "Failed to wait for chat readiness.",
         }),
       );
     return true;
@@ -2600,12 +2795,14 @@ if (!window.__syncZoteroListenerRegistered) {
 let lastHistoryJson = "";
 
 async function scrapeHistory() {
-  const items = Array.from(document.querySelectorAll('nav a[href^="/c/"]'));
+  const linkSelector = SITE_ADAPTER?.historyLinkSelector || 'nav a[href^="/c/"]';
+  const items = Array.from(document.querySelectorAll(linkSelector));
   const history = items.map(a => {
+    if (SITE_ADAPTER?.buildHistoryEntry) {
+      return SITE_ADAPTER.buildHistoryEntry(a);
+    }
     const href = a.getAttribute('href');
     const chatId = href.replace('/c/', '');
-    // The title is usually in a nested div, but textContent works well enough
-    // to get the visible text, stripped of extra whitespace.
     const title = a.textContent.trim();
     return { id: chatId, title, chatUrl: `https://chatgpt.com${href}` };
   });
@@ -2629,7 +2826,8 @@ setInterval(scrapeHistory, 2000);
 
 async function handleDeleteChat(chatId) {
   // Find the exact link in the sidebar
-  const chatLink = document.querySelector(`nav a[href="/c/${chatId}"]`);
+  const deleteLinkSelector = SITE_ADAPTER?.deleteChatLinkSelector?.(chatId) || `nav a[href="/c/${chatId}"]`;
+  const chatLink = document.querySelector(deleteLinkSelector);
   if (!chatLink) return { success: false, error: "Chat not found in sidebar" };
 
   // Hover or focus to ensure the options button appears

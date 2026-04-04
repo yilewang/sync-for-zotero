@@ -1,11 +1,15 @@
 /**
- * injected.js — Runs in ChatGPT's MAIN world (same JS context as the page).
+ * injected.js — Runs in MAIN world (same JS context as the page).
  *
- * Patches window.fetch to intercept streaming responses from ChatGPT's
+ * Patches window.fetch to intercept streaming responses from the site's
  * conversation API. Extracts assistant message text from the SSE stream
  * and relays it to the content script via window.postMessage.
  *
- * This approach is immune to ChatGPT DOM changes — it reads the raw
+ * Supports multiple sites via hostname-based adapter selection:
+ *   - chatgpt.com  — ChatGPT's /backend-api/conversation SSE format
+ *   - chat.deepseek.com — DeepSeek's /api/v0/chat/completion SSE format
+ *
+ * This approach is immune to DOM changes — it reads the raw
  * API response data at the network level.
  */
 
@@ -13,9 +17,7 @@
   "use strict";
 
   // Version guard: re-patch when the extension updates (new version).
-  // Without versioning, reloading the extension wouldn't update the fetch
-  // patch because the old guard blocks re-injection.
-  const PATCH_VERSION = 2;
+  const PATCH_VERSION = 3;
   if (window.__syncZoteroFetchPatched >= PATCH_VERSION) return;
   window.__syncZoteroFetchPatched = PATCH_VERSION;
 
@@ -23,6 +25,10 @@
   const originalFetch = window.__syncZoteroOriginalFetch || window.fetch;
   window.__syncZoteroOriginalFetch = originalFetch;
   let activeConversationStreamCount = 0;
+
+  // ---------------------------------------------------------------------------
+  // Shared helpers
+  // ---------------------------------------------------------------------------
 
   function postActiveStreamCount() {
     window.postMessage(
@@ -66,25 +72,137 @@
     return true;
   }
 
-  function isConversationRequest(url, method) {
-    if (method !== "POST") return false;
-    return (
-      /\/backend-api\/(?:f\/)?conversation\b/.test(url) ||
-      /\/backend-anon\/conversation\b/.test(url)
-    );
+  // ---------------------------------------------------------------------------
+  // Site adapters — each defines how to detect and parse SSE for that site
+  // ---------------------------------------------------------------------------
+
+  const SITE_ADAPTERS = {
+    "chatgpt.com": {
+      /** Detect ChatGPT's streaming conversation API requests. */
+      isConversationRequest(url, method) {
+        if (method !== "POST") return false;
+        return (
+          /\/backend-api\/(?:f\/)?conversation\b/.test(url) ||
+          /\/backend-anon\/conversation\b/.test(url)
+        );
+      },
+
+      /**
+       * Parse a single SSE JSON payload from ChatGPT's format.
+       * ChatGPT wraps content in message.content.parts[] and thinking in message.metadata.
+       * Returns { text, thinking } or null if this event should be skipped.
+       */
+      parseSSEPayload(parsed, lastText, lastThinking) {
+        const msg = parsed?.message;
+        if (!msg) return null;
+        if (msg.author?.role !== "assistant") return null;
+
+        // Skip known non-content message types
+        const msgType = msg.content?.content_type;
+        if (
+          msgType === "system_error" ||
+          msgType === "title_generation" ||
+          msgType === "conversation_title"
+        ) {
+          return null;
+        }
+
+        let text = lastText;
+        let thinking = lastThinking;
+
+        // Extract main text content
+        const parts = msg.content?.parts;
+        if (Array.isArray(parts)) {
+          const partText = parts
+            .filter((p) => typeof p === "string")
+            .join("");
+          if (hasMeaningfulAssistantText(partText) && partText !== lastText) {
+            text = partText;
+          }
+        }
+
+        // Extract thinking/reasoning text (o1, o3, o4-mini models)
+        const thinkingText =
+          msg.metadata?.thinking_text ||
+          msg.metadata?.reasoning_text ||
+          msg.content?.thinking ||
+          null;
+        if (thinkingText && thinkingText !== lastThinking) {
+          thinking = thinkingText;
+        }
+
+        // Only return if something changed
+        if (text !== lastText || thinking !== lastThinking) {
+          return { text, thinking };
+        }
+        return null;
+      },
+    },
+
+    "chat.deepseek.com": {
+      /** Detect DeepSeek's streaming chat completion API requests. */
+      isConversationRequest(url, method) {
+        if (method !== "POST") return false;
+        return /\/api\/v0\/chat\/completion\b/.test(url);
+      },
+
+      /**
+       * Parse a single SSE JSON payload from DeepSeek's format.
+       * DeepSeek uses OpenAI-compatible format: choices[0].delta.content
+       * and choices[0].delta.reasoning_content for thinking.
+       * Returns { text, thinking } or null if this event should be skipped.
+       */
+      parseSSEPayload(parsed, lastText, lastThinking) {
+        const choices = parsed?.choices;
+        if (!Array.isArray(choices) || choices.length === 0) return null;
+
+        const delta = choices[0]?.delta;
+        if (!delta) return null;
+
+        let text = lastText;
+        let thinking = lastThinking;
+
+        // Extract main content (accumulate deltas)
+        if (typeof delta.content === "string" && delta.content) {
+          text = lastText + delta.content;
+        }
+
+        // Extract reasoning/thinking content (DeepThink mode)
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          thinking = (lastThinking || "") + delta.reasoning_content;
+        }
+
+        // Only return if something changed
+        if (text !== lastText || thinking !== lastThinking) {
+          return { text, thinking };
+        }
+        return null;
+      },
+    },
+
+  };
+
+  // Select adapter based on current hostname
+  const currentHost = window.location.hostname;
+  const adapter = SITE_ADAPTERS[currentHost];
+  if (!adapter) {
+    // Unknown site — don't patch fetch
+    return;
   }
+
+  // ---------------------------------------------------------------------------
+  // Fetch patching
+  // ---------------------------------------------------------------------------
 
   window.fetch = async function (...args) {
     try {
-      // Determine the request URL
       const url =
         args[0] instanceof Request ? args[0].url : String(args[0] || "");
       const method = (
         (args[0] instanceof Request ? args[0].method : args[1]?.method) || "GET"
       ).toUpperCase();
 
-      // Intercept POST to the conversation endpoint (ChatGPT's streaming API)
-      if (isConversationRequest(url, method)) {
+      if (adapter.isConversationRequest(url, method)) {
         window.postMessage(
           {
             type: "SYNC_ZOTERO_REQUEST",
@@ -102,18 +220,15 @@
     const response = await originalFetch.apply(this, args);
 
     try {
-      // Determine the request URL
       const url =
         args[0] instanceof Request ? args[0].url : String(args[0] || "");
       const method = (
         (args[0] instanceof Request ? args[0].method : args[1]?.method) || "GET"
       ).toUpperCase();
 
-      if (isConversationRequest(url, method)) {
-        // Clone so we can read without consuming the original
+      if (adapter.isConversationRequest(url, method)) {
         const clone = response.clone();
         processSSEResponse(clone).catch((err) => {
-          // Silent failure — don't break ChatGPT
           console.debug("[sync-zotero] SSE processing error:", err);
         });
       }
@@ -124,10 +239,10 @@
     return response;
   };
 
-  /**
-   * Read the SSE stream from a cloned Response, extract assistant text,
-   * and post updates to the content script.
-   */
+  // ---------------------------------------------------------------------------
+  // SSE stream processing (shared across all sites)
+  // ---------------------------------------------------------------------------
+
   async function processSSEResponse(response) {
     const body = response.body;
     if (!body) return;
@@ -135,10 +250,6 @@
     activeConversationStreamCount += 1;
     postActiveStreamCount();
 
-    // Notify content script that a new SSE stream is starting.
-    // This resets sseDone so the previous stream's [DONE] doesn't
-    // prematurely end the pipeline (e.g., tool-use multi-stream flows
-    // where "Reading documents" completes before the actual response).
     window.postMessage({ type: "SYNC_ZOTERO_STREAM_START" }, "*");
 
     const reader = body.getReader();
@@ -156,7 +267,7 @@
 
         // Process complete lines
         const lines = buffer.split("\n");
-        buffer = lines.pop() || ""; // keep the last (possibly incomplete) line
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
@@ -165,9 +276,6 @@
 
           // SSE termination
           if (data === "[DONE]") {
-            // Include how many streams are still active (including this one,
-            // which hasn't decremented yet). The content script uses this to
-            // avoid setting sseDone when other streams are still in flight.
             window.postMessage(
               {
                 type: "SYNC_ZOTERO_SSE",
@@ -186,59 +294,19 @@
           try {
             parsed = JSON.parse(data);
           } catch {
-            continue; // malformed JSON — skip
-          }
-
-          // Filter: only process assistant messages
-          const msg = parsed?.message;
-          if (!msg) continue;
-          if (msg.author?.role !== "assistant") continue;
-
-          // Skip known non-content message types (title generation, status).
-          // Use a blocklist rather than allowlist so we don't miss responses
-          // with unexpected content_types (e.g., "multimodal_text" for image queries).
-          const msgType = msg.content?.content_type;
-          if (
-            msgType === "system_error" ||
-            msgType === "title_generation" ||
-            msgType === "conversation_title"
-          ) {
             continue;
           }
 
-          // Extract main text content
-          const parts = msg.content?.parts;
-          if (Array.isArray(parts)) {
-            const text = parts
-              .filter((p) => typeof p === "string")
-              .join("");
-            if (hasMeaningfulAssistantText(text) && text !== lastText) {
-              lastText = text;
-              window.postMessage(
-                {
-                  type: "SYNC_ZOTERO_SSE",
-                  text: lastText,
-                  thinking: lastThinking || null,
-                  done: false,
-                },
-                "*"
-              );
-            }
-          }
-
-          // Extract thinking/reasoning text (o1, o3, o4-mini models)
-          const thinking =
-            msg.metadata?.thinking_text ||
-            msg.metadata?.reasoning_text ||
-            msg.content?.thinking ||
-            null;
-          if (thinking && thinking !== lastThinking) {
-            lastThinking = thinking;
+          // Delegate to site adapter for extraction
+          const result = adapter.parseSSEPayload(parsed, lastText, lastThinking);
+          if (result) {
+            lastText = result.text;
+            lastThinking = result.thinking;
             window.postMessage(
               {
                 type: "SYNC_ZOTERO_SSE",
                 text: lastText,
-                thinking: lastThinking,
+                thinking: lastThinking || null,
                 done: false,
               },
               "*"

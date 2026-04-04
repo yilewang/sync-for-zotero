@@ -25,8 +25,15 @@ function setPipelineIndicator(state, message) {
 }
 
 // Request full status from background
+const labelTab = document.getElementById("label-tab");
+
 chrome.runtime.sendMessage({ type: "GET_FULL_STATUS" }, (status) => {
   if (!status) return;
+
+  // Update the tab label to show which site is active
+  if (labelTab && status.activeSiteLabel) {
+    labelTab.textContent = status.activeSiteLabel;
+  }
 
   setIndicator(dotHost, valHost, status.relayAlive, status.relayAlive ? "Connected" : "Offline");
   setIndicator(dotTab, valTab, status.chatTabAlive, status.chatTabAlive ? "Tab active" : "No tab");
@@ -34,8 +41,13 @@ chrome.runtime.sendMessage({ type: "GET_FULL_STATUS" }, (status) => {
 
   // Show conversation URL if available
   if (status.chatUrl) {
-    const short = status.chatUrl.replace("https://chatgpt.com/c/", "").slice(0, 12) + "…";
-    info.innerHTML = `🔗 <a href="${status.chatUrl}" target="_blank">chatgpt.com/c/${short}</a>`;
+    try {
+      const urlObj = new URL(status.chatUrl);
+      const shortPath = urlObj.pathname.slice(0, 20) + "…";
+      info.innerHTML = `🔗 <a href="${status.chatUrl}" target="_blank">${urlObj.hostname}${shortPath}</a>`;
+    } catch {
+      info.innerHTML = "";
+    }
   }
 });
 

@@ -29,11 +29,47 @@ const shared = globalThis.SyncZoteroShared || {
 };
 
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
-const CHATGPT_URL = "https://chatgpt.com/";
 const MAX_PRE_SUBMIT_RELEASES = 3;
 const RELAY_POLL_INTERVAL_MS = 500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const WEBCHAT_DEBUG = false;
+
+// ---------------------------------------------------------------------------
+// Site configuration — maps target IDs to their site details
+// ---------------------------------------------------------------------------
+
+const SITE_CONFIGS = {
+  chatgpt: {
+    siteId: "chatgpt",
+    homeUrl: "https://chatgpt.com/",
+    urlPattern: "https://chatgpt.com/*",
+    urlPrefix: "https://chatgpt.com",
+  },
+  deepseek: {
+    siteId: "deepseek",
+    homeUrl: "https://chat.deepseek.com/",
+    urlPattern: "https://chat.deepseek.com/*",
+    urlPrefix: "https://chat.deepseek.com",
+  },
+};
+
+const ALL_SITE_URL_PATTERNS = Object.values(SITE_CONFIGS).map(s => s.urlPattern);
+
+/** Get site config from a target ID (e.g., "chatgpt", "deepseek"). Defaults to chatgpt. */
+function getSiteConfig(target) {
+  return SITE_CONFIGS[target] || SITE_CONFIGS.chatgpt;
+}
+
+/** Determine which site config a URL belongs to. */
+function getSiteConfigByUrl(url) {
+  for (const config of Object.values(SITE_CONFIGS)) {
+    if (url?.startsWith(config.urlPrefix)) return config;
+  }
+  return null;
+}
+
+/** The currently active target — updated when a query specifies a target. */
+let activeTarget = "chatgpt";
 
 // Connection state tracking
 let zoteroConnected = false;
@@ -107,20 +143,35 @@ async function heartbeat() {
     const res = await fetch(`${SERVER}/heartbeat`);
     if (res.ok) {
       lastSuccessfulContact = Date.now();
+      // Update activeTarget from relay if provided
+      try {
+        const hb = await res.clone().json();
+        if (hb.active_target && SITE_CONFIGS[hb.active_target]) {
+          activeTarget = hb.active_target;
+        }
+      } catch { /* non-critical */ }
       if (!zoteroConnected) {
         zoteroConnected = true;
         console.log("[sync-zotero] Heartbeat: reconnected to Zotero");
         resetExtensionState();
       }
 
-      // Report extension status (ChatGPT tab alive, URL) to the relay
+      // Report extension status (chat tab alive, URL) to the relay
+      // Check ALL supported sites — report alive if any supported chat tab is open
       try {
-        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
-        const chatTabAlive = tabs.length > 0;
-        const preferred = activeChatTabId !== null
-          ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
-          : tabs[0];
-        const chatUrl = preferred?.url || null;
+        let chatTabAlive = false;
+        let chatUrl = null;
+        for (const pattern of ALL_SITE_URL_PATTERNS) {
+          const tabs = await chrome.tabs.query({ url: pattern });
+          if (tabs.length > 0) {
+            chatTabAlive = true;
+            const preferred = activeChatTabId !== null
+              ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
+              : tabs[0];
+            chatUrl = preferred?.url || null;
+            break;
+          }
+        }
         fetch(`${SERVER}/extension_status`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -140,12 +191,23 @@ async function heartbeat() {
 discoverZoteroPort();
 setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
 
-// Auto-discover existing ChatGPT tabs on startup and trigger initial history scrape
+// Auto-discover existing chat tabs on startup and trigger initial history scrape
 (async () => {
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
-  if (tabs.length > 0 && activeChatTabId === null) {
-    activeChatTabId = tabs[0].id;
-    console.log(`[sync-zotero] Found existing ChatGPT tab: ${tabs[0].id}`);
+  // Search all supported sites for an existing tab
+  let foundTab = null;
+  for (const config of Object.values(SITE_CONFIGS)) {
+    const tabs = await chrome.tabs.query({ url: config.urlPattern });
+    if (tabs.length > 0) {
+      foundTab = tabs[0];
+      activeTarget = config.siteId;
+      break;
+    }
+  }
+  if (foundTab && activeChatTabId === null) {
+    activeChatTabId = foundTab.id;
+    const tabs = [foundTab]; // compatibility with original code below
+    console.log(`[sync-zotero] Found existing chat tab: ${foundTab.id} (${activeTarget})`);
+    // (original code follows)
 
     // Wait for Zotero port discovery, then trigger a history scrape
     await discoverZoteroPort();
@@ -164,7 +226,7 @@ setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
 // ---------------------------------------------------------------------------
 
 let pipelineRunning  = false;
-let activeChatTabId  = null;   // ChatGPT tab used for the current conversation
+let activeChatTabId  = null;   // Chat tab used for the current conversation
 let lastProcessedSeq = 0;
 let lastProcessedAttempt = 0;
 let activePort       = null;   // current port connection to content script
@@ -270,7 +332,7 @@ async function waitForChatReadyInTab(tabId, expectedChatUrl = null, timeoutMs = 
     timeoutMs,
   });
   if (!response?.ok) {
-    throw new Error(response?.error || "ChatGPT did not become ready.");
+    throw new Error(response?.error || "Chat did not become ready.");
   }
   return response;
 }
@@ -358,7 +420,7 @@ async function pollForStop() {
   try {
     const data = await fetch(`${SERVER}/poll_stop`).then(r => r.json());
     if (data.stop && activeChatTabId !== null) {
-      // Tell content script to click ChatGPT's stop button
+      // Tell content script to click the stop button
       chrome.tabs.sendMessage(activeChatTabId, { type: "STOP" }, () => {
         void chrome.runtime.lastError;
       });
@@ -371,6 +433,10 @@ async function pollForCommand() {
   if (!zoteroConnected) return;
   try {
     const data = await fetch(`${SERVER}/poll_command`).then(r => r.json());
+    // Update activeTarget from relay
+    if (data.active_target && SITE_CONFIGS[data.active_target]) {
+      activeTarget = data.active_target;
+    }
     if (!data.command) return;
 
     const cmd = data.command;
@@ -383,22 +449,23 @@ async function pollForCommand() {
         turn_status: "navigating",
       }).catch(() => {});
 
-      // Navigate a ChatGPT tab to a fresh page
+      // Navigate a chat tab to a fresh page
+      const siteConfig = getSiteConfig(activeTarget);
       let tabId = activeChatTabId;
 
-      // Find an existing ChatGPT tab if we don't have one tracked
+      // Find an existing chat tab if we don't have one tracked
       if (tabId === null) {
-        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        const tabs = await chrome.tabs.query({ url: siteConfig.urlPattern });
         if (tabs.length > 0) tabId = tabs[0].id;
       }
 
       if (tabId !== null) {
         try {
-          await chrome.tabs.update(tabId, { url: CHATGPT_URL });
+          await chrome.tabs.update(tabId, { url: siteConfig.homeUrl });
           await waitForTabLoad(tabId);
         } catch (_) {}
       } else {
-        const tab = await chrome.tabs.create({ url: CHATGPT_URL, active: false });
+        const tab = await chrome.tabs.create({ url: siteConfig.homeUrl, active: false });
         await waitForTabLoad(tab.id);
         tabId = tab.id;
       }
@@ -425,11 +492,12 @@ async function pollForCommand() {
       // Navigate to a specific past chat URL
       let tabId = null;
 
-      // Try to find an existing ChatGPT tab first
+      // Try to find an existing chat tab first
+      const loadSiteConfig = getSiteConfigByUrl(cmd.chatUrl) || getSiteConfig(activeTarget);
       if (activeChatTabId !== null) {
         try {
           const existingTab = await chrome.tabs.get(activeChatTabId);
-          if (existingTab?.url?.startsWith("https://chatgpt.com")) {
+          if (existingTab?.url?.startsWith(loadSiteConfig.urlPrefix)) {
             tabId = activeChatTabId;
           }
         } catch (_) {
@@ -437,7 +505,7 @@ async function pollForCommand() {
         }
       }
       if (!tabId) {
-        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        const tabs = await chrome.tabs.query({ url: loadSiteConfig.urlPattern });
         if (tabs.length > 0) {
           tabId = tabs[0].id;
           activeChatTabId = tabId;
@@ -445,7 +513,7 @@ async function pollForCommand() {
       }
 
       if (tabId) {
-        // ChatGPT is an SPA — navigating within it won't trigger a full page load.
+        // SPA — navigating within it won't trigger a full page load.
         // Use the content script to navigate via window.location for a clean reload.
         try {
           await ensureContentScript(tabId);
@@ -483,7 +551,7 @@ async function pollForCommand() {
         }).catch(() => {});
         broadcastStatus(
           "error",
-          err.message || "Failed to load the selected ChatGPT conversation",
+          err.message || "Failed to load the selected conversation",
         );
         return;
       }
@@ -493,7 +561,8 @@ async function pollForCommand() {
       // Plugin is requesting a fresh history scrape
       let tabId = activeChatTabId;
       if (!tabId) {
-        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        const scrapeSiteConfig = getSiteConfig(activeTarget);
+        const tabs = await chrome.tabs.query({ url: scrapeSiteConfig.urlPattern });
         if (tabs.length > 0) { tabId = tabs[0].id; activeChatTabId = tabId; }
       }
       if (tabId) {
@@ -570,9 +639,15 @@ async function runPipeline(query) {
   const startsFresh = query.force_new_chat === true;
   const isFollowup = !startsFresh;
 
+  // Determine which site to use from the query target (defaults to active/chatgpt)
+  const queryTarget = query.target || activeTarget || "chatgpt";
+  activeTarget = queryTarget;
+  const siteConfig = getSiteConfig(queryTarget);
+  const siteLabel = queryTarget === "deepseek" ? "DeepSeek" : "ChatGPT";
+
   broadcastStatus("running", isFollowup
-    ? (query.pdf_base64 ? `Attaching PDF to conversation…` : "Sending follow-up to ChatGPT…")
-    : (query.pdf_base64 ? `Starting fresh chat with PDF: ${query.pdf_filename}…` : "Starting fresh ChatGPT chat…")
+    ? (query.pdf_base64 ? `Attaching PDF to conversation…` : `Sending follow-up to ${siteLabel}…`)
+    : (query.pdf_base64 ? `Starting fresh chat with PDF: ${query.pdf_filename}…` : `Starting fresh ${siteLabel} chat…`)
   );
 
   try {
@@ -591,7 +666,7 @@ async function runPipeline(query) {
     if (activeChatTabId !== null) {
       try {
         const existing = await chrome.tabs.get(activeChatTabId);
-        if (existing?.url?.startsWith("https://chatgpt.com")) {
+        if (existing?.url?.startsWith(siteConfig.urlPrefix)) {
           tab = existing;
         }
       } catch (_) {
@@ -600,24 +675,23 @@ async function runPipeline(query) {
     }
 
     if (!tab) {
-      tab = await getChatGPTTab();
+      tab = await getChatTab(queryTarget);
       activeChatTabId = tab.id;
     }
 
     const shouldNavigateFresh = startsFresh;
 
     if (shouldNavigateFresh) {
-      // Skip navigation if tab is already on the ChatGPT home/new-chat URL
-      // (e.g., a NEW_CHAT command already navigated us there)
+      // Skip navigation if tab is already on the site's home/new-chat URL
       const currentUrl = tab.url || "";
       const isAlreadyHome = (
-        currentUrl === CHATGPT_URL ||
-        currentUrl === CHATGPT_URL.slice(0, -1) ||
-        currentUrl === "https://chatgpt.com"
+        currentUrl === siteConfig.homeUrl ||
+        currentUrl === siteConfig.homeUrl.slice(0, -1) ||
+        currentUrl === siteConfig.urlPrefix
       );
       if (!isAlreadyHome) {
         try {
-          await chrome.tabs.update(tab.id, { url: CHATGPT_URL });
+          await chrome.tabs.update(tab.id, { url: siteConfig.homeUrl });
           await waitForTabLoad(tab.id);
         } catch (_) {}
       }
@@ -676,7 +750,7 @@ async function runPipeline(query) {
     });
 
     if (runState === "done" && !shared.hasMeaningfulAssistantText(responseText)) {
-      throw new Error("ChatGPT did not produce a visible final answer.");
+      throw new Error(`${siteLabel} did not produce a visible final answer.`);
     }
 
     await serverPost("/submit_response", {
@@ -749,13 +823,19 @@ async function submitError(seq, errorMsg, attempt) {
 // Tab helpers
 // ---------------------------------------------------------------------------
 
-async function getChatGPTTab() {
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+async function getChatTab(target) {
+  const config = getSiteConfig(target || activeTarget);
+  const tabs = await chrome.tabs.query({ url: config.urlPattern });
   if (tabs.length > 0) return tabs[0];  // reuse silently, no focus change
   // Open a new tab in the background (active: false keeps user's focus)
-  const tab = await chrome.tabs.create({ url: CHATGPT_URL, active: false });
+  const tab = await chrome.tabs.create({ url: config.homeUrl, active: false });
   await waitForTabLoad(tab.id);
   return tab;
+}
+
+// Backward compat alias
+async function getChatGPTTab() {
+  return getChatTab(activeTarget);
 }
 
 function waitForTabLoad(tabId) {
@@ -776,11 +856,11 @@ function waitForTabLoad(tabId) {
   });
 }
 
-// Clear activeChatTabId if the user closes the ChatGPT tab
+// Clear activeChatTabId if the user closes the chat tab
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === activeChatTabId) {
     activeChatTabId = null;
-    broadcastStatus("idle", "ChatGPT tab closed — next query will open a new conversation");
+    broadcastStatus("idle", "Chat tab closed — next query will open a new conversation");
   }
 });
 
@@ -1023,20 +1103,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         relayAlive = res.ok;
       } catch { /* offline */ }
 
-      // Check ChatGPT tab — look for ANY open ChatGPT tab, not just activeChatTabId
+      // Check chat tabs — look for ANY open supported chat tab
       let chatTabAlive = false;
       let chatUrl = null;
+      let activeSiteLabel = "Chat Site";
       try {
-        const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+        const siteConfig = getSiteConfig(activeTarget);
+        activeSiteLabel = activeTarget === "deepseek" ? "DeepSeek" : "ChatGPT";
+
+        // Check the active target's site first
+        let tabs = await chrome.tabs.query({ url: siteConfig.urlPattern });
+        // Fall back to checking all supported sites
+        if (tabs.length === 0) {
+          for (const pattern of ALL_SITE_URL_PATTERNS) {
+            tabs = await chrome.tabs.query({ url: pattern });
+            if (tabs.length > 0) {
+              const foundConfig = getSiteConfigByUrl(tabs[0].url);
+              if (foundConfig) activeSiteLabel = foundConfig.siteId === "deepseek" ? "DeepSeek" : "ChatGPT";
+              break;
+            }
+          }
+        }
         if (tabs.length > 0) {
           chatTabAlive = true;
-          // Prefer the active pipeline tab, otherwise use the first found
           const preferred = activeChatTabId !== null
             ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
             : tabs[0];
-          if (preferred.url && preferred.url.startsWith("https://chatgpt.com/c/")) {
-            chatUrl = preferred.url;
-          }
+          chatUrl = preferred.url || null;
         }
       } catch { /* no tabs */ }
 
@@ -1049,6 +1142,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         zoteroConnected,
         chatTabAlive,
         chatUrl,
+        activeSiteLabel,
         pipelineState: ps.state,
         pipelineMessage: ps.message,
       });
