@@ -41,15 +41,19 @@ const WEBCHAT_DEBUG = false;
 const SITE_CONFIGS = {
   chatgpt: {
     siteId: "chatgpt",
+    label: "ChatGPT",
     homeUrl: "https://chatgpt.com/",
     urlPattern: "https://chatgpt.com/*",
     urlPrefix: "https://chatgpt.com",
+    conversationUrlPattern: /\/c\//,
   },
   deepseek: {
     siteId: "deepseek",
+    label: "DeepSeek",
     homeUrl: "https://chat.deepseek.com/",
     urlPattern: "https://chat.deepseek.com/*",
     urlPrefix: "https://chat.deepseek.com",
+    conversationUrlPattern: /\/a\/chat\/s\//,
   },
 };
 
@@ -157,20 +161,18 @@ async function heartbeat() {
       }
 
       // Report extension status (chat tab alive, URL) to the relay
-      // Check ALL supported sites — report alive if any supported chat tab is open
+      // Only report alive if a tab matching the ACTIVE TARGET is open
       try {
         let chatTabAlive = false;
         let chatUrl = null;
-        for (const pattern of ALL_SITE_URL_PATTERNS) {
-          const tabs = await chrome.tabs.query({ url: pattern });
-          if (tabs.length > 0) {
-            chatTabAlive = true;
-            const preferred = activeChatTabId !== null
-              ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
-              : tabs[0];
-            chatUrl = preferred?.url || null;
-            break;
-          }
+        const targetConfig = getSiteConfig(activeTarget);
+        const tabs = await chrome.tabs.query({ url: targetConfig.urlPattern });
+        if (tabs.length > 0) {
+          chatTabAlive = true;
+          const preferred = activeChatTabId !== null
+            ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
+            : tabs[0];
+          chatUrl = preferred?.url || null;
         }
         fetch(`${SERVER}/extension_status`, {
           method: "POST",
@@ -346,7 +348,8 @@ async function publishReadyConversationState(
   debugLog("ready_ack", ready);
 
   // If we got empty messages on a conversation page, retry once after a delay
-  const isConversationPage = expectedChatUrl && expectedChatUrl.includes("/c/");
+  const convSiteConfig = expectedChatUrl ? getSiteConfigByUrl(expectedChatUrl) : null;
+  const isConversationPage = expectedChatUrl && convSiteConfig?.conversationUrlPattern?.test(expectedChatUrl);
   if (submitScraped && isConversationPage && (!ready.messages || ready.messages.length === 0)) {
     debugLog("ready_retry", "empty messages on conversation page, retrying…");
     await new Promise(r => setTimeout(r, 2000));
@@ -355,9 +358,18 @@ async function publishReadyConversationState(
   }
 
   if (submitScraped) {
+    // Use SCRAPE_MESSAGES for full scroll-and-collect (captures all messages
+    // from virtual-scrolling sites like DeepSeek, not just the visible ones).
+    let scrapedMessages = ready.messages || [];
+    try {
+      const scrapeResult = await sendToContentScript(tabId, { type: "SCRAPE_MESSAGES" });
+      if (scrapeResult?.ok && scrapeResult.messages?.length > 0) {
+        scrapedMessages = scrapeResult.messages;
+      }
+    } catch (_) { /* fall back to ready.messages */ }
     await serverPost("/chat_history", {
       action: "submit_scraped",
-      messages: ready.messages || [],
+      messages: scrapedMessages,
     });
   }
 
@@ -572,6 +584,18 @@ async function pollForCommand() {
           });
         } catch (_) {}
       }
+    } else if (cmd.type === "ENSURE_TAB") {
+      // Open the target site tab if none is currently open (auto-open on preload)
+      const ensureConfig = getSiteConfig(activeTarget);
+      const existingTabs = await chrome.tabs.query({ url: ensureConfig.urlPattern });
+      if (existingTabs.length === 0) {
+        const tab = await chrome.tabs.create({ url: ensureConfig.homeUrl, active: false });
+        await waitForTabLoad(tab.id);
+        activeChatTabId = tab.id;
+        console.log(`[sync-zotero] ENSURE_TAB: opened ${ensureConfig.homeUrl} (tab ${tab.id})`);
+      } else {
+        activeChatTabId = existingTabs[0].id;
+      }
     } else if (cmd.type === "DELETE_CHAT" && cmd.chatId) {
       if (activeChatTabId !== null) {
         chrome.tabs.sendMessage(activeChatTabId, { type: "DELETE_CHAT", chatId: cmd.chatId }, (response) => {
@@ -643,7 +667,7 @@ async function runPipeline(query) {
   const queryTarget = query.target || activeTarget || "chatgpt";
   activeTarget = queryTarget;
   const siteConfig = getSiteConfig(queryTarget);
-  const siteLabel = queryTarget === "deepseek" ? "DeepSeek" : "ChatGPT";
+  const siteLabel = getSiteConfig(queryTarget).label || "Chat";
 
   broadcastStatus("running", isFollowup
     ? (query.pdf_base64 ? `Attaching PDF to conversation…` : `Sending follow-up to ${siteLabel}…`)
@@ -775,10 +799,11 @@ async function runPipeline(query) {
       turn_status: turnStatus || (runState === "incomplete" ? "incomplete" : "done"),
     });
 
-    // Capture the ChatGPT URL for history persistence
+    // Capture the conversation URL for history persistence (works for all sites)
     try {
       const currentTab = await chrome.tabs.get(activeChatTabId);
-      if (currentTab.url && currentTab.url.startsWith("https://chatgpt.com/c/")) {
+      const tabSiteConfig = currentTab.url ? getSiteConfigByUrl(currentTab.url) : null;
+      if (tabSiteConfig && currentTab.url !== tabSiteConfig.homeUrl) {
         await serverPost("/update_chat_url", { chat_url: currentTab.url });
       }
     } catch (_) {}
@@ -1109,7 +1134,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       let activeSiteLabel = "Chat Site";
       try {
         const siteConfig = getSiteConfig(activeTarget);
-        activeSiteLabel = activeTarget === "deepseek" ? "DeepSeek" : "ChatGPT";
+        activeSiteLabel = getSiteConfig(activeTarget).label || "Chat";
 
         // Check the active target's site first
         let tabs = await chrome.tabs.query({ url: siteConfig.urlPattern });
@@ -1119,7 +1144,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             tabs = await chrome.tabs.query({ url: pattern });
             if (tabs.length > 0) {
               const foundConfig = getSiteConfigByUrl(tabs[0].url);
-              if (foundConfig) activeSiteLabel = foundConfig.siteId === "deepseek" ? "DeepSeek" : "ChatGPT";
+              if (foundConfig) activeSiteLabel = foundConfig.label || "Chat";
               break;
             }
           }

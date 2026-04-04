@@ -370,18 +370,21 @@ const SITE_ADAPTERS = {
       "textarea",
     ],
     sendButtonSelectors(composer) {
-      // DeepSeek uses div[role="button"] for the send button — it's the last
-      // icon-button in the composer area that is NOT the attachment button.
-      const container =
-        composer?.closest("div")?.parentElement?.parentElement?.parentElement ||
-        document.body;
-      const btns = container.querySelectorAll(
-        'div.ds-icon-button[role="button"]'
-      );
-      // The send button is the last one; the one before it is the attach button
+      // Walk up from composer to find the input area container.
+      // Stop when we find a container with 2+ ds-icon-button children
+      // (the attach button + the send button).
+      let container = composer;
+      for (let i = 0; i < 8 && container?.parentElement; i++) {
+        container = container.parentElement;
+        const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
+        if (btns.length >= 2) break;
+      }
+      if (!container) container = document.body;
+
+      const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
+      // The send button is the last one; skip the attachment button
       for (let i = btns.length - 1; i >= 0; i--) {
         const btn = btns[i];
-        // Skip the attachment button (has a sibling file input)
         if (btn.parentElement?.querySelector('input[type="file"]')) continue;
         if (isVisibleElement(btn)) return btn;
       }
@@ -393,15 +396,15 @@ const SITE_ADAPTERS = {
       // alone, so we rely entirely on SSE [DONE] + turn completion tracker for
       // completion detection. Empty array = findStopButton() always returns null.
     ],
-    userMessageSelector: "div.ds-message.d29f3d7d",
+    userMessageSelector: "div.ds-message:not(:has(.ds-markdown))",
     assistantMessageSelectors: [
-      "div.ds-message:not(.d29f3d7d)",
+      "div.ds-message:has(.ds-markdown)",
     ],
     conversationMessageSelector: "div.ds-message",
     getMessageRole(node) {
-      // DeepSeek uses an extra CSS class (d29f3d7d) for user messages
-      if (node.classList?.contains("d29f3d7d")) return "user";
-      if (node.classList?.contains("ds-message")) return "assistant";
+      // Structural detection: assistant messages contain .ds-markdown child, user messages don't
+      if (node.querySelector?.(".ds-markdown")) return "assistant";
+      if (node.classList?.contains("ds-message")) return "user";
       return null;
     },
     getMessageId(node) {
@@ -410,7 +413,7 @@ const SITE_ADAPTERS = {
     conversationTurnSelector: null, // DeepSeek doesn't use conversation-turn wrappers
     actionBarSelectors: [
       // DeepSeek's action bar buttons are ds-icon-button siblings of the message
-      "div.db183363.ds-icon-button",
+      "div.ds-icon-button[role='button']",
     ],
     thinkingSelectors: [
       // DeepSeek's DeepThink thinking content
@@ -453,6 +456,8 @@ const SITE_ADAPTERS = {
     supportsFileUpload: true,
     supportsModelSelector: false,
     hasFormWrapper: false,
+    /** Composer textarea is disabled while model is streaming. */
+    disablesComposerDuringStreaming: true,
   },
 
 };
@@ -1129,10 +1134,20 @@ function findStopButton() {
 
 function hasBusyComposerHint() {
   const bodyText = document.body?.textContent || "";
-  return (
+  if (
     bodyText.includes("Wait for the current response to finish before starting a new chat") ||
     bodyText.includes("Wait for the model to finish responding")
-  );
+  ) {
+    return true;
+  }
+  // Some sites disable the composer textarea during active streaming
+  if (SITE_ADAPTER?.disablesComposerDuringStreaming) {
+    const composer = findComposerNow();
+    if (composer?.disabled || composer?.getAttribute("disabled") !== null) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isConversationStillRunning(stopBtn = findStopButton()) {
@@ -1178,7 +1193,7 @@ function hasResponseActionBar() {
   // changed their attributes), look for a cluster of 3+ small visible icon buttons
   // that are NOT inside the prose/markdown content area.
   const contentArea = searchRoot.querySelector(".markdown, [class*='markdown'], .prose, [class*='prose']");
-  const allButtons = searchRoot.querySelectorAll("button");
+  const allButtons = searchRoot.querySelectorAll('button, [role="button"]');
   let iconButtonCount = 0;
   for (const btn of allButtons) {
     // Skip buttons inside the content area (e.g., code copy buttons)
@@ -2347,6 +2362,102 @@ function extractConversationTranscript() {
   };
 }
 
+/**
+ * For sites with virtual scrolling (e.g., DeepSeek), scroll through the entire
+ * conversation to collect all messages that the virtual list renders at each
+ * scroll position. Deduplicates by messageKey.
+ * Falls back to a single extractConversationTranscript() if no scrollable container.
+ */
+async function extractFullConversationTranscript() {
+  // Find the scrollable conversation container.
+  // DeepSeek: the .ds-virtual-list itself is the scroll container (overflow: auto).
+  // Others: look for a scroll-area parent that contains message nodes.
+  let scrollContainer = null;
+
+  // Strategy 1: Check if .ds-virtual-list is scrollable
+  const virtualList = document.querySelector('.ds-virtual-list');
+  if (virtualList && virtualList.scrollHeight > virtualList.clientHeight + 200) {
+    const style = getComputedStyle(virtualList);
+    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+      scrollContainer = virtualList;
+    }
+  }
+
+  // Strategy 2: Walk up from message nodes to find scrollable ancestor
+  if (!scrollContainer) {
+    const msgSelector = SITE_ADAPTER?.conversationMessageSelector || "[data-message-author-role]";
+    const firstMsg = document.querySelector(msgSelector);
+    let el = firstMsg?.parentElement;
+    while (el) {
+      if (el.scrollHeight > el.clientHeight + 200) {
+        const style = getComputedStyle(el);
+        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+          scrollContainer = el;
+          break;
+        }
+      }
+      el = el.parentElement;
+    }
+  }
+
+  if (!scrollContainer) {
+    // No virtual scrolling — single extraction is enough
+    return extractConversationTranscript();
+  }
+
+  const savedScrollTop = scrollContainer.scrollTop;
+
+  // Use regular setTimeout for scroll waits (workerSleep may fail with CSP on some sites)
+  const scrollSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Phase 1: Scroll to top and wait for virtual list to render all earlier messages.
+  // DeepSeek's virtual list lazily loads messages — scrolling to top triggers rendering.
+  scrollContainer.scrollTop = 0;
+  await scrollSleep(2500);
+
+  // Phase 2: Scroll through the entire conversation, collecting messages at each position.
+  // This ensures we capture items from all parts of the virtual list.
+  const collected = new Map(); // messageKey → message
+  const scrollStep = Math.max(300, Math.floor(scrollContainer.clientHeight * 0.6));
+
+  const collectVisible = () => {
+    const nodes = getConversationMessageNodes();
+    nodes.forEach((node, index) => {
+      const message = extractNormalizedMessage(node, index);
+      if (!message) return;
+      if (!message.text && !message.thinking && (!message.attachments || !message.attachments.length)) return;
+      if (!collected.has(message.messageKey)) {
+        collected.set(message.messageKey, message);
+      }
+    });
+  };
+
+  collectVisible(); // collect at top
+
+  let lastScrollTop = -1;
+  for (let step = 0; step < 100; step++) {
+    scrollContainer.scrollTop += scrollStep;
+    await scrollSleep(500);
+    collectVisible();
+    if (Math.abs(scrollContainer.scrollTop - lastScrollTop) < 5) break;
+    lastScrollTop = scrollContainer.scrollTop;
+  }
+
+  // Restore scroll position
+  scrollContainer.scrollTop = savedScrollTop;
+
+  const messages = Array.from(collected.values());
+  const hash = simpleHash(messages.map((m) => JSON.stringify(m)).join("\n"));
+
+  return {
+    chatUrl: getCurrentChatUrl(),
+    chatId: getCurrentChatId(),
+    count: messages.length,
+    hash,
+    messages,
+  };
+}
+
 function mapTranscriptToRelayMessages(transcript) {
   return transcript.messages.map((message) => ({
     messageKey: message.messageKey,
@@ -2621,7 +2732,7 @@ async function scrapeAllMessages() {
 
   // If first attempt failed or returned empty messages on a conversation page,
   // retry once after a brief delay (handles stale SPA state)
-  const isConversationPage = chatUrl && (chatUrl.includes("/c/") || chatUrl.includes("/a/chat/s/") || /\/chat\/[a-f0-9-]+/.test(chatUrl));
+  const isConversationPage = chatUrl && SITE_ADAPTER?.getChatIdFromUrl?.(chatUrl) !== null;
   const firstMessages = (ready.messages || []).filter(
     (message) => message.text || message.thinking,
   );
@@ -2637,10 +2748,23 @@ async function scrapeAllMessages() {
     return [];
   }
 
+  // Always attempt full scroll-and-collect to capture all messages
+  // (critical for sites with virtual scrolling like DeepSeek).
+  try {
+    const fullTranscript = await extractFullConversationTranscript();
+    const fullMapped = mapTranscriptToRelayMessages(fullTranscript);
+    const fullMessages = fullMapped.filter((m) => m.text || m.thinking);
+    console.log(`[sync-zotero] scrapeAllMessages: scroll extraction found ${fullMessages.length} messages`);
+    if (fullMessages.length > 0) return fullMessages;
+  } catch (err) {
+    console.warn("[sync-zotero] scrapeAllMessages: scroll extraction failed:", err);
+  }
+
+  // Fallback: use whatever waitForChatReady returned
   const messages = (ready.messages || []).filter(
     (message) => message.text || message.thinking,
   );
-  console.log(`[sync-zotero] scrapeAllMessages: found ${messages.length} messages`);
+  console.log(`[sync-zotero] scrapeAllMessages: fallback found ${messages.length} messages`);
   return messages;
 }
 
