@@ -226,7 +226,6 @@ function resetTurnDebug(seq, attempt) {
 }
 
 function recordTurnDebug(event, payload) {
-  if (!WEBCHAT_DEBUG) return;
   const entry = {
     at: Date.now(),
     token: activeTurnDebugToken,
@@ -237,12 +236,29 @@ function recordTurnDebug(event, payload) {
   if (turnDebugEvents.length > TURN_DEBUG_EVENT_LIMIT) {
     turnDebugEvents.splice(0, turnDebugEvents.length - TURN_DEBUG_EVENT_LIMIT);
   }
-  console.log("[sync-zotero][webchat]", event, payload || "");
+  if (WEBCHAT_DEBUG) {
+    console.log("[sync-zotero][webchat]", event, payload || "");
+  }
 }
 
 globalThis.__syncZoteroWebchatDebug = {
   getEvents: () => turnDebugEvents.slice(),
   getActiveToken: () => activeTurnDebugToken,
+  getState: () => ({
+    activeToken: activeTurnDebugToken,
+    siteId: SITE_ADAPTER?.siteId || null,
+    outboundRequestSerial,
+    outboundRequests: Array.isArray(outboundRequestEvents)
+      ? outboundRequestEvents.slice(-10)
+      : [],
+    activeConversationStreamCount,
+    lastTransportActivityAt,
+    sseDone,
+    sseTextLength: String(sseText || "").length,
+    sseThinkingLength: String(sseThinking || "").length,
+    lastScrape: typeof lastScrapeDebug === "object" ? lastScrapeDebug : null,
+    recentEvents: turnDebugEvents.slice(-20),
+  }),
 };
 
 // ---------------------------------------------------------------------------
@@ -959,10 +975,60 @@ function dispatchSubmitViaForm(composer) {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
-async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial, baselineUserMessageCount, timeoutMs = 15000) {
+function hasPromptSubmissionSignal(
+  transcript,
+  baselineTranscriptCount,
+  promptText,
+) {
+  const baselineCount = Math.max(0, Number(baselineTranscriptCount) || 0);
+  const newMessages = transcript.messages.slice(baselineCount);
+  if (newMessages.length === 0) return false;
+
+  if (findMatchingUserTurn(transcript, baselineCount, promptText)) {
+    return true;
+  }
+
+  return newMessages.some((message) =>
+    message.role === "assistant" ||
+    (Array.isArray(message.attachments) && message.attachments.length > 0),
+  );
+}
+
+function composerLooksSubmitted(promptText, composer = findComposerNow()) {
+  if (!composer) return false;
+  const expectedText = shared.normalizeComposerText(promptText);
+  if (!expectedText) return false;
+
+  const actualText = shared.normalizeComposerText(readComposerText(composer));
+  if (!actualText) return true;
+  return !shared.composerTextMatchesPrompt(expectedText, actualText);
+}
+
+async function waitForSubmissionSignal(
+  promptText,
+  baselineOutboundRequestSerial,
+  baselineUserMessageCount,
+  baselineTranscriptCount,
+  timeoutMs = 15000,
+) {
   const deadline = Date.now() + timeoutMs;
+  let observedRequestContext = null;
 
   while (Date.now() < deadline) {
+    if (!observedRequestContext && SITE_ADAPTER?.siteId === "deepseek") {
+      observedRequestContext = findObservedDeepSeekRequestContext(
+        baselineOutboundRequestSerial,
+        promptText,
+      );
+      if (observedRequestContext) {
+        return {
+          delivered: true,
+          requestObserved: true,
+          requestContext: observedRequestContext,
+        };
+      }
+    }
+
     const composer = findComposerNow();
     const signal = shared.hasDeliverySignal({
       baselineOutboundRequestSerial,
@@ -973,10 +1039,42 @@ async function waitForSubmissionSignal(promptText, baselineOutboundRequestSerial
       composerTextAfter: readComposerText(composer),
       promptText,
     });
-    if (signal) return true;
+    if (signal) {
+      return {
+        delivered: true,
+        requestObserved: Boolean(observedRequestContext),
+        requestContext: observedRequestContext,
+      };
+    }
+
+    if (composerLooksSubmitted(promptText, composer)) {
+      return {
+        delivered: true,
+        requestObserved: Boolean(observedRequestContext),
+        requestContext: observedRequestContext,
+      };
+    }
+
+    if (
+      hasPromptSubmissionSignal(
+        extractConversationTranscript(),
+        baselineTranscriptCount,
+        promptText,
+      )
+    ) {
+      return {
+        delivered: true,
+        requestObserved: Boolean(observedRequestContext),
+        requestContext: observedRequestContext,
+      };
+    }
     await workerSleep(200);
   }
-  return false;
+  return {
+    delivered: false,
+    requestObserved: Boolean(observedRequestContext),
+    requestContext: observedRequestContext,
+  };
 }
 
 async function submitMessageAndVerify(promptText) {
@@ -999,6 +1097,7 @@ async function submitMessageAndVerify(promptText) {
         await sleep(150);
       }
 
+      const baselineTranscriptCount = extractConversationTranscript().count;
       const baselineUserMessageCount = document.querySelectorAll(
         SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']"
       ).length;
@@ -1013,8 +1112,20 @@ async function submitMessageAndVerify(promptText) {
         promptText,
         baselineOutboundRequestSerial,
         baselineUserMessageCount,
+        baselineTranscriptCount,
       );
-      if (delivered) return true;
+      if (delivered.delivered || delivered.requestObserved) {
+        return {
+          baselineOutboundRequestSerial,
+          requestContext:
+            delivered.requestContext ||
+            findObservedDeepSeekRequestContext(
+              baselineOutboundRequestSerial,
+              promptText,
+            ) ||
+            null,
+        };
+      }
 
       await typePromptAndVerify(promptText);
     }
@@ -1031,14 +1142,96 @@ let sseText = "";
 let sseThinking = null;
 let sseDone = false;
 let outboundRequestSerial = 0;
+let outboundRequestEvents = [];
 let activeConversationStreamCount = 0;
 let lastTransportActivityAt = 0;
+let historyScrapeInFlight = false;
+let lastScrapeDebug = null;
+
+function mergeStreamFragments(previous, next) {
+  const prev = String(previous || "");
+  const upcoming = String(next || "");
+  if (!upcoming) return prev;
+  if (!prev) return upcoming;
+  if (upcoming.startsWith(prev)) return upcoming;
+  if (prev.startsWith(upcoming)) return prev;
+
+  const maxOverlap = Math.min(prev.length, upcoming.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap--) {
+    if (prev.slice(-overlap) === upcoming.slice(0, overlap)) {
+      return prev + upcoming.slice(overlap);
+    }
+  }
+  return prev + upcoming;
+}
+
+function makePromptFingerprint(text) {
+  const normalized = shared.normalizeComposerText(text)
+    .normalize("NFC")
+    .toLowerCase();
+  if (!normalized) return "";
+  let hash = 2166136261;
+  for (let index = 0; index < normalized.length; index++) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${normalized.length}:${(hash >>> 0).toString(36)}`;
+}
+
+function storeOutboundRequestEvent(payload = {}) {
+  const requestSerial = Number(payload.requestSerial) || (outboundRequestSerial + 1);
+  outboundRequestSerial = Math.max(outboundRequestSerial, requestSerial);
+  outboundRequestEvents.push({
+    requestSerial,
+    chatUrl: typeof payload.chatUrl === "string" ? payload.chatUrl : null,
+    chatId: typeof payload.chatId === "string" ? payload.chatId : null,
+    sentAt: Number(payload.sentAt) || Date.now(),
+    promptFingerprint:
+      typeof payload.promptFingerprint === "string" && payload.promptFingerprint
+        ? payload.promptFingerprint
+        : null,
+  });
+  if (outboundRequestEvents.length > 40) {
+    outboundRequestEvents = outboundRequestEvents.slice(-40);
+  }
+  return outboundRequestEvents[outboundRequestEvents.length - 1] || null;
+}
+
+function findObservedDeepSeekRequestContext(
+  baselineRequestSerial,
+  promptText = "",
+) {
+  if (SITE_ADAPTER?.siteId !== "deepseek") return null;
+  const promptFingerprint = makePromptFingerprint(promptText);
+  const candidates = outboundRequestEvents.filter(
+    (event) => event.requestSerial > baselineRequestSerial,
+  );
+  if (!candidates.length) return null;
+  if (!promptFingerprint) {
+    return candidates[0] || null;
+  }
+  const exact = candidates.find(
+    (event) =>
+      !event.promptFingerprint || event.promptFingerprint === promptFingerprint,
+  );
+  return exact || candidates[0] || null;
+}
 
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
+  if (event.data?.type === "SYNC_ZOTERO_DEEPSEEK_TRANSCRIPT_CACHE") {
+    storeDeepSeekTranscriptSnapshot(event.data.snapshot);
+    lastTransportActivityAt = Date.now();
+    return;
+  }
+  if (event.data?.type === "SYNC_ZOTERO_DEEPSEEK_HISTORY_CACHE") {
+    storeDeepSeekHistorySnapshot(event.data.snapshot);
+    lastTransportActivityAt = Date.now();
+    return;
+  }
   if (event.data?.type === "SYNC_ZOTERO_SSE") {
-    sseText = event.data.text || "";
-    sseThinking = event.data.thinking || null;
+    sseText = mergeStreamFragments(sseText, event.data.text || "");
+    sseThinking = mergeStreamFragments(sseThinking || "", event.data.thinking || "") || null;
     // Only mark SSE as done when this is the last active stream.
     // During multi-tool-use flows, earlier streams finish before the
     // actual answer stream — their [DONE] should not end the pipeline.
@@ -1060,7 +1253,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (event.data?.type === "SYNC_ZOTERO_REQUEST") {
-    outboundRequestSerial += 1;
+    storeOutboundRequestEvent(event.data);
     lastTransportActivityAt = Date.now();
     return;
   }
@@ -1069,6 +1262,8 @@ window.addEventListener("message", (event) => {
     lastTransportActivityAt = Date.now();
   }
 });
+
+requestDeepSeekNetworkCacheReplay();
 
 // ---------------------------------------------------------------------------
 // Step 4: Stream response — emit partials every 500ms, resolve when done
@@ -1354,6 +1549,7 @@ async function streamResponseSnapshots(
   baselineTranscript = null,
   promptText = "",
   attachmentFingerprint = "",
+  submissionMeta = null,
   timeoutMs = 180000,
 ) {
   sseText = "";
@@ -1364,6 +1560,7 @@ async function streamResponseSnapshots(
   const baseline = baselineTranscript || extractConversationTranscript();
   const baselineTranscriptCount = baseline.count;
   const baselineTranscriptHash = baseline.hash;
+  const baselineAssistantSnapshot = getLatestAssistantSignature();
   let remoteChatUrl = baseline.chatUrl;
   let remoteChatId = baseline.chatId;
   let userTurnKey = null;
@@ -1386,15 +1583,23 @@ async function streamResponseSnapshots(
   const userTurnDeadline = Date.now() + 30_000;
   let reportedUserTurn = false;
   let reportedAssistantTurn = false;
+  let reportedDeepSeekRequestCorrelation = false;
+  let reportedDeepSeekMissingUserTurn = false;
   let lastActiveRun = null;
   let toolUseDetected = false;
   let completionTracker = shared.createTurnCompletionTracker(Date.now());
+  const baselineOutboundRequestSerial =
+    Number(submissionMeta?.baselineOutboundRequestSerial) || 0;
+  let requestContext = submissionMeta?.requestContext || null;
 
   recordTurnDebug("baseline_transcript", {
     seq,
     attempt,
     baselineTranscriptCount,
     baselineTranscriptHash,
+    baselineAssistantCount: baselineAssistantSnapshot.count,
+    baselineAssistantSignature: baselineAssistantSnapshot.signature,
+    baselineOutboundRequestSerial,
     attachmentFingerprint,
     remoteChatUrl,
     remoteChatId,
@@ -1414,9 +1619,15 @@ async function streamResponseSnapshots(
     const nowMs = Date.now();
     const stopBtn = findStopButton();
     const activeRun = isConversationStillRunning(stopBtn);
+    if (SITE_ADAPTER?.siteId === "deepseek" && !requestContext) {
+      requestContext = findObservedDeepSeekRequestContext(
+        baselineOutboundRequestSerial,
+        promptText,
+      );
+    }
     const transcript = extractConversationTranscript();
-    remoteChatUrl = transcript.chatUrl;
-    remoteChatId = transcript.chatId;
+    remoteChatUrl = transcript.chatUrl || requestContext?.chatUrl || remoteChatUrl;
+    remoteChatId = transcript.chatId || requestContext?.chatId || remoteChatId;
     if (transcript.hash !== lastTranscriptHash) {
       lastTranscriptHash = transcript.hash;
       transcriptRevision += 1;
@@ -1434,6 +1645,30 @@ async function streamResponseSnapshots(
         seq,
         attempt,
         activeRun,
+      });
+    }
+
+    if (
+      SITE_ADAPTER?.siteId === "deepseek" &&
+      requestContext &&
+      !reportedDeepSeekRequestCorrelation
+    ) {
+      reportedDeepSeekRequestCorrelation = true;
+      recordTurnDebug("deepseek_request_correlated", {
+        seq,
+        attempt,
+        requestSerial: requestContext.requestSerial || null,
+        remoteChatUrl,
+        remoteChatId,
+      });
+      postTurnState(port, {
+        seq,
+        attempt,
+        remoteChatUrl,
+        remoteChatId,
+        baselineTranscriptCount,
+        baselineTranscriptHash,
+        turnStatus: "submitted",
       });
     }
 
@@ -1469,6 +1704,8 @@ async function streamResponseSnapshots(
         // Use strict active-run check (no transport grace period) for the deadline,
         // so SSE activity doesn't keep the deadline from firing indefinitely.
         const strictActiveRun = Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint();
+        const deepseekRequestObserved =
+          SITE_ADAPTER?.siteId === "deepseek" && Boolean(requestContext);
 
         if (!strictActiveRun) {
           // Fallback: take the last user message after baseline (position-based).
@@ -1485,6 +1722,17 @@ async function streamResponseSnapshots(
               baselineTranscriptCount, baselineTranscriptHash,
               userTurnKey, turnStatus: "user_turn_matched",
             });
+          } else if (deepseekRequestObserved) {
+            if (!reportedDeepSeekMissingUserTurn) {
+              reportedDeepSeekMissingUserTurn = true;
+              recordTurnDebug("deepseek_request_without_dom_user_turn", {
+                seq,
+                attempt,
+                requestSerial: requestContext?.requestSerial || null,
+                remoteChatUrl,
+                remoteChatId,
+              });
+            }
           } else if (shared.hasMeaningfulAssistantText(sseText)) {
             // Nuclear fallback: SSE captured the response but DOM scraping failed.
             // Emit the SSE text directly as the terminal response.
@@ -1519,24 +1767,61 @@ async function streamResponseSnapshots(
       }
     }
 
-    // Re-resolve the assistant turn when:
-    // 1. No key set yet
-    // 2. Locked key no longer exists in transcript (DOM node was replaced,
-    //    e.g., "Analyzing the image..." replaced by the actual response)
-    // 3. Locked key exists but has empty text+thinking (still rendering)
-    let shouldResolveAssistant = !assistantTurnKey;
-    if (assistantTurnKey) {
-      const bound = transcript.messages.find(m => m.messageKey === assistantTurnKey);
-      if (!bound || (!bound.text && !bound.thinking)) {
-        shouldResolveAssistant = true;
-      }
-    }
-    const assistantTurn = shouldResolveAssistant
-      ? resolveBoundAssistantTurn(transcript, userTurnKey, assistantTurnKey)
-      : transcript.messages.find(m => m.messageKey === assistantTurnKey) || null;
+    const previousAssistantTurnKey = assistantTurnKey;
+    const assistantTurn = userTurnKey
+      ? resolveBoundAssistantTurn(
+        transcript,
+        userTurnKey,
+        assistantTurnKey,
+      )
+      : (
+        SITE_ADAPTER?.siteId === "deepseek" && requestContext
+          ? resolveLatestAssistantTurnAfterBaseline(
+            transcript,
+            baselineTranscriptCount,
+            assistantTurnKey,
+          )
+          : null
+      );
+    const deepseekAnchoredSnapshot =
+      SITE_ADAPTER?.siteId === "deepseek" && requestContext
+        ? getCurrentAnchoredSnapshot(baselineAssistantSnapshot)
+        : null;
     if (assistantTurn?.messageKey) {
       assistantTurnKey = assistantTurn.messageKey;
-      if (!reportedAssistantTurn) {
+      if (!reportedAssistantTurn || assistantTurnKey !== previousAssistantTurnKey) {
+        reportedAssistantTurn = true;
+        recordTurnDebug(
+          assistantTurnKey !== previousAssistantTurnKey
+            ? "assistant_turn_rebound"
+            : "assistant_turn_matched",
+          {
+            seq,
+            attempt,
+            userTurnKey,
+            assistantTurnKey,
+            remoteChatUrl,
+            remoteChatId,
+          },
+        );
+        postTurnState(port, {
+          seq,
+          attempt,
+          remoteChatUrl,
+          remoteChatId,
+          baselineTranscriptCount,
+          baselineTranscriptHash,
+          userTurnKey,
+          assistantTurnKey,
+          turnStatus: "assistant_turn_matched",
+        });
+      }
+    } else if (
+      deepseekAnchoredSnapshot &&
+      (deepseekAnchoredSnapshot.answerVisible || deepseekAnchoredSnapshot.thinkingText)
+    ) {
+      assistantTurnKey = deepseekAnchoredSnapshot.anchorId || assistantTurnKey || "deepseek-visible-assistant";
+      if (!reportedAssistantTurn || assistantTurnKey !== previousAssistantTurnKey) {
         reportedAssistantTurn = true;
         recordTurnDebug("assistant_turn_matched", {
           seq,
@@ -1545,6 +1830,7 @@ async function streamResponseSnapshots(
           assistantTurnKey,
           remoteChatUrl,
           remoteChatId,
+          source: "deepseek_visible_dom",
         });
         postTurnState(port, {
           seq,
@@ -1563,11 +1849,17 @@ async function streamResponseSnapshots(
     // Use DOM-extracted answer text, but fall back to SSE-captured text when
     // DOM extraction fails (e.g., thinking model responses where the answer
     // isn't extractable from the DOM during/after the thinking phase).
-    const domAnswerText = assistantTurn?.text || "";
+    const domAnswerText =
+      assistantTurn?.text ||
+      deepseekAnchoredSnapshot?.answerText ||
+      "";
     const answerText = shared.hasMeaningfulAssistantText(domAnswerText)
       ? domAnswerText
       : (shared.hasMeaningfulAssistantText(sseText) ? sseText : domAnswerText);
-    const domThinking = assistantTurn?.thinking || "";
+    const domThinking =
+      assistantTurn?.thinking ||
+      deepseekAnchoredSnapshot?.thinkingText ||
+      "";
     const thinkingText = shared.normalizeComposerText(
       domThinking || sseThinking || "",
     );
@@ -1834,6 +2126,83 @@ async function streamResponseSnapshots(
     }
 
     if (
+      SITE_ADAPTER?.siteId === "deepseek" &&
+      !activeRun &&
+      !stopBtn &&
+      !hasBusyComposerHint() &&
+      (Boolean(requestContext) || Boolean(assistantTurnKey)) &&
+      quietSinceMs >= 1_500 &&
+      completion.phase !== "verified_done"
+    ) {
+      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
+        ? lastAnswerText
+        : (shared.hasMeaningfulAssistantText(sseText) ? sseText : "");
+      const finalThinking = lastThinkingText || sseThinking || null;
+
+      if (shared.hasMeaningfulAssistantText(finalText)) {
+        recordTurnDebug("deepseek_quiescent_fast_completion", {
+          seq,
+          attempt,
+          quietSinceMs,
+          domAnswerLen: lastAnswerText.length,
+          sseTextLen: (sseText || "").length,
+          usedSse: finalText === sseText && finalText !== lastAnswerText,
+        });
+        postTerminal(port, {
+          seq,
+          attempt,
+          text: finalText,
+          thinking: finalThinking,
+          answerAnchorId: assistantTurnKey,
+          answerRevision,
+          thinkingRevision,
+          runState: "done",
+          completionReason: "settled",
+          finalTranscriptHash: transcript.hash,
+          verifiedAt: nowMs,
+          remoteChatUrl,
+          remoteChatId,
+          userTurnKey,
+          assistantTurnKey,
+          baselineTranscriptCount,
+          baselineTranscriptHash,
+          turnStatus: "done",
+        });
+        return;
+      }
+
+      if (thinkingVisible && quietSinceMs >= 5_000) {
+        recordTurnDebug("deepseek_quiescent_incomplete", {
+          seq,
+          attempt,
+          quietSinceMs,
+          thinkingLen: (finalThinking || "").length,
+        });
+        postTerminal(port, {
+          seq,
+          attempt,
+          text: "",
+          thinking: finalThinking,
+          answerAnchorId: assistantTurnKey,
+          answerRevision,
+          thinkingRevision,
+          runState: "incomplete",
+          completionReason: "settled",
+          finalTranscriptHash: transcript.hash,
+          verifiedAt: nowMs,
+          remoteChatUrl,
+          remoteChatId,
+          userTurnKey,
+          assistantTurnKey,
+          baselineTranscriptCount,
+          baselineTranscriptHash,
+          turnStatus: "incomplete",
+        });
+        return;
+      }
+    }
+
+    if (
       answerVisible &&
       activeRun &&
       !cancelAttempted &&
@@ -1972,11 +2341,103 @@ async function streamResponseSnapshots(
  *   BEFORE the current query was submitted. Only messages after this count
  *   are considered, preventing old responses from leaking into follow-ups.
  */
-function extractAssistantAnswerText(node) {
-  if (!node) return "";
-  const prunedAssistant = node.cloneNode(true);
-  pruneAssistantStatusNodes(prunedAssistant);
+function getDeepSeekTopLevelMarkdownBlocks(root) {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll(".ds-markdown"))
+    .filter((el) => el instanceof Element)
+    .filter((el) => !el.parentElement?.closest(".ds-markdown"))
+    .filter(
+      (el) =>
+        !el.hasAttribute("hidden") &&
+        el.getAttribute("aria-hidden") !== "true",
+    );
+}
 
+function isDeepSeekReasoningBlock(block) {
+  if (!(block instanceof Element)) return false;
+
+  for (
+    let current = block.parentElement, depth = 0;
+    current && depth < 6;
+    current = current.parentElement, depth++
+  ) {
+    const className = String(current.className || "").toLowerCase();
+    if (className.includes("thinking") || className.includes("reasoning")) {
+      return true;
+    }
+
+    const summary = current.querySelector?.("summary");
+    const summaryText = shared.normalizeComposerText(summary?.textContent || "");
+    if (/^thought for\b/i.test(summaryText) || /\b(thinking|reason)\b/i.test(summaryText)) {
+      return true;
+    }
+
+    const prev = current.previousElementSibling;
+    const prevText = shared.normalizeComposerText(prev?.textContent || "");
+    if (/^thought for\b/i.test(prevText) || /\b(thinking|reason)\b/i.test(prevText)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function extractDeepSeekAssistantSections(node) {
+  if (!node) return null;
+  const root = node.cloneNode(true);
+  root.querySelectorAll("button, [role='button']").forEach((el) => el.remove());
+
+  const blocks = getDeepSeekTopLevelMarkdownBlocks(root)
+    .map((el) => {
+      const text = shared.normalizeComposerText(el.textContent || "");
+      if (!text) return null;
+      return {
+        text,
+        markdown: htmlToMarkdown(el.innerHTML).trim() || text,
+        reasoningLike: isDeepSeekReasoningBlock(el),
+      };
+    })
+    .filter((block) => block && shared.hasMeaningfulAssistantText(block.text));
+
+  if (!blocks.length) return null;
+
+  const rootText = shared.normalizeComposerText(root.textContent || "");
+  const rootStartsWithReasoning =
+    /^thought for\b/i.test(rootText) || /^\s*(thinking|reason)/i.test(rootText);
+
+  let answerBlock = null;
+  let thinkingBlocks = [];
+  const explicitReasoningBlocks = blocks.filter((block) => block.reasoningLike);
+
+  if (explicitReasoningBlocks.length > 0) {
+    thinkingBlocks = explicitReasoningBlocks;
+    const answerBlocks = blocks.filter((block) => !block.reasoningLike);
+    answerBlock = answerBlocks[answerBlocks.length - 1] || null;
+    if (!answerBlock && blocks.length > 1) {
+      answerBlock = blocks[blocks.length - 1] || null;
+      thinkingBlocks = blocks.slice(0, -1);
+    }
+  } else if (blocks.length > 1 && rootStartsWithReasoning) {
+    answerBlock = blocks[blocks.length - 1] || null;
+    thinkingBlocks = blocks.slice(0, -1);
+  } else if (blocks.length === 1 && rootStartsWithReasoning) {
+    thinkingBlocks = [blocks[0]];
+  }
+
+  const thinking = Array.from(
+    new Set(thinkingBlocks.map((block) => block.markdown).filter(Boolean)),
+  ).join("\n\n");
+
+  return {
+    answer: answerBlock?.markdown || "",
+    thinking: thinking || null,
+    hasStructuredSplit:
+      Boolean(thinkingBlocks.length) ||
+      (Boolean(answerBlock) && blocks.length > 1 && rootStartsWithReasoning),
+  };
+}
+
+function extractBestAssistantAnswerCandidate(prunedAssistant) {
   const contentSelectors = [
     ".markdown",
     ".ds-markdown",
@@ -2035,6 +2496,62 @@ function extractAssistantAnswerText(node) {
   return "";
 }
 
+function extractDeepSeekAssistantAnswerText(node) {
+  if (!node) return "";
+
+  const sections = extractDeepSeekAssistantSections(node);
+  if (shared.hasMeaningfulAssistantText(sections?.answer || "")) {
+    return sections.answer;
+  }
+
+  const root = node.cloneNode(true);
+  pruneAssistantStatusNodes(root);
+
+  const deepSeekCandidates = [];
+  const seenKeys = new Set();
+  const selectors = [
+    ".ds-markdown",
+    "[class*='markdown']",
+    ".prose",
+    "[class*='prose']",
+    "article",
+    ".text-message",
+    "div[data-message-content]",
+    "p",
+  ];
+  for (const selector of selectors) {
+    root.querySelectorAll(selector).forEach((el) => {
+      if (!(el instanceof Element)) return;
+      if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") return;
+      const text = shared.normalizeComposerText(el.textContent || "");
+      if (!shared.hasMeaningfulAssistantText(text)) return;
+      if (isDeepSeekReasoningBlock(el)) return;
+      const markdown = htmlToMarkdown(el.innerHTML).trim() || text;
+      const key = `${selector}::${markdown}`;
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+      deepSeekCandidates.push({ markdown, text });
+    });
+  }
+
+  if (deepSeekCandidates.length > 0) {
+    return deepSeekCandidates[deepSeekCandidates.length - 1].markdown;
+  }
+
+  return extractBestAssistantAnswerCandidate(root);
+}
+
+function extractAssistantAnswerText(node) {
+  if (SITE_ADAPTER?.siteId === "deepseek") {
+    return extractDeepSeekAssistantAnswerText(node);
+  }
+
+  if (!node) return "";
+  const prunedAssistant = node.cloneNode(true);
+  pruneAssistantStatusNodes(prunedAssistant);
+  return extractBestAssistantAnswerCandidate(prunedAssistant);
+}
+
 function extractResponseAfter(baselineCount = 0) {
   const assistantMessages = getAssistantMessageInfo();
   if (assistantMessages.length <= baselineCount) return "";
@@ -2072,6 +2589,13 @@ function pruneAssistantStatusNodes(root) {
 }
 
 function extractAssistantThinkingText(node) {
+  if (SITE_ADAPTER?.siteId === "deepseek") {
+    const sections = extractDeepSeekAssistantSections(node);
+    if (sections?.hasStructuredSplit && sections.thinking) {
+      return sections.thinking;
+    }
+  }
+
   if (!node) return null;
   const root = node.cloneNode(true);
   root.querySelectorAll("button, [role='button']").forEach((el) => el.remove());
@@ -2181,6 +2705,226 @@ function getCurrentChatId(url = getCurrentChatUrl()) {
 
 function normalizeUrl(url) {
   return String(url || "").replace(/\/+$/, "");
+}
+
+function cloneRelayMessage(message) {
+  if (!message || typeof message !== "object") return null;
+  const attachments = Array.isArray(message.attachments)
+    ? message.attachments.filter((attachment) => typeof attachment === "string")
+    : undefined;
+  return {
+    messageKey:
+      typeof message.messageKey === "string" ? message.messageKey : undefined,
+    role: typeof message.role === "string" ? message.role : "assistant",
+    text: typeof message.text === "string" ? message.text : "",
+    thinking:
+      typeof message.thinking === "string" ? message.thinking : undefined,
+    attachments: attachments?.length ? attachments : undefined,
+  };
+}
+
+let deepSeekTranscriptSnapshots = new Map();
+let deepSeekLatestTranscriptKey = null;
+let deepSeekHistorySnapshot = null;
+
+function makeDeepSeekTranscriptCacheKey(chatUrl, chatId) {
+  return `${normalizeUrl(chatUrl || "")}::${String(chatId || "").trim()}`;
+}
+
+function cloneDeepSeekTranscriptSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const messages = Array.isArray(snapshot.messages)
+    ? snapshot.messages.map((message) => cloneRelayMessage(message)).filter(Boolean)
+    : [];
+  return {
+    messages,
+    chatUrl: typeof snapshot.chatUrl === "string" ? snapshot.chatUrl : null,
+    chatId: typeof snapshot.chatId === "string" ? snapshot.chatId : null,
+    siteHostname:
+      typeof snapshot.siteHostname === "string" ? snapshot.siteHostname : null,
+    capturedAt:
+      Number.isFinite(snapshot.capturedAt) && Number(snapshot.capturedAt) > 0
+        ? Math.floor(Number(snapshot.capturedAt))
+        : 0,
+    source:
+      snapshot.source === "network" || snapshot.source === "dom"
+        ? snapshot.source
+        : null,
+  };
+}
+
+function cloneDeepSeekHistorySnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const history = Array.isArray(snapshot.history)
+    ? snapshot.history
+      .filter((entry) =>
+        entry &&
+        typeof entry.id === "string" &&
+        typeof entry.title === "string" &&
+        typeof entry.chatUrl === "string",
+      )
+      .map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        chatUrl: entry.chatUrl,
+      }))
+    : [];
+  return {
+    history,
+    siteHostname:
+      typeof snapshot.siteHostname === "string" ? snapshot.siteHostname : null,
+    capturedAt:
+      Number.isFinite(snapshot.capturedAt) && Number(snapshot.capturedAt) > 0
+        ? Math.floor(Number(snapshot.capturedAt))
+        : 0,
+    source:
+      snapshot.source === "network" || snapshot.source === "dom"
+        ? snapshot.source
+        : null,
+    status:
+      snapshot.status === "ok" ||
+      snapshot.status === "empty" ||
+      snapshot.status === "invalid_source" ||
+      snapshot.status === "timeout"
+        ? snapshot.status
+        : "empty",
+  };
+}
+
+function getDeepSeekTranscriptSnapshotHostname(snapshot) {
+  if (!snapshot) return "";
+  if (snapshot.siteHostname) {
+    return String(snapshot.siteHostname).trim().toLowerCase();
+  }
+  if (!snapshot.chatUrl) return "";
+  try {
+    return new URL(snapshot.chatUrl).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function storeDeepSeekTranscriptSnapshot(snapshot) {
+  const normalized = cloneDeepSeekTranscriptSnapshot(snapshot);
+  if (!normalized) return;
+  const key = makeDeepSeekTranscriptCacheKey(normalized.chatUrl, normalized.chatId);
+  deepSeekTranscriptSnapshots.set(key, normalized);
+  deepSeekLatestTranscriptKey = key;
+  if (deepSeekTranscriptSnapshots.size > 6) {
+    const keys = Array.from(deepSeekTranscriptSnapshots.keys());
+    for (const entryKey of keys.slice(0, Math.max(0, keys.length - 6))) {
+      if (entryKey === deepSeekLatestTranscriptKey) continue;
+      deepSeekTranscriptSnapshots.delete(entryKey);
+    }
+  }
+}
+
+function storeDeepSeekHistorySnapshot(snapshot) {
+  deepSeekHistorySnapshot = cloneDeepSeekHistorySnapshot(snapshot);
+}
+
+function clearDeepSeekNetworkCaches(scope = "all") {
+  if (!scope || scope === "all" || scope === "transcript") {
+    deepSeekTranscriptSnapshots = new Map();
+    deepSeekLatestTranscriptKey = null;
+  }
+  if (!scope || scope === "all" || scope === "history") {
+    deepSeekHistorySnapshot = null;
+  }
+  try {
+    window.postMessage(
+      { type: "SYNC_ZOTERO_NETWORK_CACHE_CLEAR", scope },
+      "*",
+    );
+  } catch (_) {}
+}
+
+function requestDeepSeekNetworkCacheReplay() {
+  if (SITE_ADAPTER?.siteId !== "deepseek") return;
+  try {
+    window.postMessage({ type: "SYNC_ZOTERO_NETWORK_CACHE_REQUEST" }, "*");
+  } catch (_) {}
+}
+
+function findMatchingDeepSeekTranscriptSnapshot({
+  expectedChatUrl = null,
+  expectedChatId = null,
+  minCapturedAt = 0,
+} = {}) {
+  const normalizedExpectedUrl = normalizeUrl(expectedChatUrl || "");
+  const normalizedExpectedId = String(expectedChatId || "").trim();
+  const minimumCapture = Number(minCapturedAt) || 0;
+  const snapshotMatches = (snapshot) => {
+    if (!snapshot) return false;
+    if ((snapshot.capturedAt || 0) < minimumCapture) return false;
+    const actualId = String(snapshot.chatId || "").trim();
+    if (normalizedExpectedId) {
+      if (actualId) {
+        return actualId === normalizedExpectedId;
+      }
+      if (
+        normalizedExpectedUrl &&
+        normalizeUrl(snapshot.chatUrl || "") !== normalizedExpectedUrl
+      ) {
+        return false;
+      }
+      return true;
+    }
+    if (
+      normalizedExpectedUrl &&
+      normalizeUrl(snapshot.chatUrl || "") !== normalizedExpectedUrl
+    ) {
+      return false;
+    }
+    return true;
+  };
+  const candidates = Array.from(deepSeekTranscriptSnapshots.values());
+  if (deepSeekLatestTranscriptKey && deepSeekTranscriptSnapshots.has(deepSeekLatestTranscriptKey)) {
+    const latest = deepSeekTranscriptSnapshots.get(deepSeekLatestTranscriptKey);
+    return [latest, ...candidates.filter((snapshot) => snapshot !== latest)].find(snapshotMatches) || null;
+  }
+  return candidates.find(snapshotMatches) || null;
+}
+
+async function waitForDeepSeekTranscriptSnapshot({
+  expectedChatUrl = null,
+  expectedChatId = null,
+  minCapturedAt = 0,
+  timeoutMs = 15_000,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  requestDeepSeekNetworkCacheReplay();
+
+  while (Date.now() < deadline) {
+    const snapshot = findMatchingDeepSeekTranscriptSnapshot({
+      expectedChatUrl,
+      expectedChatId,
+      minCapturedAt,
+    });
+    if (snapshot) return cloneDeepSeekTranscriptSnapshot(snapshot);
+    await workerSleep(250);
+  }
+  return null;
+}
+
+async function waitForDeepSeekHistorySnapshot({
+  minCapturedAt = 0,
+  timeoutMs = 15_000,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const minimumCapture = Number(minCapturedAt) || 0;
+  requestDeepSeekNetworkCacheReplay();
+
+  while (Date.now() < deadline) {
+    if (
+      deepSeekHistorySnapshot &&
+      (deepSeekHistorySnapshot.capturedAt || 0) >= minimumCapture
+    ) {
+      return cloneDeepSeekHistorySnapshot(deepSeekHistorySnapshot);
+    }
+    await workerSleep(250);
+  }
+  return null;
 }
 
 function removeTransientMessageNodes(root) {
@@ -2368,7 +3112,12 @@ function extractConversationTranscript() {
  * scroll position. Deduplicates by messageKey.
  * Falls back to a single extractConversationTranscript() if no scrollable container.
  */
-async function extractFullConversationTranscript() {
+async function extractFullConversationTranscript(options = {}) {
+  const initialWaitMs = Math.max(250, Number(options.initialWaitMs) || 2500);
+  const stepWaitMs = Math.max(150, Number(options.stepWaitMs) || 500);
+  const maxSteps = Math.max(1, Number(options.maxSteps) || 100);
+  const maxDurationMs = Math.max(1000, Number(options.maxDurationMs) || 60_000);
+  const startedAt = Date.now();
   // Find the scrollable conversation container.
   // DeepSeek: the .ds-virtual-list itself is the scroll container (overflow: auto).
   // Others: look for a scroll-area parent that contains message nodes.
@@ -2413,7 +3162,7 @@ async function extractFullConversationTranscript() {
   // Phase 1: Scroll to top and wait for virtual list to render all earlier messages.
   // DeepSeek's virtual list lazily loads messages — scrolling to top triggers rendering.
   scrollContainer.scrollTop = 0;
-  await scrollSleep(2500);
+  await scrollSleep(initialWaitMs);
 
   // Phase 2: Scroll through the entire conversation, collecting messages at each position.
   // This ensures we capture items from all parts of the virtual list.
@@ -2435,9 +3184,10 @@ async function extractFullConversationTranscript() {
   collectVisible(); // collect at top
 
   let lastScrollTop = -1;
-  for (let step = 0; step < 100; step++) {
+  for (let step = 0; step < maxSteps; step++) {
+    if (Date.now() - startedAt >= maxDurationMs) break;
     scrollContainer.scrollTop += scrollStep;
-    await scrollSleep(500);
+    await scrollSleep(stepWaitMs);
     collectVisible();
     if (Math.abs(scrollContainer.scrollTop - lastScrollTop) < 5) break;
     lastScrollTop = scrollContainer.scrollTop;
@@ -2491,6 +3241,42 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
     // If navigating to a new conversation, wait briefly for React to start rendering
     if (normalizedExpected && normalizeUrl(getCurrentChatUrl()) !== normalizedExpected) {
       await workerSleep(1000);
+    }
+
+    if (SITE_ADAPTER?.siteId === "deepseek") {
+      while (Date.now() < deadline) {
+        const transcript = extractConversationTranscript();
+        const currentUrl = normalizeUrl(transcript.chatUrl || getCurrentChatUrl());
+        const urlMatches = !normalizedExpected || currentUrl === normalizedExpected;
+        const bodyReady = Boolean(document.body);
+        const mainReady = Boolean(
+          document.querySelector("main") ||
+          document.querySelector('[role="main"]') ||
+          document.body,
+        );
+        const domSettled = (Date.now() - lastDomMutationAt) >= 400;
+
+        if (urlMatches && bodyReady && mainReady && domSettled) {
+          debugLog("chat_ready", {
+            site: "deepseek",
+            chatUrl: transcript.chatUrl || currentUrl,
+            chatId: transcript.chatId || getCurrentChatId(currentUrl),
+            count: transcript.count,
+            hash: transcript.hash,
+          });
+          return {
+            ok: true,
+            ready: true,
+            chatUrl: transcript.chatUrl || currentUrl,
+            chatId: transcript.chatId || getCurrentChatId(currentUrl),
+            transcriptHash: transcript.hash,
+            transcriptCount: transcript.count,
+            messages: mapTranscriptToRelayMessages(transcript),
+          };
+        }
+
+        await workerSleep(250);
+      }
     }
 
     while (Date.now() < deadline) {
@@ -2564,28 +3350,36 @@ function findMatchingUserTurn(transcript, baselineCount, promptText) {
     .slice(Math.max(0, baselineCount))
     .filter((message) => message.role === "user");
   if (candidates.length === 0) return null;
+  if (!normalizedPrompt) {
+    return candidates[candidates.length - 1] || null;
+  }
 
   // Tier 1: exact match
-  const exact = candidates.find(
+  const exactMatches = candidates.filter(
     (message) =>
       shared.normalizeComposerText(message.text).normalize("NFC").toLowerCase() === normalizedPrompt,
   );
-  if (exact) return exact;
+  if (exactMatches.length > 0) {
+    return exactMatches[exactMatches.length - 1];
+  }
 
   // Tier 2: substring containment
-  const contains = candidates.find((message) => {
+  const containsMatches = candidates.filter((message) => {
     const normalized = shared.normalizeComposerText(message.text).normalize("NFC").toLowerCase();
     return normalized.includes(normalizedPrompt) || normalizedPrompt.includes(normalized);
   });
-  if (contains) return contains;
+  if (containsMatches.length > 0) {
+    return containsMatches[containsMatches.length - 1];
+  }
 
   // Tier 3: fuzzy match (word-level Jaccard similarity)
   let bestMatch = null;
   let bestScore = 0;
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index];
     const normalized = shared.normalizeComposerText(candidate.text).normalize("NFC").toLowerCase();
     const score = wordJaccardSimilarity(normalizedPrompt, normalized);
-    if (score > bestScore) {
+    if (score >= bestScore) {
       bestScore = score;
       bestMatch = candidate;
     }
@@ -2603,22 +3397,52 @@ function resolveBoundAssistantTurn(transcript, userTurnKey, assistantTurnKey = n
   );
   if (userIndex < 0) return null;
 
-  if (assistantTurnKey) {
-    const exact = transcript.messages.find(
-      (message) =>
-        message.role === "assistant" &&
-        message.messageKey === assistantTurnKey,
-    );
-    if (exact) return exact;
-  }
-
+  const assistantTurns = [];
   for (let index = userIndex + 1; index < transcript.messages.length; index++) {
     const message = transcript.messages[index];
+    if (message.role === "user") break;
     if (message.role === "assistant") {
-      return message;
+      assistantTurns.push(message);
     }
   }
-  return null;
+  if (assistantTurns.length === 0) return null;
+
+  const exact = assistantTurnKey
+    ? assistantTurns.find((message) => message.messageKey === assistantTurnKey) || null
+    : null;
+  const meaningfulTurns = assistantTurns.filter((message) =>
+    shared.hasMeaningfulAssistantText(message.text || ""),
+  );
+
+  if (meaningfulTurns.length > 0) {
+    return meaningfulTurns[meaningfulTurns.length - 1];
+  }
+  if (exact) return exact;
+  return assistantTurns[assistantTurns.length - 1] || null;
+}
+
+function resolveLatestAssistantTurnAfterBaseline(
+  transcript,
+  baselineCount,
+  assistantTurnKey = null,
+) {
+  const assistantTurns = transcript.messages
+    .slice(Math.max(0, baselineCount))
+    .filter((message) => message.role === "assistant");
+  if (assistantTurns.length === 0) return null;
+
+  const exact = assistantTurnKey
+    ? assistantTurns.find((message) => message.messageKey === assistantTurnKey) || null
+    : null;
+  const meaningfulTurns = assistantTurns.filter((message) =>
+    shared.hasMeaningfulAssistantText(message.text || ""),
+  );
+
+  if (meaningfulTurns.length > 0) {
+    return meaningfulTurns[meaningfulTurns.length - 1];
+  }
+  if (exact) return exact;
+  return assistantTurns[assistantTurns.length - 1] || null;
 }
 
 /** Extract original LaTeX source from a KaTeX-rendered element. */
@@ -2726,38 +3550,194 @@ function htmlToMarkdown(html) {
  * Extract all user and assistant messages from the current ChatGPT page.
  * Returns them in chronological order as { role, text } objects.
  */
-async function scrapeAllMessages() {
-  const chatUrl = getCurrentChatUrl();
-  let ready = await waitForChatReady(chatUrl, 15000);
+async function scrapeAllMessages(options = {}) {
+  const expectedChatUrl = options.expectedChatUrl || getCurrentChatUrl();
+  const expectedChatId = options.expectedChatId || getCurrentChatId(expectedChatUrl);
+  const minCapturedAt = Number(options.minCapturedAt) || 0;
+  const timeoutMs = Number(options.timeoutMs) || 15_000;
+  const requestedChatUrl = expectedChatUrl || getCurrentChatUrl();
+  const isDeepSeek = SITE_ADAPTER?.siteId === "deepseek";
+  const readyWaitMs = isDeepSeek ? Math.min(timeoutMs, 5_000) : 15_000;
+  const retryDelayMs = isDeepSeek ? 750 : 2_000;
+  const scrollBudgetMs = isDeepSeek ? Math.min(timeoutMs, 12_000) : 20_000;
+  lastScrapeDebug = {
+    startedAt: Date.now(),
+    expectedChatUrl,
+    expectedChatId,
+    currentChatUrl: getCurrentChatUrl(),
+    siteId: SITE_ADAPTER?.siteId || null,
+    source: null,
+    messageCount: 0,
+    chatId: null,
+    chatUrl: null,
+  };
+
+  if (isDeepSeek) {
+    const fastNetworkGraceMs = Math.min(timeoutMs, 1_250);
+    const fastNetworkSnapshotPromise = waitForDeepSeekTranscriptSnapshot({
+      expectedChatUrl,
+      expectedChatId,
+      minCapturedAt,
+      timeoutMs: fastNetworkGraceMs,
+    });
+    const earlyTranscriptPromise = extractFullConversationTranscript({
+      initialWaitMs: 900,
+      stepWaitMs: 250,
+      maxSteps: 60,
+      maxDurationMs: Math.max(2500, scrollBudgetMs),
+    });
+    const networkSnapshot = await fastNetworkSnapshotPromise;
+    if (networkSnapshot) {
+      console.log(
+        `[sync-zotero] scrapeAllMessages: using DeepSeek network snapshot (${networkSnapshot.messages.length} messages)`,
+      );
+      lastScrapeDebug = {
+        ...lastScrapeDebug,
+        finishedAt: Date.now(),
+        source: "network",
+        messageCount: networkSnapshot.messages.length,
+        chatId: networkSnapshot.chatId || null,
+        chatUrl: networkSnapshot.chatUrl || null,
+      };
+      return networkSnapshot;
+    }
+
+    try {
+      const earlyTranscript = await earlyTranscriptPromise;
+      const earlyMapped = mapTranscriptToRelayMessages(earlyTranscript);
+      const earlyMessages = earlyMapped.filter((message) => message.text || message.thinking);
+      if (earlyMessages.length > 0) {
+        const result = {
+          messages: earlyMessages,
+          chatUrl: earlyTranscript.chatUrl,
+          chatId: earlyTranscript.chatId,
+          siteHostname: window.location.hostname,
+          capturedAt: Date.now(),
+          source: "dom",
+        };
+        lastScrapeDebug = {
+          ...lastScrapeDebug,
+          finishedAt: Date.now(),
+          source: "dom",
+          messageCount: earlyMessages.length,
+          chatId: result.chatId || null,
+          chatUrl: result.chatUrl || null,
+          strategy: "deepseek_early_scroll",
+          fastNetworkGraceMs,
+        };
+        return result;
+      }
+    } catch (err) {
+      lastScrapeDebug = {
+        ...lastScrapeDebug,
+        fastNetworkGraceMs,
+        earlyScrollError: err?.message || String(err),
+      };
+    }
+  }
+
+  let ready = await waitForChatReady(requestedChatUrl, readyWaitMs);
 
   // If first attempt failed or returned empty messages on a conversation page,
   // retry once after a brief delay (handles stale SPA state)
-  const isConversationPage = chatUrl && SITE_ADAPTER?.getChatIdFromUrl?.(chatUrl) !== null;
+  const isConversationPage =
+    requestedChatUrl && SITE_ADAPTER?.getChatIdFromUrl?.(requestedChatUrl) !== null;
   const firstMessages = (ready.messages || []).filter(
     (message) => message.text || message.thinking,
   );
 
   if (isConversationPage && firstMessages.length === 0) {
     console.warn("[sync-zotero] scrapeAllMessages: no messages on first attempt, retrying…");
-    await workerSleep(2000);
-    ready = await waitForChatReady(chatUrl, 15000);
+    await workerSleep(retryDelayMs);
+    ready = await waitForChatReady(requestedChatUrl, readyWaitMs);
   }
 
   if (!ready.ok && (!ready.messages || ready.messages.length === 0)) {
     console.warn("[sync-zotero] scrapeAllMessages: page never became ready");
-    return [];
+    const result = {
+      messages: [],
+      chatUrl: ready.chatUrl || requestedChatUrl,
+      chatId: ready.chatId || getCurrentChatId(requestedChatUrl),
+      siteHostname: window.location.hostname,
+      capturedAt: Date.now(),
+      source: "dom",
+    };
+    lastScrapeDebug = {
+      ...lastScrapeDebug,
+      finishedAt: Date.now(),
+      source: "dom",
+      messageCount: 0,
+      chatId: result.chatId || null,
+      chatUrl: result.chatUrl || null,
+      error: ready.error || "page_never_ready",
+    };
+    return result;
+  }
+
+  const readyMessages = (ready.messages || []).filter(
+    (message) => message.text || message.thinking,
+  );
+  if (!isDeepSeek) {
+    const result = {
+      messages: readyMessages,
+      chatUrl: ready.chatUrl || requestedChatUrl,
+      chatId: ready.chatId || getCurrentChatId(requestedChatUrl),
+      siteHostname: window.location.hostname,
+      capturedAt: Date.now(),
+      source: "dom",
+    };
+    lastScrapeDebug = {
+      ...lastScrapeDebug,
+      finishedAt: Date.now(),
+      source: "dom",
+      messageCount: readyMessages.length,
+      chatId: result.chatId || null,
+      chatUrl: result.chatUrl || null,
+      strategy: "ready_transcript",
+    };
+    return result;
   }
 
   // Always attempt full scroll-and-collect to capture all messages
   // (critical for sites with virtual scrolling like DeepSeek).
   try {
-    const fullTranscript = await extractFullConversationTranscript();
+    const fullTranscript = await extractFullConversationTranscript({
+      initialWaitMs: isDeepSeek ? 900 : 2500,
+      stepWaitMs: isDeepSeek ? 250 : 500,
+      maxSteps: isDeepSeek ? 60 : 100,
+      maxDurationMs: scrollBudgetMs,
+    });
     const fullMapped = mapTranscriptToRelayMessages(fullTranscript);
     const fullMessages = fullMapped.filter((m) => m.text || m.thinking);
     console.log(`[sync-zotero] scrapeAllMessages: scroll extraction found ${fullMessages.length} messages`);
-    if (fullMessages.length > 0) return fullMessages;
+    if (fullMessages.length > 0) {
+      const result = {
+        messages: fullMessages,
+        chatUrl: fullTranscript.chatUrl,
+        chatId: fullTranscript.chatId,
+        siteHostname: window.location.hostname,
+        capturedAt: Date.now(),
+        source: "dom",
+      };
+      lastScrapeDebug = {
+        ...lastScrapeDebug,
+        finishedAt: Date.now(),
+        source: "dom",
+        messageCount: fullMessages.length,
+        chatId: result.chatId || null,
+        chatUrl: result.chatUrl || null,
+      };
+      return result;
+    }
   } catch (err) {
     console.warn("[sync-zotero] scrapeAllMessages: scroll extraction failed:", err);
+    lastScrapeDebug = {
+      ...lastScrapeDebug,
+      finishedAt: Date.now(),
+      source: "dom",
+      messageCount: 0,
+      error: err?.message || String(err),
+    };
   }
 
   // Fallback: use whatever waitForChatReady returned
@@ -2765,7 +3745,23 @@ async function scrapeAllMessages() {
     (message) => message.text || message.thinking,
   );
   console.log(`[sync-zotero] scrapeAllMessages: fallback found ${messages.length} messages`);
-  return messages;
+  const result = {
+    messages,
+    chatUrl: ready.chatUrl || requestedChatUrl,
+    chatId: ready.chatId || getCurrentChatId(requestedChatUrl),
+    siteHostname: window.location.hostname,
+    capturedAt: Date.now(),
+    source: "dom",
+  };
+  lastScrapeDebug = {
+    ...lastScrapeDebug,
+    finishedAt: Date.now(),
+    source: "dom",
+    messageCount: messages.length,
+    chatId: result.chatId || null,
+    chatUrl: result.chatUrl || null,
+  };
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2781,8 +3777,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   // [webchat] Trigger immediate sidebar history scrape (force re-send)
   if (msg.type === "SCRAPE_HISTORY_NOW") {
-    lastHistoryJson = "";  // Reset cache to force re-send
-    scrapeHistory();
+    if (msg.force === true) {
+      lastHistoryJson = "";
+    }
+    scrapeHistory({
+      force: msg.force === true,
+      minCapturedAt: Number(msg.minCapturedAt) || 0,
+      timeoutMs: Number(msg.timeoutMs) || 15_000,
+    })
+      .then((result) => sendResponse(result || { ok: true }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: err?.message || "Failed to scrape history.",
+        }),
+      );
+    return true;
+  }
+
+  if (msg.type === "RESET_NETWORK_CACHE") {
+    clearDeepSeekNetworkCaches(msg.scope || "all");
     sendResponse({ ok: true });
     return false;
   }
@@ -2823,14 +3837,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // [webchat] Scrape all messages from the current ChatGPT conversation
   if (msg.type === "SCRAPE_MESSAGES") {
     console.log("[sync-zotero] SCRAPE_MESSAGES received, starting scrape…");
-    scrapeAllMessages()
-      .then((messages) => {
-        console.log(`[sync-zotero] SCRAPE_MESSAGES done: ${messages.length} messages`);
-        sendResponse({ ok: true, messages });
+    scrapeAllMessages({
+      expectedChatUrl: msg.expectedChatUrl || null,
+      expectedChatId: msg.expectedChatId || null,
+      minCapturedAt: Number(msg.minCapturedAt) || 0,
+      timeoutMs: Number(msg.timeoutMs) || 15_000,
+    })
+      .then((result) => {
+        console.log(`[sync-zotero] SCRAPE_MESSAGES done: ${result.messages.length} messages (${result.source || "unknown"})`);
+        sendResponse({ ok: true, ...result });
       })
       .catch((err) => {
         console.warn("[sync-zotero] SCRAPE_MESSAGES error:", err);
-        sendResponse({ ok: false, error: err.message, messages: [] });
+        sendResponse({
+          ok: false,
+          error: err.message,
+          messages: [],
+          chatUrl: msg.expectedChatUrl || getCurrentChatUrl(),
+          chatId: msg.expectedChatId || getCurrentChatId(),
+          siteHostname: window.location.hostname,
+          capturedAt: Date.now(),
+          source: null,
+        });
       });
     return true; // async sendResponse
   }
@@ -2892,7 +3920,7 @@ if (!window.__syncZoteroListenerRegistered) {
         await typePromptAndVerify(msg.prompt);
         port.postMessage({ type: "phase", seq, attempt, phase: "prompt_applied" });
 
-        await submitMessageAndVerify(msg.prompt);
+        const submission = await submitMessageAndVerify(msg.prompt);
         port.postMessage({ type: "phase", seq, attempt, phase: "submitted" });
 
         await streamResponseSnapshots(
@@ -2902,6 +3930,7 @@ if (!window.__syncZoteroListenerRegistered) {
           baselineTranscript,
           msg.prompt || "",
           attachmentFingerprint,
+          submission,
           180000,
         );
 
@@ -2918,35 +3947,270 @@ if (!window.__syncZoteroListenerRegistered) {
 
 let lastHistoryJson = "";
 
-async function scrapeHistory() {
-  const linkSelector = SITE_ADAPTER?.historyLinkSelector || 'nav a[href^="/c/"]';
-  const items = Array.from(document.querySelectorAll(linkSelector));
-  const history = items.map(a => {
-    if (SITE_ADAPTER?.buildHistoryEntry) {
-      return SITE_ADAPTER.buildHistoryEntry(a);
-    }
-    const href = a.getAttribute('href');
-    const chatId = href.replace('/c/', '');
-    const title = a.textContent.trim();
-    return { id: chatId, title, chatUrl: `https://chatgpt.com${href}` };
-  });
-
-  const historyJson = JSON.stringify(history);
-  if (historyJson !== lastHistoryJson && history.length > 0) {
-    lastHistoryJson = historyJson;
-    try {
-      chrome.runtime.sendMessage({ type: "HISTORY_UPDATE", history }, () => {
-        // Suppress "Receiving end does not exist" when service worker is inactive
-        void chrome.runtime.lastError;
-      });
-    } catch (e) {
-      // Extension context invalidated (extension reloaded while page still open)
-    }
+function parseDeepSeekHistoryHref(href) {
+  const rawHref = String(href || "").trim();
+  if (!rawHref) return null;
+  try {
+    const parsed = new URL(rawHref, window.location.origin);
+    if (parsed.origin !== window.location.origin) return null;
+    const match = parsed.pathname.match(/^\/a\/chat\/s\/([^/?#]+)$/);
+    if (!match) return null;
+    return {
+      id: match[1],
+      chatUrl: `https://chat.deepseek.com${parsed.pathname}`,
+    };
+  } catch (_) {
+    return null;
   }
 }
 
+function parseDeepSeekHistoryAnchor(anchor) {
+  if (!anchor) return null;
+  const parsed = parseDeepSeekHistoryHref(anchor.getAttribute("href"));
+  if (!parsed?.id || !parsed.chatUrl) return null;
+  const title = shared.normalizeComposerText(anchor.textContent || "");
+  if (!title || title === parsed.id || title === parsed.chatUrl) return null;
+  return {
+    id: parsed.id,
+    title,
+    chatUrl: parsed.chatUrl,
+  };
+}
+
+function collectDeepSeekHistoryEntriesWithRoot() {
+  const selectors = [
+    "aside",
+    "nav",
+    '[role="navigation"]',
+    '[class*="sidebar"]',
+    '[class*="history"]',
+    '[data-testid*="history"]',
+    '[data-testid*="sidebar"]',
+  ];
+  const candidates = [];
+  const seen = new Set();
+  for (const selector of selectors) {
+    document.querySelectorAll(selector).forEach((node) => {
+      if (!(node instanceof Element) || seen.has(node)) return;
+      seen.add(node);
+      candidates.push(node);
+    });
+  }
+
+  let bestRoot = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const entries = [];
+    const seenIds = new Set();
+    candidate.querySelectorAll('a[href]').forEach((anchor) => {
+      const entry = parseDeepSeekHistoryAnchor(anchor);
+      if (!entry || seenIds.has(entry.id)) return;
+      entries.push(entry);
+      seenIds.add(entry.id);
+    });
+    const candidateClass = String(candidate.className || "").toLowerCase();
+    const isLikelyHistoryRoot =
+      entries.length > 0 ||
+      candidate.matches("aside") ||
+      /(sidebar|history|conversation)/.test(candidateClass) ||
+      candidate.matches(
+        '[class*="sidebar"], [class*="history"], [data-testid*="history"], [data-testid*="sidebar"]',
+      );
+    if (!isLikelyHistoryRoot) continue;
+    const bonus =
+      candidate.matches("aside, nav, [role='navigation']") ? 2 : 0;
+    const keywordBonus =
+      /(sidebar|history|conversation|nav)/.test(candidateClass) ? 4 : 0;
+    const score = entries.length * 20 + bonus + keywordBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      bestRoot = candidate;
+    }
+  }
+
+  if (!bestRoot) {
+    return { root: null, history: [] };
+  }
+
+  const history = [];
+  const seenIds = new Set();
+  bestRoot.querySelectorAll('a[href]').forEach((anchor) => {
+    const entry = parseDeepSeekHistoryAnchor(anchor);
+    if (!entry || seenIds.has(entry.id)) return;
+    history.push(entry);
+    seenIds.add(entry.id);
+  });
+  return { root: bestRoot, history };
+}
+
+function collectHistoryEntries() {
+  if (SITE_ADAPTER?.siteId === "deepseek") {
+    return collectDeepSeekHistoryEntriesWithRoot().history;
+  }
+  const linkSelector = SITE_ADAPTER?.historyLinkSelector || 'nav a[href^="/c/"]';
+  const items = Array.from(document.querySelectorAll(linkSelector));
+  const history = [];
+  const seenIds = new Set();
+
+  for (const a of items) {
+    if (SITE_ADAPTER?.buildHistoryEntry) {
+      const entry = SITE_ADAPTER.buildHistoryEntry(a);
+      const id = String(entry?.id || "").trim();
+      const title = shared.normalizeComposerText(entry?.title || "");
+      const chatUrl = String(entry?.chatUrl || "").trim();
+      if (
+        !id ||
+        !title ||
+        !chatUrl ||
+        title === id ||
+        title === chatUrl ||
+        seenIds.has(id)
+      ) {
+        continue;
+      }
+      history.push({ id, title, chatUrl });
+      seenIds.add(id);
+      continue;
+    }
+    const href = a.getAttribute('href');
+    if (!href) continue;
+    const chatId = href.replace('/c/', '');
+    const title = shared.normalizeComposerText(a.textContent || "");
+    if (!chatId || !title || title === chatId || title === href || seenIds.has(chatId)) continue;
+    history.push({ id: chatId, title, chatUrl: `https://chatgpt.com${href}` });
+    seenIds.add(chatId);
+  }
+
+  return history;
+}
+
+async function scrapeHistory(options = {}) {
+  if (historyScrapeInFlight) return;
+  historyScrapeInFlight = true;
+  try {
+    const isDeepSeek = window.location.hostname === "chat.deepseek.com";
+    const minCapturedAt = Number(options.minCapturedAt) || 0;
+    const timeoutMs = Number(options.timeoutMs) || 15_000;
+    let history = null;
+    let scrapedAt = Date.now();
+    let source = "dom";
+    let status = "ok";
+    let networkStatus = null;
+
+    if (isDeepSeek) {
+      const networkSnapshot = await waitForDeepSeekHistorySnapshot({
+        minCapturedAt,
+        timeoutMs,
+      });
+      if (networkSnapshot) {
+        networkStatus = networkSnapshot.status || "empty";
+        if (networkStatus === "ok" || networkStatus === "empty") {
+          history = networkSnapshot.history;
+          scrapedAt = networkSnapshot.capturedAt || Date.now();
+          source = networkSnapshot.source || "network";
+          status = networkStatus;
+        }
+      }
+    }
+
+    if (!Array.isArray(history)) {
+      const attempts = isDeepSeek ? 4 : 2;
+      const initialDelayMs = isDeepSeek ? 600 : 150;
+      const retryDelayMs = isDeepSeek ? 700 : 300;
+
+      await workerSleep(initialDelayMs);
+
+      history = [];
+      let deepSeekRootSeen = false;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (isDeepSeek) {
+          const collected = collectDeepSeekHistoryEntriesWithRoot();
+          history = collected.history;
+          if (collected.root) {
+            deepSeekRootSeen = true;
+          }
+        } else {
+          history = collectHistoryEntries();
+        }
+        if (history.length > 0 || attempt === attempts - 1) {
+          break;
+        }
+        await workerSleep(retryDelayMs);
+      }
+      scrapedAt = Date.now();
+      source = "dom";
+      if (isDeepSeek) {
+        if (history.length > 0) {
+          status = "ok";
+        } else if (deepSeekRootSeen) {
+          status = "empty";
+        } else if (networkStatus === "invalid_source") {
+          status = "invalid_source";
+          source = "network";
+        } else {
+          status = "timeout";
+        }
+      } else {
+        status = history.length > 0 ? "ok" : "empty";
+      }
+    }
+
+    const historyJson = JSON.stringify({
+      history,
+      status,
+      siteHostname: window.location.hostname,
+    });
+    if (
+      historyJson !== lastHistoryJson ||
+      options.force === true ||
+      minCapturedAt > 0
+    ) {
+      lastHistoryJson = historyJson;
+      // Include siteHostname so the relay can merge per-site
+      // (only replace this site's entries, keep other sites intact).
+      const siteHostname = window.location.hostname;
+      try {
+        chrome.runtime.sendMessage(
+          {
+            type: "HISTORY_UPDATE",
+            history,
+            siteHostname,
+            scrapedAt,
+            source,
+            status,
+          },
+          () => {
+            // Suppress "Receiving end does not exist" when service worker is inactive
+            void chrome.runtime.lastError;
+          },
+        );
+      } catch (e) {
+        // Extension context invalidated (extension reloaded while page still open)
+      }
+    }
+    return {
+      ok: true,
+      history,
+      siteHostname: window.location.hostname,
+      scrapedAt,
+      source,
+      status,
+    };
+  } finally {
+    historyScrapeInFlight = false;
+  }
+}
+
+function shouldAutoScrapeHistory() {
+  if (SITE_ADAPTER?.siteId !== "deepseek") return true;
+  return !getCurrentChatId();
+}
+
 // Scrape every 2 seconds
-setInterval(scrapeHistory, 2000);
+setInterval(() => {
+  if (!shouldAutoScrapeHistory()) return;
+  void scrapeHistory();
+}, 2000);
 
 async function handleDeleteChat(chatId) {
   // Find the exact link in the sidebar
@@ -2989,7 +4253,9 @@ async function handleDeleteChat(chatId) {
   await sleep(1000); // Wait for deletion to process
 
   // Scrape history immediately to reflect deletion
-  scrapeHistory();
+  if (shouldAutoScrapeHistory()) {
+    scrapeHistory();
+  }
   return { success: true };
 }
 

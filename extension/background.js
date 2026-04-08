@@ -72,6 +72,30 @@ function getSiteConfigByUrl(url) {
   return null;
 }
 
+function isSiteHomeUrl(url, config) {
+  try {
+    const parsed = new URL(String(url || ""));
+    const expected = new URL(config.homeUrl);
+    const parsedPath = parsed.pathname.replace(/\/+$/, "") || "/";
+    const expectedPath = expected.pathname.replace(/\/+$/, "") || "/";
+    return parsed.origin === expected.origin && parsedPath === expectedPath;
+  } catch {
+    return false;
+  }
+}
+
+function findSiteHomeTab(tabs, config) {
+  return tabs.find((tab) => isSiteHomeUrl(tab.url, config)) || null;
+}
+
+function hostnameFromUrl(url) {
+  try {
+    return new URL(String(url || "")).hostname;
+  } catch {
+    return null;
+  }
+}
+
 /** The currently active target — updated when a query specifies a target. */
 let activeTarget = "chatgpt";
 
@@ -151,6 +175,12 @@ async function heartbeat() {
       try {
         const hb = await res.clone().json();
         if (hb.active_target && SITE_CONFIGS[hb.active_target]) {
+          if (activeTarget !== hb.active_target) {
+            // Target changed — clear stale tab reference so SCRAPE_HISTORY
+            // and other commands discover the correct tab for the new target.
+            activeChatTabId = null;
+            console.log(`[sync-zotero] Target changed: ${activeTarget} → ${hb.active_target}, cleared activeChatTabId`);
+          }
           activeTarget = hb.active_target;
         }
       } catch { /* non-critical */ }
@@ -193,7 +223,7 @@ async function heartbeat() {
 discoverZoteroPort();
 setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
 
-// Auto-discover existing chat tabs on startup and trigger initial history scrape
+// Auto-discover existing chat tabs on startup without opening new tabs.
 (async () => {
   // Search all supported sites for an existing tab
   let foundTab = null;
@@ -207,19 +237,7 @@ setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
   }
   if (foundTab && activeChatTabId === null) {
     activeChatTabId = foundTab.id;
-    const tabs = [foundTab]; // compatibility with original code below
     console.log(`[sync-zotero] Found existing chat tab: ${foundTab.id} (${activeTarget})`);
-    // (original code follows)
-
-    // Wait for Zotero port discovery, then trigger a history scrape
-    await discoverZoteroPort();
-    try {
-      await ensureContentScript(activeChatTabId);
-      // Ping the content script to trigger an immediate scrapeHistory()
-      chrome.tabs.sendMessage(activeChatTabId, { type: "SCRAPE_HISTORY_NOW" }, () => {
-        void chrome.runtime.lastError;
-      });
-    } catch (_) {}
   }
 })();
 
@@ -339,18 +357,65 @@ async function waitForChatReadyInTab(tabId, expectedChatUrl = null, timeoutMs = 
   return response;
 }
 
+async function resetNetworkCacheInTab(tabId, scope = "all") {
+  try {
+    await sendToContentScript(tabId, {
+      type: "RESET_NETWORK_CACHE",
+      scope,
+    });
+  } catch (_) {}
+}
+
 async function publishReadyConversationState(
   tabId,
   expectedChatUrl = null,
-  { submitScraped = false } = {},
+  { submitScraped = false, expectedChatId = null, minCapturedAt = 0 } = {},
 ) {
-  let ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
-  debugLog("ready_ack", ready);
+  const expectedSiteConfig = expectedChatUrl
+    ? getSiteConfigByUrl(expectedChatUrl)
+    : getSiteConfig(activeTarget);
+  const allowNetworkReadyFallback =
+    submitScraped && expectedSiteConfig?.siteId === "deepseek";
+  const readyTimeoutMs = allowNetworkReadyFallback ? 8_000 : 30_000;
+  const fallbackReady = {
+    ok: false,
+    ready: false,
+    chatUrl: expectedChatUrl || null,
+    chatId: expectedChatId || null,
+    transcriptCount: 0,
+    transcriptHash: null,
+    messages: [],
+  };
+  const readyPromise = (async () => {
+    try {
+      return await waitForChatReadyInTab(tabId, expectedChatUrl, readyTimeoutMs);
+    } catch (err) {
+      if (!allowNetworkReadyFallback) {
+        throw err;
+      }
+      debugLog("ready_fallback_network", {
+        expectedChatUrl,
+        expectedChatId,
+        reason: err?.message || String(err),
+      });
+      return fallbackReady;
+    }
+  })();
+  let ready = allowNetworkReadyFallback ? fallbackReady : await readyPromise;
+  if (!allowNetworkReadyFallback) {
+    debugLog("ready_ack", ready);
+  }
 
   // If we got empty messages on a conversation page, retry once after a delay
   const convSiteConfig = expectedChatUrl ? getSiteConfigByUrl(expectedChatUrl) : null;
   const isConversationPage = expectedChatUrl && convSiteConfig?.conversationUrlPattern?.test(expectedChatUrl);
-  if (submitScraped && isConversationPage && (!ready.messages || ready.messages.length === 0)) {
+  if (
+    submitScraped &&
+    ready?.ok !== false &&
+    isConversationPage &&
+    (!ready.messages || ready.messages.length === 0) &&
+    expectedSiteConfig?.siteId !== "deepseek"
+  ) {
     debugLog("ready_retry", "empty messages on conversation page, retrying…");
     await new Promise(r => setTimeout(r, 2000));
     ready = await waitForChatReadyInTab(tabId, expectedChatUrl);
@@ -358,18 +423,83 @@ async function publishReadyConversationState(
   }
 
   if (submitScraped) {
+    const scrapeTimeoutMs =
+      expectedSiteConfig?.siteId === "deepseek" ? 20_000 : 15_000;
+    const canonicalChatUrl =
+      expectedSiteConfig?.siteId === "deepseek" && expectedChatUrl
+        ? expectedChatUrl
+        : null;
+    const canonicalChatId =
+      expectedSiteConfig?.siteId === "deepseek" && expectedChatId
+        ? expectedChatId
+        : null;
     // Use SCRAPE_MESSAGES for full scroll-and-collect (captures all messages
     // from virtual-scrolling sites like DeepSeek, not just the visible ones).
-    let scrapedMessages = ready.messages || [];
+    let scrapedSnapshot = {
+      messages: ready.messages || [],
+      chatUrl: canonicalChatUrl || ready.chatUrl || expectedChatUrl || null,
+      chatId: canonicalChatId || ready.chatId || expectedChatId || null,
+      siteHostname:
+        hostnameFromUrl(canonicalChatUrl || ready.chatUrl || expectedChatUrl),
+      capturedAt: Date.now(),
+      source: "dom",
+    };
     try {
-      const scrapeResult = await sendToContentScript(tabId, { type: "SCRAPE_MESSAGES" });
-      if (scrapeResult?.ok && scrapeResult.messages?.length > 0) {
-        scrapedMessages = scrapeResult.messages;
+      const scrapeResult = await sendToContentScript(tabId, {
+        type: "SCRAPE_MESSAGES",
+        expectedChatUrl,
+        expectedChatId,
+        minCapturedAt,
+        timeoutMs: scrapeTimeoutMs,
+      });
+      if (scrapeResult?.ok && Array.isArray(scrapeResult.messages)) {
+        scrapedSnapshot = {
+          messages: scrapeResult.messages,
+          chatUrl:
+            canonicalChatUrl ||
+            scrapeResult.chatUrl ||
+            ready.chatUrl ||
+            expectedChatUrl ||
+            null,
+          chatId:
+            canonicalChatId ||
+            scrapeResult.chatId ||
+            ready.chatId ||
+            expectedChatId ||
+            null,
+          siteHostname:
+            hostnameFromUrl(
+              canonicalChatUrl ||
+              scrapeResult.chatUrl ||
+              ready.chatUrl ||
+              expectedChatUrl,
+            ) || scrapeResult.siteHostname || hostnameFromUrl(ready.chatUrl),
+          capturedAt: Number(scrapeResult.capturedAt) || Date.now(),
+          source: scrapeResult.source || "dom",
+        };
       }
     } catch (_) { /* fall back to ready.messages */ }
+    if (allowNetworkReadyFallback) {
+      try {
+        ready = await readyPromise;
+      } catch (err) {
+        debugLog("ready_post_scrape_error", {
+          expectedChatUrl,
+          expectedChatId,
+          reason: err?.message || String(err),
+        });
+        ready = fallbackReady;
+      }
+      debugLog("ready_ack", ready);
+    }
     await serverPost("/chat_history", {
       action: "submit_scraped",
-      messages: scrapedMessages,
+      messages: scrapedSnapshot.messages,
+      chatUrl: scrapedSnapshot.chatUrl,
+      chatId: scrapedSnapshot.chatId,
+      siteHostname: scrapedSnapshot.siteHostname,
+      capturedAt: scrapedSnapshot.capturedAt,
+      source: scrapedSnapshot.source,
     });
   }
 
@@ -445,8 +575,12 @@ async function pollForCommand() {
   if (!zoteroConnected) return;
   try {
     const data = await fetch(`${SERVER}/poll_command`).then(r => r.json());
-    // Update activeTarget from relay
+    // Update activeTarget from relay — clear stale tab if target changed
     if (data.active_target && SITE_CONFIGS[data.active_target]) {
+      if (activeTarget !== data.active_target) {
+        activeChatTabId = null;
+        console.log(`[sync-zotero] poll_command: target changed ${activeTarget} → ${data.active_target}, cleared activeChatTabId`);
+      }
       activeTarget = data.active_target;
     }
     if (!data.command) return;
@@ -493,6 +627,7 @@ async function pollForCommand() {
       }
       broadcastStatus("idle", "New chat — ready for next query");
     } else if (cmd.type === "LOAD_CHAT" && cmd.chatUrl) {
+      const loadStartedAt = Date.now();
       await reportTurnState({
         remote_chat_url: cmd.chatUrl,
         remote_chat_id: cmd.chatId || null,
@@ -529,6 +664,7 @@ async function pollForCommand() {
         // Use the content script to navigate via window.location for a clean reload.
         try {
           await ensureContentScript(tabId);
+          await resetNetworkCacheInTab(tabId, "all");
           await new Promise((resolve) => {
             chrome.tabs.sendMessage(tabId, { type: "NAVIGATE", url: cmd.chatUrl }, () => {
               void chrome.runtime.lastError;
@@ -553,6 +689,8 @@ async function pollForCommand() {
       try {
         await publishReadyConversationState(tabId, cmd.chatUrl, {
           submitScraped: true,
+          expectedChatId: cmd.chatId || null,
+          minCapturedAt: loadStartedAt,
         });
       } catch (err) {
         console.warn("[sync-zotero] Scraping error:", err);
@@ -570,19 +708,47 @@ async function pollForCommand() {
 
       broadcastStatus("idle", "Loaded past chat — ready for follow-up");
     } else if (cmd.type === "SCRAPE_HISTORY") {
-      // Plugin is requesting a fresh history scrape
-      let tabId = activeChatTabId;
+      // Plugin is requesting a fresh history scrape.
+      // Always use a background-safe home tab for the active target. DeepSeek's
+      // sidebar/history bootstrap is network-backed; reloading a background home
+      // tab keeps history fetching independent of focus and virtualized DOM state.
+      const historyStartedAt = Date.now();
+      const scrapeSiteConfig = getSiteConfig(activeTarget);
+      const scrapeTabs = await chrome.tabs.query({ url: scrapeSiteConfig.urlPattern });
+      let tabId = findSiteHomeTab(scrapeTabs, scrapeSiteConfig)?.id || null;
       if (!tabId) {
-        const scrapeSiteConfig = getSiteConfig(activeTarget);
-        const tabs = await chrome.tabs.query({ url: scrapeSiteConfig.urlPattern });
-        if (tabs.length > 0) { tabId = tabs[0].id; activeChatTabId = tabId; }
+        const tab = await chrome.tabs.create({
+          url: scrapeSiteConfig.homeUrl,
+          active: false,
+        });
+        await waitForTabLoad(tab.id);
+        tabId = tab.id;
+      } else {
+        await resetNetworkCacheInTab(tabId, "history");
+        await reloadTab(tabId);
+        await waitForTabLoad(tabId);
       }
       if (tabId) {
         try {
-          chrome.tabs.sendMessage(tabId, { type: "SCRAPE_HISTORY_NOW" }, () => {
-            void chrome.runtime.lastError;
+          await ensureContentScript(tabId);
+          const result = await sendToContentScript(tabId, {
+            type: "SCRAPE_HISTORY_NOW",
+            force: true,
+            minCapturedAt: historyStartedAt,
+            timeoutMs: 15_000,
           });
-        } catch (_) {}
+          if (!result?.ok) {
+            throw new Error(result?.error || "Failed to scrape history.");
+          }
+        } catch (_) {
+          await serverPost("/update_chat_history", {
+            sessions: [],
+            siteHostname: hostnameFromUrl(scrapeSiteConfig.homeUrl),
+            scrapedAt: Date.now(),
+            source: null,
+            status: "timeout",
+          }).catch(() => {});
+        }
       }
     } else if (cmd.type === "ENSURE_TAB") {
       // Open the target site tab if none is currently open (auto-open on preload)
@@ -616,8 +782,18 @@ async function pollForCommand() {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "HISTORY_UPDATE") {
-    // Forward the scraped history to the relay server
-    serverPost("/update_chat_history", { sessions: message.history })
+    // Forward the scraped history to the relay server.
+    // Include siteHostname so the relay can merge per-site (e.g. empty
+    // DeepSeek scrape clears only DeepSeek entries, not ChatGPT's).
+    const siteHostname = message.siteHostname || null;
+    const scrapedAt = Number(message.scrapedAt) || Date.now();
+    serverPost("/update_chat_history", {
+      sessions: message.history,
+      siteHostname,
+      scrapedAt,
+      source: message.source || null,
+      status: message.status || null,
+    })
       .then(() => console.log(`[sync-zotero] History updated: ${message.history?.length} sessions`))
       .catch((err) => console.warn("[sync-zotero] History update failed:", err.message));
   }
@@ -728,7 +904,7 @@ async function runPipeline(query) {
 
     const readyState = await publishReadyConversationState(
       tab.id,
-      shouldNavigateFresh ? null : null,
+      shouldNavigateFresh ? null : (tab.url || null),
       { submitScraped: false },
     );
 
@@ -773,8 +949,19 @@ async function runPipeline(query) {
       attempt,
     });
 
-    if (runState === "done" && !shared.hasMeaningfulAssistantText(responseText)) {
-      throw new Error(`${siteLabel} did not produce a visible final answer.`);
+    let finalRunState = runState;
+    let finalCompletionReason = completionReason || null;
+    if (finalRunState === "done" && !shared.hasMeaningfulAssistantText(responseText)) {
+      const hasPartialContext =
+        Boolean((thinkingText || "").trim()) ||
+        Number(answerRevision || 0) > 0 ||
+        Number(thinkingRevision || 0) > 0;
+      if (hasPartialContext) {
+        finalRunState = "incomplete";
+        finalCompletionReason = finalCompletionReason || "error";
+      } else {
+        throw new Error(`${siteLabel} did not produce a visible final answer.`);
+      }
     }
 
     await serverPost("/submit_response", {
@@ -786,8 +973,8 @@ async function runPipeline(query) {
       answer_anchor_id: answerAnchorId || null,
       answer_revision: answerRevision || 0,
       thinking_revision: thinkingRevision || 0,
-      run_state: runState,
-      completion_reason: completionReason || null,
+      run_state: finalRunState,
+      completion_reason: finalCompletionReason,
       final_transcript_hash: finalTranscriptHash || null,
       verified_at: verifiedAt || null,
       remote_chat_url: remoteChatUrl || null,
@@ -796,7 +983,9 @@ async function runPipeline(query) {
       assistant_turn_key: assistantTurnKey || null,
       baseline_transcript_count: baselineTranscriptCount || 0,
       baseline_transcript_hash: baselineTranscriptHash || null,
-      turn_status: turnStatus || (runState === "incomplete" ? "incomplete" : "done"),
+      turn_status:
+        turnStatus ||
+        (finalRunState === "incomplete" ? "incomplete" : "done"),
     });
 
     // Capture the conversation URL for history persistence (works for all sites)
@@ -809,8 +998,8 @@ async function runPipeline(query) {
     } catch (_) {}
 
     broadcastStatus(
-      runState === "incomplete" ? "error" : "done",
-      runState === "incomplete"
+      finalRunState === "incomplete" ? "error" : "done",
+      finalRunState === "incomplete"
         ? "Captured partial response — final answer not verified"
         : "Response sent to GUI",
     );
@@ -1067,6 +1256,15 @@ async function ensureTabReady(tabId) {
   });
 }
 
+async function reloadTab(tabId) {
+  await new Promise((resolve) => {
+    chrome.tabs.reload(tabId, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
 async function ensureContentScript(tabId) {
   // Always inject the MAIN world script (SSE interceptor).
   // It has its own __syncZoteroFetchPatched guard to avoid double-patching,
@@ -1094,8 +1292,16 @@ async function ensureContentScript(tabId) {
     files:  ["content_script.js"],
   });
 
-  // Wait for it to initialise
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Poll briefly instead of always paying a fixed 1s delay after injection.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const ready = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
+        resolve(!chrome.runtime.lastError && res?.pong === true);
+      });
+    });
+    if (ready) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 // ---------------------------------------------------------------------------
