@@ -1,5 +1,7 @@
 # Sync for Zotero
 
+[中文说明](README_CN.md)
+
 A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero](https://github.com/yat-lok/llm-for-zotero) plugin. It connects Zotero to ChatGPT via the browser: uploading PDFs, running prompts, and returning markdown results back to Zotero.
 
 > **This extension is not a standalone tool.** It requires the LLM for Zotero plugin (v3.7.17 or later) with **webchat mode** selected in the plugin preferences.
@@ -31,11 +33,25 @@ A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero]
 
 ### Updating
 
-When a new version is available:
+When a new version is available, choose one of the following methods depending on how you installed the extension:
 
-1. Pull the latest changes (`git pull`) or download the new release
-2. Go to `chrome://extensions/`
-3. Click the reload icon on the "Sync for Zotero" card
+#### Option A: Git (if you cloned the repository)
+
+1. Open a terminal and navigate to the cloned repository folder
+2. Run `git pull` to fetch the latest changes
+3. Open `chrome://extensions/` in Chrome
+4. Find the "Sync for Zotero" card and click the **reload** (↻) icon
+5. Done — the extension is now updated
+
+#### Option B: ZIP download (if you downloaded the release)
+
+1. Download the latest `extension.zip` from the [Releases](https://github.com/yat-lok/sync-for-zotero/releases) page
+2. Unzip the file and **replace** the old `extension/` folder with the new one
+3. Open `chrome://extensions/` in Chrome
+4. Find the "Sync for Zotero" card and click the **reload** (↻) icon
+5. Done — the extension is now updated
+
+> **Tip:** Do not delete the old folder from Chrome and re-load it. Simply replacing the files and clicking reload preserves your extension settings.
 
 ## Usage
 
