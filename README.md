@@ -2,7 +2,7 @@
 
 [中文说明](README_CN.md)
 
-A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero](https://github.com/yat-lok/llm-for-zotero) plugin. It connects Zotero to ChatGPT via the browser: uploading PDFs, running prompts, and returning markdown results back to Zotero.
+A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero](https://github.com/yilewang/llm-for-zotero) plugin. It connects Zotero to ChatGPT via the browser: uploading PDFs, running prompts, and returning markdown results back to Zotero.
 
 > **This extension is not a standalone tool.** It requires the LLM for Zotero plugin (v3.7.17 or later) with **webchat mode** selected in the plugin preferences.
 
@@ -15,7 +15,7 @@ A Chrome extension that works as the **webchat bridge** for the [LLM for Zotero]
 
 ## Prerequisites
 
-- [Zotero](https://www.zotero.org/) with the **[LLM for Zotero](https://github.com/yat-lok/llm-for-zotero) plugin v3.7.17+** installed
+- [Zotero](https://www.zotero.org/) with the **[LLM for Zotero](https://github.com/yilewang/llm-for-zotero) plugin v3.7.17+** installed
 - In LLM for Zotero preferences, set the mode to **webchat**
 - A ChatGPT account (you must keep a tab open at chatgpt.com while using the extension)
 
@@ -45,7 +45,7 @@ When a new version is available, choose one of the following methods depending o
 
 #### Option B: ZIP download (if you downloaded the release)
 
-1. Download the latest `extension.zip` from the [Releases](https://github.com/yat-lok/sync-for-zotero/releases) page
+1. Download the latest `extension.zip` from the [Releases](https://github.com/yilewang/sync-for-zotero/releases) page
 2. Unzip the file and **replace** the old `extension/` folder with the new one
 3. Open `chrome://extensions/` in Chrome
 4. Find the "Sync for Zotero" card and click the **reload** (↻) icon
