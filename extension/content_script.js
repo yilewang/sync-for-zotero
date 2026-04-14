@@ -1141,11 +1141,12 @@ async function submitMessageAndVerify(promptText) {
 let sseText = "";
 let sseThinking = null;
 let sseDone = false;
+let sseDoneAt = 0; // timestamp when sseDone first became true (0 = not done)
 let outboundRequestSerial = 0;
 let outboundRequestEvents = [];
 let activeConversationStreamCount = 0;
 let lastTransportActivityAt = 0;
-let historyScrapeInFlight = false;
+let historyScrapeInFlight = null; // null | Promise — concurrent callers wait
 let lastScrapeDebug = null;
 
 function mergeStreamFragments(previous, next) {
@@ -1237,9 +1238,12 @@ window.addEventListener("message", (event) => {
     // actual answer stream — their [DONE] should not end the pipeline.
     if (event.data.done) {
       const activeCount = Number(event.data.activeStreamCount) || 0;
+      const wasDone = sseDone;
       sseDone = activeCount <= 1;
+      if (sseDone && !wasDone) sseDoneAt = Date.now();
     } else {
       sseDone = false;
+      sseDoneAt = 0;
     }
     lastTransportActivityAt = Date.now();
     return;
@@ -1249,6 +1253,7 @@ window.addEventListener("message", (event) => {
     // Reset done flag so the previous stream's [DONE] doesn't
     // cause premature pipeline exit.
     sseDone = false;
+    sseDoneAt = 0;
     lastTransportActivityAt = Date.now();
     return;
   }
@@ -1347,9 +1352,10 @@ function hasBusyComposerHint() {
 
 function isConversationStillRunning(stopBtn = findStopButton()) {
   // Grace period: treat the conversation as still running if we saw transport
-  // activity within the last 3 seconds. This bridges brief gaps between
-  // tool-use streams where the stop button may momentarily vanish.
-  const recentActivity = (Date.now() - lastTransportActivityAt) < 3000;
+  // activity recently. Bridges gaps between sequential streams — ChatGPT's
+  // "text → think → text" and DeepSeek's agentic tool-use phases can have
+  // pauses of several seconds between streams.
+  const recentActivity = (Date.now() - lastTransportActivityAt) < 8000;
   return Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint() || recentActivity;
 }
 
@@ -1555,6 +1561,7 @@ async function streamResponseSnapshots(
   sseText = "";
   sseThinking = null;
   sseDone = false;
+  sseDoneAt = 0;
   resetTurnDebug(seq, attempt);
 
   const baseline = baselineTranscript || extractConversationTranscript();
@@ -1892,15 +1899,22 @@ async function streamResponseSnapshots(
     const thinkingVisible = Boolean(thinkingText);
     const quietSinceMs = nowMs - Math.max(lastAnyProgressAt, lastTransportActivityAt || 0);
 
-    // Detect tool-use patterns in SSE text to adapt completion timing.
-    // Once detected, stays true for the entire turn.
+    // Detect tool-use patterns in SSE text or DOM content to adapt completion
+    // timing. Once detected, stays true for the entire turn. Check both SSE
+    // stream text and DOM-rendered content, since DeepSeek's agentic status
+    // messages (e.g. "Found N web pages") may only appear in the DOM.
     if (!toolUseDetected) {
       const rawSse = (sseText || "").toLowerCase();
+      const rawDom = (answerText || "").toLowerCase();
+      const rawThinking = (thinkingText || "").toLowerCase();
+      const combinedText = rawSse + " " + rawDom + " " + rawThinking;
       if (
-        /reading\s+documents?/i.test(rawSse) ||
-        /searching(\s+the\s+web)?/i.test(rawSse) ||
-        /analyzing/i.test(rawSse) ||
-        /browsing/i.test(rawSse) ||
+        /reading\s+documents?/i.test(combinedText) ||
+        /searching(\s+the\s+web)?/i.test(combinedText) ||
+        /analyzing/i.test(combinedText) ||
+        /browsing/i.test(combinedText) ||
+        /found\s+\d+\s+web\s+pages?/i.test(combinedText) ||
+        /read\s+\d+\s+pages?/i.test(combinedText) ||
         activeConversationStreamCount > 1
       ) {
         toolUseDetected = true;
@@ -2040,8 +2054,12 @@ async function streamResponseSnapshots(
     // answer text AND ChatGPT's stop button is gone, emit the response directly.
     // This bypasses the DOM-based completion tracker which can fail for thinking
     // model responses where DOM answer extraction returns empty.
+    // Require a settle period after sseDone to bridge gaps between sequential
+    // streams (e.g., ChatGPT "text → think → text" or DeepSeek agentic phases).
+    const sseDoneSettleMs = toolUseDetected ? 15_000 : 5_000;
+    const sseSettled = sseDoneAt > 0 && (nowMs - sseDoneAt) >= sseDoneSettleMs;
     if (
-      sseDone &&
+      sseSettled &&
       activeConversationStreamCount === 0 &&
       shared.hasMeaningfulAssistantText(sseText) &&
       !stopBtn &&
@@ -2125,13 +2143,18 @@ async function streamResponseSnapshots(
       }
     }
 
+    // DeepSeek-specific fast completion: require a longer quiet period when
+    // tool-use (web search, reading pages) was detected, to bridge gaps
+    // between agentic workflow phases.
+    const deepseekQuietThresholdMs = toolUseDetected ? 20_000 : 1_500;
+    const deepseekIncompleteThresholdMs = toolUseDetected ? 25_000 : 5_000;
     if (
       SITE_ADAPTER?.siteId === "deepseek" &&
       !activeRun &&
       !stopBtn &&
       !hasBusyComposerHint() &&
       (Boolean(requestContext) || Boolean(assistantTurnKey)) &&
-      quietSinceMs >= 1_500 &&
+      quietSinceMs >= deepseekQuietThresholdMs &&
       completion.phase !== "verified_done"
     ) {
       const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
@@ -2144,6 +2167,7 @@ async function streamResponseSnapshots(
           seq,
           attempt,
           quietSinceMs,
+          toolUseDetected,
           domAnswerLen: lastAnswerText.length,
           sseTextLen: (sseText || "").length,
           usedSse: finalText === sseText && finalText !== lastAnswerText,
@@ -2171,7 +2195,7 @@ async function streamResponseSnapshots(
         return;
       }
 
-      if (thinkingVisible && quietSinceMs >= 5_000) {
+      if (thinkingVisible && quietSinceMs >= deepseekIncompleteThresholdMs) {
         recordTurnDebug("deepseek_quiescent_incomplete", {
           seq,
           attempt,
@@ -4085,120 +4109,131 @@ function collectHistoryEntries() {
 }
 
 async function scrapeHistory(options = {}) {
-  if (historyScrapeInFlight) return;
-  historyScrapeInFlight = true;
+  if (historyScrapeInFlight) {
+    // Another scrape is running — wait for it instead of silently dropping.
+    try { return await historyScrapeInFlight; }
+    catch { return { ok: false, error: "concurrent scrape failed" }; }
+  }
+  const promise = _doScrapeHistory(options);
+  historyScrapeInFlight = promise;
   try {
-    const isDeepSeek = window.location.hostname === "chat.deepseek.com";
-    const minCapturedAt = Number(options.minCapturedAt) || 0;
-    const timeoutMs = Number(options.timeoutMs) || 15_000;
-    let history = null;
-    let scrapedAt = Date.now();
-    let source = "dom";
-    let status = "ok";
-    let networkStatus = null;
+    return await promise;
+  } finally {
+    if (historyScrapeInFlight === promise) {
+      historyScrapeInFlight = null;
+    }
+  }
+}
 
-    if (isDeepSeek) {
-      const networkSnapshot = await waitForDeepSeekHistorySnapshot({
-        minCapturedAt,
-        timeoutMs,
-      });
-      if (networkSnapshot) {
-        networkStatus = networkSnapshot.status || "empty";
-        if (networkStatus === "ok" || networkStatus === "empty") {
-          history = networkSnapshot.history;
-          scrapedAt = networkSnapshot.capturedAt || Date.now();
-          source = networkSnapshot.source || "network";
-          status = networkStatus;
-        }
+async function _doScrapeHistory(options = {}) {
+  const isDeepSeek = window.location.hostname === "chat.deepseek.com";
+  const minCapturedAt = Number(options.minCapturedAt) || 0;
+  const timeoutMs = Number(options.timeoutMs) || 15_000;
+  let history = null;
+  let scrapedAt = Date.now();
+  let source = "dom";
+  let status = "ok";
+  let networkStatus = null;
+
+  if (isDeepSeek) {
+    const networkSnapshot = await waitForDeepSeekHistorySnapshot({
+      minCapturedAt,
+      timeoutMs,
+    });
+    if (networkSnapshot) {
+      networkStatus = networkSnapshot.status || "empty";
+      if (networkStatus === "ok" || networkStatus === "empty") {
+        history = networkSnapshot.history;
+        scrapedAt = networkSnapshot.capturedAt || Date.now();
+        source = networkSnapshot.source || "network";
+        status = networkStatus;
       }
     }
+  }
 
-    if (!Array.isArray(history)) {
-      const attempts = isDeepSeek ? 4 : 2;
-      const initialDelayMs = isDeepSeek ? 600 : 150;
-      const retryDelayMs = isDeepSeek ? 700 : 300;
+  if (!Array.isArray(history)) {
+    const attempts = isDeepSeek ? 4 : 2;
+    const initialDelayMs = isDeepSeek ? 600 : 150;
+    const retryDelayMs = isDeepSeek ? 700 : 300;
 
-      await workerSleep(initialDelayMs);
+    await workerSleep(initialDelayMs);
 
-      history = [];
-      let deepSeekRootSeen = false;
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        if (isDeepSeek) {
-          const collected = collectDeepSeekHistoryEntriesWithRoot();
-          history = collected.history;
-          if (collected.root) {
-            deepSeekRootSeen = true;
-          }
-        } else {
-          history = collectHistoryEntries();
-        }
-        if (history.length > 0 || attempt === attempts - 1) {
-          break;
-        }
-        await workerSleep(retryDelayMs);
-      }
-      scrapedAt = Date.now();
-      source = "dom";
+    history = [];
+    let deepSeekRootSeen = false;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       if (isDeepSeek) {
-        if (history.length > 0) {
-          status = "ok";
-        } else if (deepSeekRootSeen) {
-          status = "empty";
-        } else if (networkStatus === "invalid_source") {
-          status = "invalid_source";
-          source = "network";
-        } else {
-          status = "timeout";
+        const collected = collectDeepSeekHistoryEntriesWithRoot();
+        history = collected.history;
+        if (collected.root) {
+          deepSeekRootSeen = true;
         }
       } else {
-        status = history.length > 0 ? "ok" : "empty";
+        history = collectHistoryEntries();
       }
-    }
-
-    const historyJson = JSON.stringify({
-      history,
-      status,
-      siteHostname: window.location.hostname,
-    });
-    if (
-      historyJson !== lastHistoryJson ||
-      options.force === true ||
-      minCapturedAt > 0
-    ) {
-      lastHistoryJson = historyJson;
-      // Include siteHostname so the relay can merge per-site
-      // (only replace this site's entries, keep other sites intact).
-      const siteHostname = window.location.hostname;
-      try {
-        chrome.runtime.sendMessage(
-          {
-            type: "HISTORY_UPDATE",
-            history,
-            siteHostname,
-            scrapedAt,
-            source,
-            status,
-          },
-          () => {
-            // Suppress "Receiving end does not exist" when service worker is inactive
-            void chrome.runtime.lastError;
-          },
-        );
-      } catch (e) {
-        // Extension context invalidated (extension reloaded while page still open)
+      if (history.length > 0 || attempt === attempts - 1) {
+        break;
       }
+      await workerSleep(retryDelayMs);
     }
-    return {
-      ok: true,
-      history,
-      siteHostname: window.location.hostname,
-      scrapedAt,
-      source,
-      status,
-    };
-  } finally {
-    historyScrapeInFlight = false;
+    scrapedAt = Date.now();
+    source = "dom";
+    if (isDeepSeek) {
+      if (history.length > 0) {
+        status = "ok";
+      } else if (deepSeekRootSeen) {
+        status = "empty";
+      } else if (networkStatus === "invalid_source") {
+        status = "invalid_source";
+        source = "network";
+      } else {
+        status = "timeout";
+      }
+    } else {
+      status = history.length > 0 ? "ok" : "empty";
+    }
   }
+
+  const historyJson = JSON.stringify({
+    history,
+    status,
+    siteHostname: window.location.hostname,
+  });
+  if (
+    historyJson !== lastHistoryJson ||
+    options.force === true ||
+    minCapturedAt > 0
+  ) {
+    lastHistoryJson = historyJson;
+    // Include siteHostname so the relay can merge per-site
+    // (only replace this site's entries, keep other sites intact).
+    const siteHostname = window.location.hostname;
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: "HISTORY_UPDATE",
+          history,
+          siteHostname,
+          scrapedAt,
+          source,
+          status,
+        },
+        () => {
+          // Suppress "Receiving end does not exist" when service worker is inactive
+          void chrome.runtime.lastError;
+        },
+      );
+    } catch (e) {
+      // Extension context invalidated (extension reloaded while page still open)
+    }
+  }
+  return {
+    ok: true,
+    history,
+    siteHostname: window.location.hostname,
+    scrapedAt,
+    source,
+    status,
+  };
 }
 
 function shouldAutoScrapeHistory() {

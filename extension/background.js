@@ -570,6 +570,66 @@ async function pollForStop() {
   } catch (_) {}
 }
 
+/**
+ * ChatGPT: DOM-based history scrape.
+ * The sidebar is rendered by React and already present in the DOM.
+ * Never reload — just scrape the existing page.
+ */
+async function scrapeChatGPTHistory(siteConfig, historyStartedAt) {
+  const tabs = await chrome.tabs.query({ url: siteConfig.urlPattern });
+  let tabId = tabs.length > 0 ? tabs[0].id : null;
+
+  if (!tabId) {
+    // No ChatGPT tab — create one and wait for page load
+    const tab = await chrome.tabs.create({ url: siteConfig.homeUrl, active: false });
+    await waitForTabLoad(tab.id);
+    tabId = tab.id;
+  }
+
+  await ensureContentScript(tabId);
+  return sendToContentScript(tabId, {
+    type: "SCRAPE_HISTORY_NOW",
+    force: true,
+    minCapturedAt: historyStartedAt,
+    timeoutMs: 15_000,
+  });
+}
+
+/**
+ * DeepSeek: Network-capture-based history scrape.
+ * History is extracted from intercepted fetch/XHR responses during page load.
+ * Must reload (or navigate to home) so the network bootstrap captures fresh data.
+ */
+async function scrapeDeepSeekHistory(siteConfig, historyStartedAt) {
+  const tabs = await chrome.tabs.query({ url: siteConfig.urlPattern });
+  let tabId = findSiteHomeTab(tabs, siteConfig)?.id || null;
+
+  if (tabId) {
+    // Home tab exists — reload to trigger fresh network capture
+    await resetNetworkCacheInTab(tabId, "history");
+    await reloadTab(tabId);
+    await waitForTabLoad(tabId);
+  } else if (tabs.length > 0) {
+    // Site tab exists but not on home — navigate it to home
+    tabId = tabs[0].id;
+    await chrome.tabs.update(tabId, { url: siteConfig.homeUrl });
+    await waitForTabLoad(tabId);
+  } else {
+    // No tab — create one in background
+    const tab = await chrome.tabs.create({ url: siteConfig.homeUrl, active: false });
+    await waitForTabLoad(tab.id);
+    tabId = tab.id;
+  }
+
+  await ensureContentScript(tabId);
+  return sendToContentScript(tabId, {
+    type: "SCRAPE_HISTORY_NOW",
+    force: true,
+    minCapturedAt: historyStartedAt,
+    timeoutMs: 15_000,
+  });
+}
+
 async function pollForCommand() {
   if (pipelineRunning) return;
   if (!zoteroConnected) return;
@@ -708,48 +768,28 @@ async function pollForCommand() {
 
       broadcastStatus("idle", "Loaded past chat — ready for follow-up");
     } else if (cmd.type === "SCRAPE_HISTORY") {
-      // Plugin is requesting a fresh history scrape.
-      // Always use a background-safe home tab for the active target. DeepSeek's
-      // sidebar/history bootstrap is network-backed; reloading a background home
-      // tab keeps history fetching independent of focus and virtualized DOM state.
       const historyStartedAt = Date.now();
       const scrapeSiteConfig = getSiteConfig(activeTarget);
-      const scrapeTabs = await chrome.tabs.query({ url: scrapeSiteConfig.urlPattern });
-      let tabId = findSiteHomeTab(scrapeTabs, scrapeSiteConfig)?.id || null;
-      if (!tabId) {
-        const tab = await chrome.tabs.create({
-          url: scrapeSiteConfig.homeUrl,
-          active: false,
-        });
-        await waitForTabLoad(tab.id);
-        tabId = tab.id;
-      } else {
-        await resetNetworkCacheInTab(tabId, "history");
-        await reloadTab(tabId);
-        await waitForTabLoad(tabId);
+
+      let scrapeResult = null;
+      try {
+        const scrape = scrapeSiteConfig.siteId === "chatgpt"
+          ? scrapeChatGPTHistory
+          : scrapeDeepSeekHistory;
+        scrapeResult = await scrape(scrapeSiteConfig, historyStartedAt);
+      } catch (_) {
+        // Communication failure — content script never ran.
+        // Post timeout metadata so the plugin's polling loop can exit.
+        await serverPost("/update_chat_history", {
+          sessions: [],
+          siteHostname: hostnameFromUrl(scrapeSiteConfig.homeUrl),
+          scrapedAt: Date.now(),
+          source: null,
+          status: "timeout",
+        }).catch(() => {});
       }
-      if (tabId) {
-        try {
-          await ensureContentScript(tabId);
-          const result = await sendToContentScript(tabId, {
-            type: "SCRAPE_HISTORY_NOW",
-            force: true,
-            minCapturedAt: historyStartedAt,
-            timeoutMs: 15_000,
-          });
-          if (!result?.ok) {
-            throw new Error(result?.error || "Failed to scrape history.");
-          }
-        } catch (_) {
-          await serverPost("/update_chat_history", {
-            sessions: [],
-            siteHostname: hostnameFromUrl(scrapeSiteConfig.homeUrl),
-            scrapedAt: Date.now(),
-            source: null,
-            status: "timeout",
-          }).catch(() => {});
-        }
-      }
+      // If scrapeResult came back but !ok, the content script already posted
+      // its own HISTORY_UPDATE — no duplicate post needed from here.
     } else if (cmd.type === "ENSURE_TAB") {
       // Open the target site tab if none is currently open (auto-open on preload)
       const ensureConfig = getSiteConfig(activeTarget);
