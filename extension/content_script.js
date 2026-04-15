@@ -185,17 +185,26 @@ const shared = globalThis.SyncZoteroShared || {
   },
   hasMeaningfulAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
-    return normalized.length > 1 &&
-      normalized !== "thinking" &&
-      normalized !== "thinking..." &&
-      normalized !== "stopped thinking" &&
-      normalized !== "quick answer" &&
-      normalized !== "stopped thinking quick answer" &&
-      !/^thought for .+$/.test(normalized) &&
-      !/^reading\s+documents?\.?$/i.test(normalized) &&
-      !/^searching(\s+the\s+web)?\.?$/i.test(normalized) &&
-      !/^analyzing\.?$/i.test(normalized) &&
-      !/^browsing\.?$/i.test(normalized);
+    if (normalized.length <= 1) return false;
+    if (
+      normalized === "thinking" ||
+      normalized === "thinking..." ||
+      normalized === "stopped thinking" ||
+      normalized === "quick answer" ||
+      normalized === "stopped thinking quick answer"
+    ) return false;
+    if (/^thought for .+$/.test(normalized)) return false;
+    if (/^reading\s+documents?\.?$/i.test(normalized)) return false;
+    if (/^searching(\s+the\s+web)?\.?$/i.test(normalized)) return false;
+    if (/^analyzing\.?$/i.test(normalized)) return false;
+    if (/^browsing\.?$/i.test(normalized)) return false;
+    // Chinese equivalents (DeepSeek Chinese UI)
+    const raw = String(text || "").trim().replace(/\s+/g, " ");
+    if (raw === "思考中" || raw === "思考中..." || raw === "深度思考" || raw === "停止思考") return false;
+    if (/^已深度思考/.test(raw) || /^已思考/.test(raw) || /^思考了/.test(raw)) return false;
+    if (/^正在阅读/.test(raw) || /^正在搜索/.test(raw) ||
+        /^正在分析/.test(raw) || /^正在浏览/.test(raw)) return false;
+    return true;
   },
   hasDeliverySignal: (snapshot) => {
     if ((snapshot.outboundRequestSerial || 0) > (snapshot.baselineOutboundRequestSerial || 0)) return true;
@@ -2392,13 +2401,15 @@ function isDeepSeekReasoningBlock(block) {
 
     const summary = current.querySelector?.("summary");
     const summaryText = shared.normalizeComposerText(summary?.textContent || "");
-    if (/^thought for\b/i.test(summaryText) || /\b(thinking|reason)\b/i.test(summaryText)) {
+    if (/^thought for\b/i.test(summaryText) || /\b(thinking|reason)\b/i.test(summaryText)
+        || /已?深?度?思考/.test(summaryText) || /思考了/.test(summaryText)) {
       return true;
     }
 
     const prev = current.previousElementSibling;
     const prevText = shared.normalizeComposerText(prev?.textContent || "");
-    if (/^thought for\b/i.test(prevText) || /\b(thinking|reason)\b/i.test(prevText)) {
+    if (/^thought for\b/i.test(prevText) || /\b(thinking|reason)\b/i.test(prevText)
+        || /已?深?度?思考/.test(prevText) || /思考了/.test(prevText)) {
       return true;
     }
   }
@@ -2427,7 +2438,8 @@ function extractDeepSeekAssistantSections(node) {
 
   const rootText = shared.normalizeComposerText(root.textContent || "");
   const rootStartsWithReasoning =
-    /^thought for\b/i.test(rootText) || /^\s*(thinking|reason)/i.test(rootText);
+    /^thought for\b/i.test(rootText) || /^\s*(thinking|reason)/i.test(rootText) ||
+    /^已?深?度?思考/.test(rootText) || /^思考了/.test(rootText);
 
   let answerBlock = null;
   let thinkingBlocks = [];
@@ -2436,7 +2448,13 @@ function extractDeepSeekAssistantSections(node) {
   if (explicitReasoningBlocks.length > 0) {
     thinkingBlocks = explicitReasoningBlocks;
     const answerBlocks = blocks.filter((block) => !block.reasoningLike);
-    answerBlock = answerBlocks[answerBlocks.length - 1] || null;
+    if (answerBlocks.length > 1) {
+      const combinedMarkdown = answerBlocks.map((b) => b.markdown).filter(Boolean).join("\n\n");
+      const combinedText = answerBlocks.map((b) => b.text).filter(Boolean).join(" ");
+      answerBlock = { text: combinedText, markdown: combinedMarkdown, reasoningLike: false };
+    } else {
+      answerBlock = answerBlocks[answerBlocks.length - 1] || null;
+    }
     if (!answerBlock && blocks.length > 1) {
       answerBlock = blocks[blocks.length - 1] || null;
       thinkingBlocks = blocks.slice(0, -1);
@@ -2559,7 +2577,9 @@ function extractDeepSeekAssistantAnswerText(node) {
   }
 
   if (deepSeekCandidates.length > 0) {
-    return deepSeekCandidates[deepSeekCandidates.length - 1].markdown;
+    return deepSeekCandidates.reduce((best, c) =>
+      c.text.length > best.text.length ? c : best
+    ).markdown;
   }
 
   return extractBestAssistantAnswerCandidate(root);
@@ -2646,7 +2666,7 @@ function extractAssistantThinkingText(node) {
     const el = allDetails[i];
     const summary = el.querySelector("summary");
     const summaryText = shared.normalizeComposerText(summary?.textContent || "");
-    if (/thought|thinking|reason/i.test(summaryText)) {
+    if (/thought|thinking|reason/i.test(summaryText) || /思考|推理/.test(summaryText)) {
       const full = shared.normalizeComposerText(el.textContent || "");
       const content = full.startsWith(summaryText)
         ? shared.normalizeComposerText(full.slice(summaryText.length))
@@ -2687,7 +2707,7 @@ function extractThinking() {
     const summary = el.querySelector("summary");
     const summaryText = summary?.textContent?.trim() ?? "";
     // Only grab details blocks that look like thinking (contain "Thought" or "Thinking")
-    if (/thought|thinking|reason/i.test(summaryText)) {
+    if (/thought|thinking|reason/i.test(summaryText) || /思考|推理/.test(summaryText)) {
       // Get text content excluding the summary label
       const full    = el.textContent.trim();
       const content = full.startsWith(summaryText)

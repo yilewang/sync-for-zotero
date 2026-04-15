@@ -14,17 +14,26 @@ const shared = globalThis.SyncZoteroShared || {
   attemptToken: (seq, attempt) => `${Number(seq) || 0}:${Number(attempt) || 0}`,
   hasMeaningfulAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
-    return normalized.length > 1 &&
-      normalized !== "thinking" &&
-      normalized !== "thinking..." &&
-      normalized !== "stopped thinking" &&
-      normalized !== "quick answer" &&
-      normalized !== "stopped thinking quick answer" &&
-      !/^thought for .+$/.test(normalized) &&
-      !/^reading\s+documents?\.?$/i.test(normalized) &&
-      !/^searching(\s+the\s+web)?\.?$/i.test(normalized) &&
-      !/^analyzing\.?$/i.test(normalized) &&
-      !/^browsing\.?$/i.test(normalized);
+    if (normalized.length <= 1) return false;
+    if (
+      normalized === "thinking" ||
+      normalized === "thinking..." ||
+      normalized === "stopped thinking" ||
+      normalized === "quick answer" ||
+      normalized === "stopped thinking quick answer"
+    ) return false;
+    if (/^thought for .+$/.test(normalized)) return false;
+    if (/^reading\s+documents?\.?$/i.test(normalized)) return false;
+    if (/^searching(\s+the\s+web)?\.?$/i.test(normalized)) return false;
+    if (/^analyzing\.?$/i.test(normalized)) return false;
+    if (/^browsing\.?$/i.test(normalized)) return false;
+    // Chinese equivalents (DeepSeek Chinese UI)
+    const raw = String(text || "").trim().replace(/\s+/g, " ");
+    if (raw === "思考中" || raw === "思考中..." || raw === "深度思考" || raw === "停止思考") return false;
+    if (/^已深度思考/.test(raw) || /^已思考/.test(raw) || /^思考了/.test(raw)) return false;
+    if (/^正在阅读/.test(raw) || /^正在搜索/.test(raw) ||
+        /^正在分析/.test(raw) || /^正在浏览/.test(raw)) return false;
+    return true;
   },
 };
 

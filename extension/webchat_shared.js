@@ -48,6 +48,13 @@
     if (/^searching(\s+the\s+web)?\.?$/i.test(collapsed)) return true;
     if (/^analyzing\.?$/i.test(collapsed)) return true;
     if (/^browsing\.?$/i.test(collapsed)) return true;
+    // Chinese equivalents (DeepSeek Chinese UI)
+    if (collapsed === "思考中" || collapsed === "思考中..." ||
+        collapsed === "深度思考" || collapsed === "停止思考") return true;
+    if (/^已深度思考/.test(collapsed) || /^已思考/.test(collapsed) ||
+        /^思考了/.test(collapsed)) return true;
+    if (/^正在阅读/.test(collapsed) || /^正在搜索/.test(collapsed) ||
+        /^正在分析/.test(collapsed) || /^正在浏览/.test(collapsed)) return true;
     return false;
   }
 
