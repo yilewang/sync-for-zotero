@@ -44,10 +44,18 @@ chrome.runtime.sendMessage({ type: "GET_FULL_STATUS" }, (status) => {
     try {
       const urlObj = new URL(status.chatUrl);
       const shortPath = urlObj.pathname.slice(0, 20) + "…";
-      info.innerHTML = `🔗 <a href="${status.chatUrl}" target="_blank">${urlObj.hostname}${shortPath}</a>`;
+      info.textContent = "🔗 ";
+      const link = document.createElement("a");
+      link.href = urlObj.href;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = `${urlObj.hostname}${shortPath}`;
+      info.appendChild(link);
     } catch {
-      info.innerHTML = "";
+      info.textContent = "";
     }
+  } else {
+    info.textContent = "";
   }
 });
 

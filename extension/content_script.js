@@ -221,6 +221,7 @@ const shared = globalThis.SyncZoteroShared || {
 
 const WEBCHAT_DEBUG = false;
 const TURN_DEBUG_EVENT_LIMIT = 200;
+const RESPONSE_TIMEOUT_MS = 60 * 60_000;
 let turnDebugEvents = [];
 let activeTurnDebugToken = null;
 
@@ -1565,7 +1566,7 @@ async function streamResponseSnapshots(
   promptText = "",
   attachmentFingerprint = "",
   submissionMeta = null,
-  timeoutMs = 180000,
+  timeoutMs = RESPONSE_TIMEOUT_MS,
 ) {
   sseText = "";
   sseThinking = null;
@@ -3975,7 +3976,7 @@ if (!window.__syncZoteroListenerRegistered) {
           msg.prompt || "",
           attachmentFingerprint,
           submission,
-          180000,
+          RESPONSE_TIMEOUT_MS,
         );
 
       } catch (err) {
@@ -4287,10 +4288,17 @@ async function handleDeleteChat(chatId) {
   optionsBtn.click();
   await sleep(300);
 
+  const isDeleteAction = (text) => {
+    const normalized = String(text || "").trim().toLowerCase();
+    return normalized.includes("delete") ||
+      normalized.includes("remove") ||
+      normalized.includes("删除");
+  };
+
   // Radix menu opens at the end of the body
   // Find the Delete menu item
   const menuItems = Array.from(document.querySelectorAll('[role="menuitem"]'));
-  const deleteItem = menuItems.find(item => item.textContent.toLowerCase().includes('delete'));
+  const deleteItem = menuItems.find(item => isDeleteAction(item.textContent));
   
   if (!deleteItem) return { success: false, error: "Delete menu item not found" };
   
@@ -4300,7 +4308,7 @@ async function handleDeleteChat(chatId) {
   // Find the red confirmation button in the modal
   const modalButtons = Array.from(document.querySelectorAll('[role="dialog"] button'));
   // Usually the destructive action button has specific styling, or it's the last button containing "Delete"
-  const confirmBtn = modalButtons.find(btn => btn.textContent.toLowerCase().includes('delete'));
+  const confirmBtn = modalButtons.find(btn => isDeleteAction(btn.textContent));
   
   if (!confirmBtn) return { success: false, error: "Confirmation button not found" };
   

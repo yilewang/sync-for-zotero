@@ -2,8 +2,8 @@
  * background.js — Service Worker (Manifest V3)
  *
  * Auto-polls the local server every 2s for pending queries.
- * When a query arrives, runs the full pipeline on ChatGPT automatically.
- * Tracks the active ChatGPT tab so follow-up messages continue the same conversation.
+ * When a query arrives, runs the full pipeline on the selected web chat.
+ * Tracks the active chat tab so follow-up messages continue the same conversation.
  */
 
 try {
@@ -41,6 +41,9 @@ let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const MAX_PRE_SUBMIT_RELEASES = 3;
 const RELAY_POLL_INTERVAL_MS = 500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
+const TAB_LOAD_TIMEOUT_MS = 120_000;
+const PIPELINE_TIMEOUT_MS = 60 * 60_000;
+const RELAY_HOSTS = ["127.0.0.1", "localhost"];
 const WEBCHAT_DEBUG = false;
 
 // ---------------------------------------------------------------------------
@@ -124,31 +127,34 @@ async function discoverZoteroPort() {
   _portDiscoveryInFlight = true;
   try {
     const previousServer = SERVER;
-    for (let port = 23119; port <= 23128; port++) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/llm-for-zotero/webchat/debug`);
-        if (!res.ok) continue;
-        const data = await res.json();
-        // Verify this is actually our relay, not Zotero returning generic text
-        if (data && typeof data.status === "string") {
-          SERVER = `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
-          lastSuccessfulContact = Date.now();
+    for (const host of RELAY_HOSTS) {
+      for (let port = 23119; port <= 23128; port++) {
+        try {
+          const candidateServer = `http://${host}:${port}/llm-for-zotero/webchat`;
+          const res = await fetch(`${candidateServer}/debug`);
+          if (!res.ok) continue;
+          const data = await res.json();
+          // Verify this is actually our relay, not Zotero returning generic text
+          if (data && typeof data.status === "string") {
+            SERVER = candidateServer;
+            lastSuccessfulContact = Date.now();
 
-          const wasConnected = zoteroConnected;
-          zoteroConnected = true;
+            const wasConnected = zoteroConnected;
+            zoteroConnected = true;
 
-          if (SERVER !== previousServer) {
-            console.log(`[sync-zotero] Found Zotero server on port ${port} (port changed)`);
-            resetExtensionState();
-          } else if (!wasConnected) {
-            console.log(`[sync-zotero] Reconnected to Zotero server on port ${port}`);
-            resetExtensionState();
-          } else {
-            console.log(`[sync-zotero] Found Zotero server on port ${port}`);
+            if (SERVER !== previousServer) {
+              console.log(`[sync-zotero] Found Zotero server at ${host}:${port} (relay changed)`);
+              resetExtensionState();
+            } else if (!wasConnected) {
+              console.log(`[sync-zotero] Reconnected to Zotero server at ${host}:${port}`);
+              resetExtensionState();
+            } else {
+              console.log(`[sync-zotero] Found Zotero server at ${host}:${port}`);
+            }
+            return;
           }
-          return;
-        }
-      } catch { /* try next port */ }
+        } catch { /* try next host/port */ }
+      }
     }
     if (zoteroConnected) {
       zoteroConnected = false;
@@ -535,7 +541,7 @@ setInterval(() => {
   persistState();
 }, 25_000);
 
-// Backup: chrome.alarms wakes the SW up even if it was killed.
+// Backup: chrome.alarms wakes the service worker up even if it was killed.
 // The SW module re-executes on restart, so setInterval below auto-resumes.
 chrome.alarms.create("pollAlarm", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -746,7 +752,7 @@ async function pollForCommand() {
         }
         await waitForTabLoad(tabId);
       } else {
-        // No existing ChatGPT tab — create a new one
+        // No existing chat tab — create a new one
         const tab = await chrome.tabs.create({ url: cmd.chatUrl, active: false });
         await waitForTabLoad(tab.id);
         activeChatTabId = tab.id;
@@ -909,7 +915,7 @@ async function runPipeline(query) {
       } catch (_) { /* server not running — ignore */ }
     }
 
-    // ── Get the right ChatGPT tab ──────────────────────────────────
+    // ── Get the right chat tab ─────────────────────────────────────
     let tab = null;
 
     if (activeChatTabId !== null) {
@@ -1101,19 +1107,30 @@ async function getChatGPTTab() {
   return getChatTab(activeTarget);
 }
 
-function waitForTabLoad(tabId) {
+function waitForTabLoad(tabId, timeoutMs = TAB_LOAD_TIMEOUT_MS) {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve();
+    };
     const listener = (id, info) => {
       if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
+        finish();
       }
     };
+    const timer = setTimeout(finish, timeoutMs);
     chrome.tabs.onUpdated.addListener(listener);
     chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        finish();
+        return;
+      }
       if (tab && tab.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
+        finish();
       }
     });
   });
@@ -1136,20 +1153,36 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // ---------------------------------------------------------------------------
 
 function streamPipeline(tabId, payload) {
-  const PIPELINE_TIMEOUT_MS = 180_000;
-
   // Disconnect any stale port from a previous pipeline
   if (activePort) {
     try { activePort.disconnect(); } catch (_) {}
     activePort = null;
   }
 
-  const pipelinePromise = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const port = chrome.tabs.connect(tabId, { name: "sync-zotero" });
     activePort = port;
     let resolved = false;
     let submitted = false;
     let streamingAcked = false;
+    let timeoutId = null;
+
+    const disconnectPort = () => {
+      if (activePort === port) activePort = null;
+      try { port.disconnect(); } catch (_) {}
+    };
+
+    const finish = (callback, value) => {
+      if (resolved) return;
+      resolved = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      disconnectPort();
+      callback(value);
+    };
+
+    timeoutId = setTimeout(() => {
+      finish(reject, new Error("Pipeline timed out after 60 minutes"));
+    }, PIPELINE_TIMEOUT_MS);
 
     port.onMessage.addListener(async (msg) => {
       if (msg.seq !== undefined && msg.seq !== payload.seq) return;
@@ -1216,10 +1249,7 @@ function streamPipeline(tabId, payload) {
         // Forward ChatGPT's actual mode back to the plugin relay
         serverPost("/update_mode", { seq: payload.seq, mode: msg.mode }).catch(() => {});
       } else if (msg.type === "terminal") {
-        resolved = true;
-        if (activePort === port) activePort = null;
-        port.disconnect();
-        resolve({
+        finish(resolve, {
           text: msg.text || "",
           thinking: msg.thinking ?? null,
           answerAnchorId: msg.answerAnchorId ?? null,
@@ -1238,16 +1268,15 @@ function streamPipeline(tabId, payload) {
           turnStatus: msg.turnStatus ?? null,
         });
       } else if (msg.type === "error") {
-        resolved = true;
-        if (activePort === port) activePort = null;
-        port.disconnect();
-        reject(new Error(msg.error));
+        finish(reject, new Error(msg.error));
       }
     });
 
     port.onDisconnect.addListener(() => {
       if (activePort === port) activePort = null;
       if (!resolved) {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        resolved = true;
         const err = chrome.runtime.lastError;
         const error = new Error("Port disconnected unexpectedly" + (err ? ": " + err.message : ""));
         error.name = submitted ? "PipelineDisconnect" : "PreSubmitDisconnect";
@@ -1257,12 +1286,6 @@ function streamPipeline(tabId, payload) {
 
     port.postMessage({ type: "START", ...payload });
   });
-
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("Pipeline timed out after 180s")), PIPELINE_TIMEOUT_MS);
-  });
-
-  return Promise.race([pipelinePromise, timeoutPromise]);
 }
 
 // ---------------------------------------------------------------------------

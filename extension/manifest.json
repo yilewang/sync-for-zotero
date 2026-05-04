@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Sync for Zotero",
-  "version": "0.0.6",
-  "description": "Automate Zotero PDF → ChatGPT → Markdown pipeline",
+  "version": "0.0.7",
+  "description": "Bridge LLM for Zotero with ChatGPT and DeepSeek web chats",
+  "minimum_chrome_version": "102",
   "permissions": [
     "tabs",
     "storage",
@@ -13,7 +14,8 @@
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.deepseek.com/*",
-    "http://127.0.0.1:*/*"
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "background.js"
