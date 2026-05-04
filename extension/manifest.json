@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sync for Zotero",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Bridge LLM for Zotero with ChatGPT and DeepSeek web chats",
   "minimum_chrome_version": "102",
   "permissions": [
