@@ -120,6 +120,18 @@ function debugLog(event, payload) {
   console.log("[sync-zotero][webchat]", event, payload || "");
 }
 
+function withZoteroAllowedRequest(init = {}) {
+  const next = { ...(init || {}) };
+  const headers = new Headers(next.headers || {});
+  headers.set("Zotero-Allowed-Request", "1");
+  next.headers = headers;
+  return next;
+}
+
+function relayFetch(url, init) {
+  return fetch(url, withZoteroAllowedRequest(init));
+}
+
 // Zotero's HTTP server port can vary (23119-23128). Discover the actual port.
 let _portDiscoveryInFlight = false;
 async function discoverZoteroPort() {
@@ -131,7 +143,7 @@ async function discoverZoteroPort() {
       for (let port = 23119; port <= 23128; port++) {
         try {
           const candidateServer = `http://${host}:${port}/llm-for-zotero/webchat`;
-          const res = await fetch(`${candidateServer}/debug`);
+          const res = await relayFetch(`${candidateServer}/debug`);
           if (!res.ok) continue;
           const data = await res.json();
           // Verify this is actually our relay, not Zotero returning generic text
@@ -183,7 +195,7 @@ function resetExtensionState() {
 // Heartbeat: checks connectivity and triggers port rediscovery when needed
 async function heartbeat() {
   try {
-    const res = await fetch(`${SERVER}/heartbeat`);
+    const res = await relayFetch(`${SERVER}/heartbeat`);
     if (res.ok) {
       lastSuccessfulContact = Date.now();
       // Update activeTarget from relay if provided
@@ -219,7 +231,7 @@ async function heartbeat() {
             : tabs[0];
           chatUrl = preferred?.url || null;
         }
-        fetch(`${SERVER}/extension_status`, {
+        relayFetch(`${SERVER}/extension_status`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chatTabAlive, chatUrl }),
@@ -303,7 +315,7 @@ loadPersistedState();
 async function serverGet(path) {
   let res;
   try {
-    res = await fetch(`${SERVER}${path}`);
+    res = await relayFetch(`${SERVER}${path}`);
   } catch (err) {
     zoteroConnected = false;
     discoverZoteroPort();
@@ -323,7 +335,7 @@ async function serverGet(path) {
 async function serverPost(path, body) {
   let res;
   try {
-    res = await fetch(`${SERVER}${path}`, {
+    res = await relayFetch(`${SERVER}${path}`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify(body),
@@ -575,7 +587,7 @@ async function pollForStop() {
   if (!pipelineRunning) return; // only needed during active generation
   if (!zoteroConnected) return;
   try {
-    const data = await fetch(`${SERVER}/poll_stop`).then(r => r.json());
+    const data = await relayFetch(`${SERVER}/poll_stop`).then(r => r.json());
     if (data.stop && activeChatTabId !== null) {
       // Tell content script to click the stop button
       chrome.tabs.sendMessage(activeChatTabId, { type: "STOP" }, () => {
@@ -649,7 +661,7 @@ async function pollForCommand() {
   if (pipelineRunning) return;
   if (!zoteroConnected) return;
   try {
-    const data = await fetch(`${SERVER}/poll_command`).then(r => r.json());
+    const data = await relayFetch(`${SERVER}/poll_command`).then(r => r.json());
     // Update activeTarget from relay — clear stale tab if target changed
     if (data.active_target && SITE_CONFIGS[data.active_target]) {
       if (activeTarget !== data.active_target) {
@@ -911,7 +923,7 @@ async function runPipeline(query) {
     // so it doesn't fire after the pipeline and navigate away.
     if (startsFresh) {
       try {
-        await fetch(`${SERVER}/poll_command`).then(r => r.json());
+        await relayFetch(`${SERVER}/poll_command`).then(r => r.json());
       } catch (_) { /* server not running — ignore */ }
     }
 
@@ -1402,7 +1414,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // Check embedded relay
       let relayAlive = false;
       try {
-        const res = await fetch(`${SERVER}/poll_response?since=0`);
+        const res = await relayFetch(`${SERVER}/poll_response?since=0`);
         relayAlive = res.ok;
       } catch { /* offline */ }
 
