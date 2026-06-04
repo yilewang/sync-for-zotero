@@ -485,6 +485,120 @@ const SITE_ADAPTERS = {
     /** Composer textarea is disabled while model is streaming. */
     disablesComposerDuringStreaming: true,
   },
+  
+  "web.lucrezia.unipd.it": {
+    siteId: "lucrezia",
+    homeUrl: "https://web.lucrezia.unipd.it/",
+
+    composerSelectors: [
+      'textarea[placeholder="Come posso aiutarti?"]',
+      "textarea",
+    ],
+
+    sendButtonSelectors(composer) {
+      const container =
+        composer?.closest("div.relative.mb-7") ||
+        composer?.closest("div[class*='rounded-xl']") ||
+        document.body;
+      const candidates = Array.from(
+        container.querySelectorAll("button")
+      ).filter((btn) =>
+        btn.className.includes("bg-aws-sea-blue-light") &&
+        isVisibleElement(btn)
+      );
+      return candidates[candidates.length - 1] || null;
+    },
+
+    stopButtonSelectors: [],
+
+    userMessageSelector: [
+      "[class*='human']",
+      "[class*='user-message']",
+      "[class*='user-turn']",
+    ].join(", "),
+
+    assistantMessageSelectors: [
+      "[class*='assistant']",
+      "[class*='ai-turn']",
+      "[class*='bot-message']",
+      "div.prose",
+      "div[class*='prose']",
+    ],
+
+    conversationMessageSelector: [
+      "[class*='human']",
+      "[class*='user-message']",
+      "[class*='user-turn']",
+      "[class*='assistant']",
+      "[class*='ai-turn']",
+      "[class*='bot-message']",
+    ].join(", "),
+
+    getMessageRole(node) {
+      const cls = String(node.className || "").toLowerCase();
+      if (cls.includes("human") || cls.includes("user")) return "user";
+      if (cls.includes("assistant") || cls.includes("ai") || cls.includes("bot")) return "assistant";
+      return node.getAttribute?.("data-role") || node.getAttribute?.("data-author") || null;
+    },
+
+    getMessageId(node) {
+      return node.getAttribute?.("data-message-id") ||
+             node.getAttribute?.("data-id") ||
+             node.id || null;
+    },
+
+    conversationTurnSelector: null,
+
+    actionBarSelectors: [
+      'button[class*="rounded-lg"]',
+    ],
+
+    thinkingSelectors: [],
+    pruneThinkingSelectors: [],
+
+    dropTargetSelectors: [
+      'textarea[placeholder="Come posso aiutarti?"]',
+      "textarea",
+    ],
+
+    attachmentPillSelector:
+      '[class*="attachment"], [class*="file-pill"], [class*="upload"]',
+
+    getChatIdFromUrl(url) {
+      try {
+        const parsed = new URL(url);
+        const botMatch = parsed.pathname.match(/\/bot\/([0-9A-Za-z]{26})/);
+        if (botMatch) return botMatch[1];
+        const convMatch = parsed.pathname.match(/\/conversation\/([0-9A-Za-z]{26})/);
+        return convMatch ? convMatch[1] : null;
+      } catch (_) {
+        return null;
+      }
+    },
+
+    historyLinkSelector: 'a[href*="/conversation/"]',
+
+    buildHistoryEntry(a) {
+      const href = a.getAttribute("href");
+      const match = href?.match(/\/conversation\/([0-9A-Za-z]{26})/);
+      const chatId = match ? match[1] : href;
+      const title = shared.normalizeComposerText(a.textContent || "");
+      return {
+        id: chatId,
+        title,
+        chatUrl: `https://web.lucrezia.unipd.it${href}`,
+      };
+    },
+
+    deleteChatLinkSelector(chatId) {
+      return `a[href*="/conversation/${chatId}"]`;
+    },
+
+    supportsFileUpload: true,
+    supportsModelSelector: false,
+    hasFormWrapper: false,
+    disablesComposerDuringStreaming: true,
+  },
 
 };
 

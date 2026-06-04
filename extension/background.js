@@ -67,6 +67,14 @@ const SITE_CONFIGS = {
     urlPrefix: "https://chat.deepseek.com",
     conversationUrlPattern: /\/a\/chat\/s\//,
   },
+    lucrezia: {
+    siteId: "lucrezia",
+    label: "LucrezIA",
+    homeUrl: "https://web.lucrezia.unipd.it/",
+    urlPattern: "https://web.lucrezia.unipd.it/*",
+    urlPrefix: "https://web.lucrezia.unipd.it",
+    conversationUrlPattern: /\/bot\/[0-9A-Za-z]{26}|\/conversation\/[0-9A-Za-z]{26}/i,
+  },
 };
 
 const ALL_SITE_URL_PATTERNS = Object.values(SITE_CONFIGS).map(s => s.urlPattern);
@@ -800,10 +808,10 @@ async function pollForCommand() {
 
       let scrapeResult = null;
       try {
-        const scrape = scrapeSiteConfig.siteId === "chatgpt"
+        const scrape = (scrapeSiteConfig.siteId === "chatgpt" || scrapeSiteConfig.siteId === "lucrezia")
           ? scrapeChatGPTHistory
           : scrapeDeepSeekHistory;
-        scrapeResult = await scrape(scrapeSiteConfig, historyStartedAt);
+		scrapeResult = await scrape(scrapeSiteConfig, historyStartedAt);
       } catch (_) {
         // Communication failure — content script never ran.
         // Post timeout metadata so the plugin's polling loop can exit.
