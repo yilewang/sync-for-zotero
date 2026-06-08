@@ -222,6 +222,7 @@ async function heartbeat() {
       try {
         let chatTabAlive = false;
         let chatUrl = null;
+        let health = null;
         const targetConfig = getSiteConfig(activeTarget);
         const tabs = await chrome.tabs.query({ url: targetConfig.urlPattern });
         if (tabs.length > 0) {
@@ -230,11 +231,50 @@ async function heartbeat() {
             ? tabs.find(t => t.id === activeChatTabId) || tabs[0]
             : tabs[0];
           chatUrl = preferred?.url || null;
+          if (preferred?.id !== undefined && preferred?.id !== null) {
+            try {
+              health = await sendToContentScript(preferred.id, { type: "HEALTH_CHECK" });
+            } catch (err) {
+              health = {
+                ok: false,
+                contentScriptAlive: false,
+                siteId: targetConfig.siteId,
+                url: chatUrl,
+                mainWorldInjected: false,
+                composerFound: false,
+                sendControlState: null,
+                uploadControlFound: false,
+                networkHookActive: false,
+                lastRequestAt: null,
+                lastStreamAt: null,
+                lastDiagnostic: {
+                  reasonCode: "health_check_failed",
+                  phase: "health_check",
+                  siteId: targetConfig.siteId,
+                  message: err?.message || String(err),
+                },
+              };
+            }
+          }
         }
         relayFetch(`${SERVER}/extension_status`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chatTabAlive, chatUrl }),
+          body: JSON.stringify({
+            chatTabAlive,
+            chatUrl,
+            siteId: health?.siteId || targetConfig.siteId,
+            url: health?.url || chatUrl,
+            contentScriptAlive: health?.contentScriptAlive === true,
+            mainWorldInjected: health?.mainWorldInjected === true,
+            composerFound: health?.composerFound === true,
+            sendControlState: health?.sendControlState || null,
+            uploadControlFound: health?.uploadControlFound === true,
+            networkHookActive: health?.networkHookActive === true,
+            lastRequestAt: health?.lastRequestAt || null,
+            lastStreamAt: health?.lastStreamAt || null,
+            lastDiagnostic: health?.lastDiagnostic || null,
+          }),
         }).catch(() => {});
       } catch { /* non-critical */ }
 
@@ -328,7 +368,13 @@ async function serverGet(path) {
   try { data = JSON.parse(text); } catch {
     throw new Error(`Server returned non-JSON: ${text.slice(0, 100)}`);
   }
+  if (!res.ok) {
+    throw new Error(data.error || data.reason || `Server returned HTTP ${res.status}`);
+  }
   if (data.error) throw new Error(data.error);
+  if (data.ok === false && (data.reason || data.message)) {
+    throw new Error(data.reason || data.message);
+  }
   return data;
 }
 
@@ -352,7 +398,13 @@ async function serverPost(path, body) {
   try { data = JSON.parse(text); } catch {
     throw new Error(`Server returned non-JSON: ${text.slice(0, 100)}`);
   }
+  if (!res.ok) {
+    throw new Error(data.error || data.reason || `Server returned HTTP ${res.status}`);
+  }
   if (data.error) throw new Error(data.error);
+  if (data.ok === false && (data.reason || data.message)) {
+    throw new Error(data.reason || data.message);
+  }
   return data;
 }
 
@@ -360,8 +412,13 @@ async function claimQuery(seq) {
   return serverPost("/claim_query", { seq });
 }
 
-async function ackQueryPhase(seq, attempt, phase) {
-  return serverPost("/ack_query_phase", { seq, attempt, phase });
+async function ackQueryPhase(seq, attempt, phase, diagnostic = null) {
+  return serverPost("/ack_query_phase", {
+    seq,
+    attempt,
+    phase,
+    ...(diagnostic ? { diagnostic } : {}),
+  });
 }
 
 async function releaseQuery(seq, attempt) {
@@ -370,6 +427,21 @@ async function releaseQuery(seq, attempt) {
 
 async function reportTurnState(body) {
   return serverPost("/update_turn_state", body);
+}
+
+function formatDiagnosticError(message, diagnostic) {
+  const base = String(message || "WebChat bridge error");
+  if (!diagnostic || typeof diagnostic !== "object") return base;
+  const details = [];
+  if (diagnostic.reasonCode) details.push(String(diagnostic.reasonCode));
+  if (diagnostic.phase) details.push(`phase=${diagnostic.phase}`);
+  if (diagnostic.sendControlState) details.push(`send=${diagnostic.sendControlState}`);
+  if (Number.isFinite(Number(diagnostic.clickAttempts))) {
+    details.push(`clicks=${Number(diagnostic.clickAttempts)}`);
+  }
+  if (diagnostic.requestObserved === true) details.push("request_observed");
+  if (diagnostic.streamObserved === true) details.push("stream_observed");
+  return details.length > 0 ? `${base} (${details.join(", ")})` : base;
 }
 
 async function waitForChatReadyInTab(tabId, expectedChatUrl = null, timeoutMs = 30_000) {
@@ -1006,6 +1078,7 @@ async function runPipeline(query) {
       baselineTranscriptCount,
       baselineTranscriptHash,
       turnStatus,
+      diagnostic,
     } = await streamPipeline(tab.id, {
       pdfBase64:    query.pdf_base64 || null,
       pdfFilename:  query.pdf_base64 ? (query.pdf_filename || "document.pdf") : null,
@@ -1053,6 +1126,7 @@ async function runPipeline(query) {
       turn_status:
         turnStatus ||
         (finalRunState === "incomplete" ? "incomplete" : "done"),
+      diagnostic: diagnostic || null,
     });
 
     // Capture the conversation URL for history persistence (works for all sites)
@@ -1082,7 +1156,7 @@ async function runPipeline(query) {
       }
     }
 
-    await submitError(seq, err.message, attempt);
+    await submitError(seq, err.message, attempt, err.diagnostic || null);
 
     const msg = err.message.includes("Failed to fetch")
       ? "Cannot reach local server. Is gui.py running?"
@@ -1094,9 +1168,15 @@ async function runPipeline(query) {
   }
 }
 
-async function submitError(seq, errorMsg, attempt) {
+async function submitError(seq, errorMsg, attempt, diagnostic = null) {
   try {
-    await serverPost("/submit_response", { seq, attempt, response: null, error: errorMsg });
+    await serverPost("/submit_response", {
+      seq,
+      attempt,
+      response: null,
+      error: errorMsg,
+      diagnostic,
+    });
   } catch (_) {}
 }
 
@@ -1177,6 +1257,7 @@ function streamPipeline(tabId, payload) {
     let resolved = false;
     let submitted = false;
     let streamingAcked = false;
+    let relayPostFailureCount = 0;
     let timeoutId = null;
 
     const disconnectPort = () => {
@@ -1192,6 +1273,31 @@ function streamPipeline(tabId, payload) {
       callback(value);
     };
 
+    const handleRelayUpdateError = (err, context, diagnostic = null) => {
+      const reason = err?.message || String(err);
+      relayPostFailureCount += 1;
+      const isContractMismatch = /(?:^|\b)(seq_mismatch|attempt_mismatch)(?:\b|$)/i.test(reason);
+      if (isContractMismatch || relayPostFailureCount >= 3) {
+        const error = new Error(`Relay update failed during ${context}: ${reason}`);
+        error.diagnostic = diagnostic || null;
+        finish(reject, error);
+        return false;
+      }
+      console.warn(`[sync-zotero] Relay update failed during ${context}: ${reason}`);
+      return true;
+    };
+
+    const postRelayUpdate = async (context, diagnostic, fn) => {
+      if (resolved) return false;
+      try {
+        await fn();
+        relayPostFailureCount = 0;
+        return true;
+      } catch (err) {
+        return handleRelayUpdateError(err, context, diagnostic);
+      }
+    };
+
     timeoutId = setTimeout(() => {
       finish(reject, new Error("Pipeline timed out after 60 minutes"));
     }, PIPELINE_TIMEOUT_MS);
@@ -1204,12 +1310,16 @@ function streamPipeline(tabId, payload) {
         if (msg.phase === "submitted" || msg.phase === "streaming") {
           submitted = true;
         }
-        try {
-          await ackQueryPhase(payload.seq, payload.attempt, msg.phase);
-        } catch (_) {}
+        if (!(await postRelayUpdate(
+          `phase:${msg.phase}`,
+          msg.diagnostic || null,
+          () => ackQueryPhase(payload.seq, payload.attempt, msg.phase, msg.diagnostic || null),
+        ))) return;
       } else if (msg.type === "turn_state") {
-        try {
-          await reportTurnState({
+        if (!(await postRelayUpdate(
+          `turn_state:${msg.turnStatus || "unknown"}`,
+          msg.diagnostic || null,
+          () => reportTurnState({
             seq: payload.seq,
             attempt: payload.attempt,
             remote_chat_url: msg.remoteChatUrl ?? null,
@@ -1219,15 +1329,18 @@ function streamPipeline(tabId, payload) {
             baseline_transcript_count: msg.baselineTranscriptCount ?? 0,
             baseline_transcript_hash: msg.baselineTranscriptHash ?? null,
             turn_status: msg.turnStatus ?? null,
-          });
-        } catch (_) {}
+            diagnostic: msg.diagnostic ?? null,
+          }),
+        ))) return;
       } else if (msg.type === "snapshot") {
         if (!streamingAcked) {
           streamingAcked = true;
           submitted = true;
-          try {
-            await ackQueryPhase(payload.seq, payload.attempt, "streaming");
-          } catch (_) {}
+          if (!(await postRelayUpdate(
+            "phase:streaming",
+            msg.diagnostic || null,
+            () => ackQueryPhase(payload.seq, payload.attempt, "streaming", msg.diagnostic || null),
+          ))) return;
         }
         broadcastStatus(
           "running",
@@ -1235,8 +1348,10 @@ function streamPipeline(tabId, payload) {
             ? "Settling visible response…"
             : (msg.thinking ? "Thinking…" : "Streaming response…"),
         );
-        try {
-          await serverPost("/update_partial", {
+        if (!(await postRelayUpdate(
+          "snapshot",
+          msg.diagnostic || null,
+          () => serverPost("/update_partial", {
             seq:     payload.seq,
             attempt: payload.attempt,
             answer_snapshot: msg.answerSnapshot ?? msg.text ?? null,
@@ -1255,8 +1370,9 @@ function streamPipeline(tabId, payload) {
             baseline_transcript_count: msg.baselineTranscriptCount ?? 0,
             baseline_transcript_hash: msg.baselineTranscriptHash ?? null,
             turn_status: msg.turnStatus ?? null,
-          });
-        } catch (_) {}
+            diagnostic: msg.diagnostic ?? null,
+          }),
+        ))) return;
       } else if (msg.type === "mode_report") {
         // Forward ChatGPT's actual mode back to the plugin relay
         serverPost("/update_mode", { seq: payload.seq, mode: msg.mode }).catch(() => {});
@@ -1278,9 +1394,12 @@ function streamPipeline(tabId, payload) {
           baselineTranscriptCount: msg.baselineTranscriptCount ?? 0,
           baselineTranscriptHash: msg.baselineTranscriptHash ?? null,
           turnStatus: msg.turnStatus ?? null,
+          diagnostic: msg.diagnostic ?? null,
         });
       } else if (msg.type === "error") {
-        finish(reject, new Error(msg.error));
+        const error = new Error(formatDiagnosticError(msg.error, msg.diagnostic || null));
+        error.diagnostic = msg.diagnostic || null;
+        finish(reject, error);
       }
     });
 
