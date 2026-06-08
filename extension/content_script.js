@@ -396,25 +396,85 @@ const SITE_ADAPTERS = {
       "textarea",
     ],
     sendButtonSelectors(composer) {
-      // Walk up from composer to find the input area container.
-      // Stop when we find a container with 2+ ds-icon-button children
-      // (the attach button + the send button).
       let container = composer;
       for (let i = 0; i < 8 && container?.parentElement; i++) {
         container = container.parentElement;
-        const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
+        const btns = container.querySelectorAll(
+          'button, [role="button"], div.ds-icon-button'
+        );
         if (btns.length >= 2) break;
       }
       if (!container) container = document.body;
 
-      const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
-      // The send button is the last one; skip the attachment button
-      for (let i = btns.length - 1; i >= 0; i--) {
-        const btn = btns[i];
-        if (btn.parentElement?.querySelector('input[type="file"]')) continue;
-        if (isVisibleElement(btn)) return btn;
+      const composerRect = composer?.getBoundingClientRect?.() || null;
+      const candidateNodes = Array.from(
+        container.querySelectorAll(
+          [
+            "button",
+            '[role="button"]',
+            "div.ds-icon-button",
+            '[class*="send"]',
+            '[class*="Send"]',
+            '[aria-label*="send"]',
+            '[aria-label*="Send"]',
+            '[data-testid*="send"]',
+            '[data-testid*="Send"]',
+          ].join(", ")
+        )
+      );
+
+      let best = null;
+      let bestScore = -Infinity;
+      const seen = new Set();
+      for (const node of candidateNodes) {
+        const btn =
+          node.closest?.('button, [role="button"], div.ds-icon-button') ||
+          node;
+        if (!btn || seen.has(btn)) continue;
+        seen.add(btn);
+        if (!isVisibleElement(btn)) continue;
+        if (btn.querySelector?.('input[type="file"]')) continue;
+        if (btn.parentElement?.querySelector?.('input[type="file"]')) continue;
+
+        const label = [
+          btn.getAttribute?.("aria-label"),
+          btn.getAttribute?.("title"),
+          btn.textContent,
+          btn.className,
+        ].filter(Boolean).join(" ").toLowerCase();
+        if (/attach|upload|file|paperclip|deepthink|search/.test(label)) {
+          continue;
+        }
+
+        const rect = btn.getBoundingClientRect?.();
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+
+        let score = 0;
+        if (composerRect) {
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          const composerCenterY = composerRect.top + composerRect.height / 2;
+          const isComposerAdjacentY =
+            centerY >= composerRect.top - 80 &&
+            centerY <= composerRect.bottom + 120;
+
+          if (!isComposerAdjacentY) continue;
+          score += centerX - composerRect.left;
+          score -= Math.abs(centerY - composerCenterY);
+          if (centerX >= composerRect.right - 140) score += 500;
+          if (centerY >= composerRect.top) score += 100;
+        }
+        if (/send|发送/.test(label)) score += 300;
+        if (/primary|circle|filled/.test(label)) score += 80;
+        if (/disabled/.test(label)) score -= 1000;
+        if (btn.tagName === "BUTTON") score += 20;
+
+        if (score > bestScore) {
+          best = btn;
+          bestScore = score;
+        }
       }
-      return null;
+      return best;
     },
     stopButtonSelectors: [
       // DeepSeek transforms the send button into a stop button during streaming
@@ -925,7 +985,16 @@ async function typePromptAndVerify(promptText) {
 // ---------------------------------------------------------------------------
 
 function isEnabledButton(btn) {
-  return Boolean(btn) && !btn.disabled && !btn.hasAttribute("disabled") && isVisibleElement(btn);
+  const classText =
+    typeof btn?.className === "string"
+      ? btn.className
+      : btn?.getAttribute?.("class") || "";
+  return Boolean(btn) &&
+    !btn.disabled &&
+    !btn.hasAttribute("disabled") &&
+    btn.getAttribute?.("aria-disabled") !== "true" &&
+    !/disabled/i.test(classText) &&
+    isVisibleElement(btn);
 }
 
 async function waitForSendButton(timeoutMs = 10000) {
@@ -985,6 +1054,51 @@ function dispatchSubmitViaForm(composer) {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
+function dispatchPointerClick(el) {
+  if (!el) return;
+  el.focus?.();
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    button: 0,
+    buttons: 1,
+  };
+  const pointerEventInit = {
+    ...eventInit,
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true,
+  };
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    const EventCtor =
+      type.startsWith("pointer") && typeof PointerEvent === "function"
+        ? PointerEvent
+        : MouseEvent;
+    el.dispatchEvent(
+      new EventCtor(
+        type,
+        type.startsWith("pointer") ? pointerEventInit : eventInit
+      )
+    );
+  }
+}
+
+function describeSubmitControl(btn) {
+  if (!btn) return "not_found";
+  const rect = btn.getBoundingClientRect?.();
+  const classText =
+    typeof btn.className === "string"
+      ? btn.className
+      : btn.getAttribute?.("class") || "";
+  const state = isEnabledButton(btn) ? "enabled" : "disabled_or_hidden";
+  const geometry = rect
+    ? `x=${Math.round(rect.x)},y=${Math.round(rect.y)},w=${Math.round(rect.width)},h=${Math.round(rect.height)}`
+    : "no_rect";
+  return `${state}; ${btn.tagName.toLowerCase()}; class=${classText.slice(0, 120)}; ${geometry}`;
+}
+
 function hasPromptSubmissionSignal(
   transcript,
   baselineTranscriptCount,
@@ -1020,6 +1134,7 @@ async function waitForSubmissionSignal(
   baselineUserMessageCount,
   baselineTranscriptCount,
   timeoutMs = 15000,
+  baselineActiveStreamCount = activeConversationStreamCount,
 ) {
   const deadline = Date.now() + timeoutMs;
   let observedRequestContext = null;
@@ -1050,6 +1165,17 @@ async function waitForSubmissionSignal(
       promptText,
     });
     if (signal) {
+      return {
+        delivered: true,
+        requestObserved: Boolean(observedRequestContext),
+        requestContext: observedRequestContext,
+      };
+    }
+
+    if (
+      SITE_ADAPTER?.siteId === "deepseek" &&
+      activeConversationStreamCount > baselineActiveStreamCount
+    ) {
       return {
         delivered: true,
         requestObserved: Boolean(observedRequestContext),
@@ -1088,6 +1214,10 @@ async function waitForSubmissionSignal(
 }
 
 async function submitMessageAndVerify(promptText) {
+  if (SITE_ADAPTER?.siteId === "deepseek") {
+    return submitDeepSeekMessageAndVerify(promptText);
+  }
+
   for (let attempt = 0; attempt < 2; attempt++) {
     const submitStrategies = [
       async (composer) => {
@@ -1142,6 +1272,97 @@ async function submitMessageAndVerify(promptText) {
   }
 
   throw new Error("Prompt delivery failed: chat did not accept the prompt after 2 attempts.");
+}
+
+async function submitDeepSeekMessageAndVerify(promptText) {
+  let totalClickAttempts = 0;
+  let lastSubmitControl = "not_checked";
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const composer = await getComposerElement();
+    const baselineTranscriptCount = extractConversationTranscript().count;
+    const baselineUserMessageCount = document.querySelectorAll(
+      SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']"
+    ).length;
+    const baselineOutboundRequestSerial = outboundRequestSerial;
+    const baselineActiveStreamCount = activeConversationStreamCount;
+    const deadline = Date.now() + 30000;
+    let lastClickAt = 0;
+
+    while (Date.now() < deadline) {
+      const remaining = Math.max(0, deadline - Date.now());
+      const delivery = await waitForSubmissionSignal(
+        promptText,
+        baselineOutboundRequestSerial,
+        baselineUserMessageCount,
+        baselineTranscriptCount,
+        Math.min(350, remaining),
+        baselineActiveStreamCount,
+      );
+      if (delivery.delivered || delivery.requestObserved) {
+        return {
+          baselineOutboundRequestSerial,
+          requestContext:
+            delivery.requestContext ||
+            findObservedDeepSeekRequestContext(
+              baselineOutboundRequestSerial,
+              promptText,
+            ) ||
+            null,
+        };
+      }
+
+      const currentComposer = findComposerNow() || composer;
+      const sendBtn = findSendButton(currentComposer);
+      lastSubmitControl = describeSubmitControl(sendBtn);
+      const now = Date.now();
+      if (isEnabledButton(sendBtn) && now - lastClickAt >= 350) {
+        lastClickAt = now;
+        totalClickAttempts++;
+        dispatchPointerClick(sendBtn);
+
+        const postClick = await waitForSubmissionSignal(
+          promptText,
+          baselineOutboundRequestSerial,
+          baselineUserMessageCount,
+          baselineTranscriptCount,
+          Math.min(1500, Math.max(0, deadline - Date.now())),
+          baselineActiveStreamCount,
+        );
+        if (postClick.delivered || postClick.requestObserved) {
+          return {
+            baselineOutboundRequestSerial,
+            requestContext:
+              postClick.requestContext ||
+              findObservedDeepSeekRequestContext(
+                baselineOutboundRequestSerial,
+                promptText,
+              ) ||
+              null,
+          };
+        }
+        if (composerLooksSubmitted(promptText, currentComposer)) {
+          return {
+            baselineOutboundRequestSerial,
+            requestContext:
+              findObservedDeepSeekRequestContext(
+                baselineOutboundRequestSerial,
+                promptText,
+              ) || null,
+          };
+        }
+      } else {
+        await workerSleep(150);
+      }
+    }
+
+    await typePromptAndVerify(promptText);
+  }
+
+  const detail = totalClickAttempts > 0
+    ? `DeepSeek send was clicked ${totalClickAttempts} time(s), but no delivery signal was observed`
+    : `no clickable DeepSeek send control was found (${lastSubmitControl})`;
+  throw new Error(`Prompt delivery failed: ${detail}.`);
 }
 
 // ---------------------------------------------------------------------------
