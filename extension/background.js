@@ -35,6 +35,16 @@ const shared = globalThis.SyncZoteroShared || {
         /^正在分析/.test(raw) || /^正在浏览/.test(raw)) return false;
     return true;
   },
+  canReuseReadyTranscriptForScrape: (siteId, ready) => {
+    if (String(siteId || "").toLowerCase() !== "chatgpt") return false;
+    const messages = Array.isArray(ready?.messages) ? ready.messages : [];
+    return messages.some((message) => {
+      if (!message || typeof message !== "object") return false;
+      if (String(message.text || "").trim()) return true;
+      if (String(message.thinking || "").trim()) return true;
+      return Array.isArray(message.attachments) && message.attachments.length > 0;
+    });
+  },
 };
 
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
@@ -543,41 +553,52 @@ async function publishReadyConversationState(
       capturedAt: Date.now(),
       source: "dom",
     };
-    try {
-      const scrapeResult = await sendToContentScript(tabId, {
-        type: "SCRAPE_MESSAGES",
-        expectedChatUrl,
-        expectedChatId,
-        minCapturedAt,
-        timeoutMs: scrapeTimeoutMs,
+    const reuseReadyTranscript = shared.canReuseReadyTranscriptForScrape(
+      expectedSiteConfig?.siteId,
+      ready,
+    );
+    if (reuseReadyTranscript) {
+      debugLog("ready_transcript_reused", {
+        siteId: expectedSiteConfig?.siteId || null,
+        count: Array.isArray(ready.messages) ? ready.messages.length : 0,
       });
-      if (scrapeResult?.ok && Array.isArray(scrapeResult.messages)) {
-        scrapedSnapshot = {
-          messages: scrapeResult.messages,
-          chatUrl:
-            canonicalChatUrl ||
-            scrapeResult.chatUrl ||
-            ready.chatUrl ||
-            expectedChatUrl ||
-            null,
-          chatId:
-            canonicalChatId ||
-            scrapeResult.chatId ||
-            ready.chatId ||
-            expectedChatId ||
-            null,
-          siteHostname:
-            hostnameFromUrl(
+    } else {
+      try {
+        const scrapeResult = await sendToContentScript(tabId, {
+          type: "SCRAPE_MESSAGES",
+          expectedChatUrl,
+          expectedChatId,
+          minCapturedAt,
+          timeoutMs: scrapeTimeoutMs,
+        });
+        if (scrapeResult?.ok && Array.isArray(scrapeResult.messages)) {
+          scrapedSnapshot = {
+            messages: scrapeResult.messages,
+            chatUrl:
               canonicalChatUrl ||
               scrapeResult.chatUrl ||
               ready.chatUrl ||
-              expectedChatUrl,
-            ) || scrapeResult.siteHostname || hostnameFromUrl(ready.chatUrl),
-          capturedAt: Number(scrapeResult.capturedAt) || Date.now(),
-          source: scrapeResult.source || "dom",
-        };
-      }
-    } catch (_) { /* fall back to ready.messages */ }
+              expectedChatUrl ||
+              null,
+            chatId:
+              canonicalChatId ||
+              scrapeResult.chatId ||
+              ready.chatId ||
+              expectedChatId ||
+              null,
+            siteHostname:
+              hostnameFromUrl(
+                canonicalChatUrl ||
+                scrapeResult.chatUrl ||
+                ready.chatUrl ||
+                expectedChatUrl,
+              ) || scrapeResult.siteHostname || hostnameFromUrl(ready.chatUrl),
+            capturedAt: Number(scrapeResult.capturedAt) || Date.now(),
+            source: scrapeResult.source || "dom",
+          };
+        }
+      } catch (_) { /* fall back to ready.messages */ }
+    }
     if (allowNetworkReadyFallback) {
       try {
         ready = await readyPromise;

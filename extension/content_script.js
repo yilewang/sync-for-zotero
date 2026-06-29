@@ -216,6 +216,25 @@ const shared = globalThis.SyncZoteroShared || {
     const normalized = String(text || "").trim().toLowerCase();
     return !normalized || normalized === "thinking" || normalized === "quick answer";
   },
+  normalizeConversationUrl: (url) => {
+    const raw = String(url || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw);
+      if (parsed.hostname.toLowerCase() === "chatgpt.com") {
+        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
+        if (match) return `${parsed.origin}/c/${match[1]}`;
+      }
+    } catch (_) {}
+    return raw.replace(/\/+$/, "");
+  },
+  conversationUrlsMatch: (actualUrl, expectedUrl) => {
+    const normalize = shared.normalizeConversationUrl ||
+      ((value) => String(value || "").replace(/\/+$/, ""));
+    const normalizedExpected = normalize(expectedUrl);
+    if (!normalizedExpected) return true;
+    return normalize(actualUrl) === normalizedExpected;
+  },
   normalizeComposerText: (text) => String(text || "").trim(),
 };
 
@@ -3183,7 +3202,9 @@ function getCurrentChatId(url = getCurrentChatUrl()) {
 }
 
 function normalizeUrl(url) {
-  return String(url || "").replace(/\/+$/, "");
+  return shared.normalizeConversationUrl
+    ? shared.normalizeConversationUrl(url)
+    : String(url || "").replace(/\/+$/, "");
 }
 
 function cloneRelayMessage(message) {
