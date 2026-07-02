@@ -69,7 +69,7 @@ const SITE_CONFIGS = {
   },
     lucrezia: {
     siteId: "lucrezia",
-    label: "Lucrez-IA",
+    label: "LucrezIA",
     homeUrl: "https://web.lucrezia.unipd.it/",
     urlPattern: "https://web.lucrezia.unipd.it/*",
     urlPrefix: "https://web.lucrezia.unipd.it",
