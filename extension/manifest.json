@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sync for Zotero",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek and Lucrez-IA web chats",
   "minimum_chrome_version": "102",
   "permissions": [
@@ -48,8 +48,8 @@
     "default_title": "Sync for Zotero"
   },
   "icons": {
-    "16":  "icons/icon16.png",
-    "48":  "icons/icon48.png",
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   }
 }

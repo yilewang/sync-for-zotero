@@ -923,6 +923,17 @@
     }
     if (event.data?.type === "SYNC_ZOTERO_NETWORK_CACHE_CLEAR") {
       clearDeepSeekNetworkCache(event.data.scope || "all");
+      return;
+    }
+    if (event.data?.type === "SYNC_ZOTERO_NETWORK_HEALTH_REQUEST") {
+      postPageEvent({
+        type: "SYNC_ZOTERO_NETWORK_HEALTH",
+        nonce: event.data.nonce || null,
+        patchVersion: PATCH_VERSION,
+        networkHookActive: true,
+        activeStreamCount: activeConversationStreamCount,
+        timestamp: Date.now(),
+      });
     }
   });
 
@@ -966,9 +977,7 @@
           msg.metadata?.reasoning_text ||
           msg.content?.thinking ||
           null;
-        if (thinkingText && thinkingText !== lastThinking) {
-          thinking = thinkingText;
-        }
+}
 
         if (text !== lastText || thinking !== lastThinking) {
           return { text, thinking };
@@ -1030,120 +1039,19 @@
         return null;
       },
     },
-	"web.lucrezia.unipd.it": {
-      isConversationRequest(url, method) {
-        return false; // Lucrez-IA usa WebSocket, non HTTP POST
-      },
-      parseSSEPayload(parsed, lastText, lastThinking) {
-        return null; // Non usato — risposte via WebSocket
-      },
-    },
   };
 
   const currentHost = window.location.hostname;
   const adapter = SITE_ADAPTERS[currentHost];
   if (!adapter) return;
-  
-    // ── Patch WebSocket per Lucrez-IA ─────────────────────────────────────────
-  // Protocollo:
-  //   ← RECV: {"status":"STREAMING","completion":"testo parziale"}  (N volte)
-  //   ← RECV: {"status":"STREAMING_END","completion":"","stop_reason":"end_turn"}
-  if (currentHost === "web.lucrezia.unipd.it") {
-    const OriginalWebSocket = window.WebSocket;
 
-    window.WebSocket = function(url, protocols) {
-      const ws = protocols
-        ? new OriginalWebSocket(url, protocols)
-        : new OriginalWebSocket(url);
-
-      const isLucreziaWs = typeof url === "string" &&
-        url.includes("execute-api") &&
-        url.includes("amazonaws.com");
-
-      if (!isLucreziaWs) return ws;
-
-      let accumulatedText = "";
-      let streamActive = false;
-
-      ws.addEventListener("message", (event) => {
-        try {
-          const data = safeJsonParse(
-            typeof event.data === "string" ? event.data : ""
-          );
-          if (!data || typeof data.status !== "string") return;
-
-          if (data.status === "STREAMING" && !streamActive) {
-            streamActive = true;
-            accumulatedText = "";
-            postPageEvent({ type: "SYNC_ZOTERO_STREAM_START" });
-            activeConversationStreamCount += 1;
-            postActiveStreamCount();
-          }
-
-          if (data.status === "STREAMING") {
-            const chunk = typeof data.completion === "string"
-              ? data.completion
-              : "";
-            if (chunk) {
-              accumulatedText += chunk;
-              postPageEvent({
-                type: "SYNC_ZOTERO_SSE",
-                text: accumulatedText,
-                thinking: null,
-                done: false,
-              });
-            }
-            return;
-          }
-
-          if (data.status === "STREAMING_END") {
-            if (hasMeaningfulAssistantText(accumulatedText)) {
-              postPageEvent({
-                type: "SYNC_ZOTERO_SSE",
-                text: accumulatedText,
-                thinking: null,
-                done: true,
-                activeStreamCount: 0,
-              });
-            }
-            streamActive = false;
-            activeConversationStreamCount = Math.max(
-              0, activeConversationStreamCount - 1
-            );
-            postActiveStreamCount();
-            return;
-          }
-
-        } catch (_) {}
-      });
-
-      ws.addEventListener("close", () => {
-        if (streamActive && hasMeaningfulAssistantText(accumulatedText)) {
-          postPageEvent({
-            type: "SYNC_ZOTERO_SSE",
-            text: accumulatedText,
-            thinking: null,
-            done: true,
-            activeStreamCount: 0,
-          });
-        }
-        if (streamActive) {
-          streamActive = false;
-          activeConversationStreamCount = Math.max(
-            0, activeConversationStreamCount - 1
-          );
-          postActiveStreamCount();
-        }
-        accumulatedText = "";
-      });
-
-      return ws;
-    };
-
-    Object.assign(window.WebSocket, OriginalWebSocket);
-    window.WebSocket.prototype = OriginalWebSocket.prototype;
-  }
-  // ── Fine patch WebSocket ───────────────────────────────────────────────────
+  postPageEvent({
+    type: "SYNC_ZOTERO_INJECTED_READY",
+    host: currentHost,
+    patchVersion: PATCH_VERSION,
+    networkHookActive: true,
+    timestamp: Date.now(),
+  });
 
   function postActiveStreamCount() {
     postPageEvent({
@@ -1177,50 +1085,55 @@
     }
   }
 
-
   function shouldInspectFetchJsonResponse(url, method, response) {
-    if (currentHost === "chat.deepseek.com") {
-      if (!response?.ok) return false;
-      if (adapter.isConversationRequest(url, method)) return false;
-      let parsedUrl = null;
-      try {
-        parsedUrl = new URL(resolveUrl(url));
-        if (parsedUrl.origin !== window.location.origin) return false;
-      } catch { return false; }
-      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-      if (contentType.includes("json")) return true;
-      if (!contentType) return parsedUrl.pathname.includes("/api/");
-      return false;
-    }
     if (currentHost === "web.lucrezia.unipd.it") {
       if (!response?.ok) return false;
       if (!isLucreziaApiUrl(url)) return false;
       const contentType = String(response.headers.get("content-type") || "").toLowerCase();
       return contentType.includes("json");
     }
+
+    if (currentHost !== "chat.deepseek.com") return false;
+    if (!response?.ok) return false;
+    if (adapter.isConversationRequest(url, method)) return false;
+
+    let parsedUrl = null;
+    try {
+      parsedUrl = new URL(resolveUrl(url));
+      if (parsedUrl.origin !== window.location.origin) return false;
+    } catch {
+      return false;
+    }
+
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("json")) return true;
+    if (!contentType) return parsedUrl.pathname.includes("/api/");
     return false;
   }
 
   function shouldInspectXHRResponse(xhr, url, method) {
-    if (currentHost === "chat.deepseek.com") {
-      if ((xhr.status || 0) < 200 || (xhr.status || 0) >= 300) return false;
-      if (adapter.isConversationRequest(url, method)) return false;
-      let parsedUrl = null;
-      try {
-        parsedUrl = new URL(resolveUrl(url));
-        if (parsedUrl.origin !== window.location.origin) return false;
-      } catch { return false; }
-      const contentType = String(xhr.getResponseHeader?.("content-type") || "").toLowerCase();
-      if (contentType.includes("json")) return true;
-      if (!contentType) return parsedUrl.pathname.includes("/api/");
-      return false;
-    }
     if (currentHost === "web.lucrezia.unipd.it") {
       if ((xhr.status || 0) < 200 || (xhr.status || 0) >= 300) return false;
       if (!isLucreziaApiUrl(url)) return false;
       const contentType = String(xhr.getResponseHeader?.("content-type") || "").toLowerCase();
       return contentType.includes("json");
     }
+
+    if (currentHost !== "chat.deepseek.com") return false;
+    if ((xhr.status || 0) < 200 || (xhr.status || 0) >= 300) return false;
+    if (adapter.isConversationRequest(url, method)) return false;
+
+    let parsedUrl = null;
+    try {
+      parsedUrl = new URL(resolveUrl(url));
+      if (parsedUrl.origin !== window.location.origin) return false;
+    } catch {
+      return false;
+    }
+
+    const contentType = String(xhr.getResponseHeader?.("content-type") || "").toLowerCase();
+    if (contentType.includes("json")) return true;
+    if (!contentType) return parsedUrl.pathname.includes("/api/");
     return false;
   }
 
