@@ -63,40 +63,6 @@
     return normalized.length > 1 && !isPlaceholderAssistantText(normalized);
   }
 
-  function normalizeConversationUrl(url) {
-    const raw = String(url || "").trim();
-    if (!raw) return "";
-
-    try {
-      const parsed = new URL(raw);
-      if (parsed.hostname.toLowerCase() === "chatgpt.com") {
-        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
-        if (match) return `${parsed.origin}/c/${match[1]}`;
-      }
-    } catch (_) {}
-
-    return raw.replace(/\/+$/, "");
-  }
-
-  function conversationUrlsMatch(actualUrl, expectedUrl) {
-    const normalizedExpected = normalizeConversationUrl(expectedUrl);
-    if (!normalizedExpected) return true;
-    return normalizeConversationUrl(actualUrl) === normalizedExpected;
-  }
-
-  function hasRelayTranscriptMessageContent(message) {
-    if (!message || typeof message !== "object") return false;
-    if (normalizeComposerText(message.text || "")) return true;
-    if (normalizeComposerText(message.thinking || "")) return true;
-    return Array.isArray(message.attachments) && message.attachments.length > 0;
-  }
-
-  function canReuseReadyTranscriptForScrape(siteId, ready) {
-    if (String(siteId || "").toLowerCase() !== "chatgpt") return false;
-    const messages = Array.isArray(ready?.messages) ? ready.messages : [];
-    return messages.some(hasRelayTranscriptMessageContent);
-  }
-
   function hasDeliverySignal(snapshot) {
     const promptText = normalizeComposerText(snapshot.promptText || "");
     const composerTextAfter = normalizeComposerText(snapshot.composerTextAfter || "");
@@ -274,14 +240,11 @@
     TURN_COMPLETION_REBOUND_WINDOW_MS,
     advanceTurnCompletionTracker,
     attemptToken,
-    canReuseReadyTranscriptForScrape,
     composerTextMatchesPrompt,
-    conversationUrlsMatch,
     createTurnCompletionTracker,
     hasMeaningfulAssistantText,
     hasDeliverySignal,
     isPlaceholderAssistantText,
     normalizeComposerText,
-    normalizeConversationUrl,
   };
 });
