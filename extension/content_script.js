@@ -216,6 +216,25 @@ const shared = globalThis.SyncZoteroShared || {
     const normalized = String(text || "").trim().toLowerCase();
     return !normalized || normalized === "thinking" || normalized === "quick answer";
   },
+  normalizeConversationUrl: (url) => {
+    const raw = String(url || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw);
+      if (parsed.hostname.toLowerCase() === "chatgpt.com") {
+        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
+        if (match) return `${parsed.origin}/c/${match[1]}`;
+      }
+    } catch (_) {}
+    return raw.replace(/\/+$/, "");
+  },
+  conversationUrlsMatch: (actualUrl, expectedUrl) => {
+    const normalize = shared.normalizeConversationUrl ||
+      ((value) => String(value || "").replace(/\/+$/, ""));
+    const normalizedExpected = normalize(expectedUrl);
+    if (!normalizedExpected) return true;
+    return normalize(actualUrl) === normalizedExpected;
+  },
   normalizeComposerText: (text) => String(text || "").trim(),
 };
 
@@ -396,25 +415,85 @@ const SITE_ADAPTERS = {
       "textarea",
     ],
     sendButtonSelectors(composer) {
-      // Walk up from composer to find the input area container.
-      // Stop when we find a container with 2+ ds-icon-button children
-      // (the attach button + the send button).
       let container = composer;
       for (let i = 0; i < 8 && container?.parentElement; i++) {
         container = container.parentElement;
-        const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
+        const btns = container.querySelectorAll(
+          'button, [role="button"], div.ds-icon-button'
+        );
         if (btns.length >= 2) break;
       }
       if (!container) container = document.body;
 
-      const btns = container.querySelectorAll('div.ds-icon-button[role="button"]');
-      // The send button is the last one; skip the attachment button
-      for (let i = btns.length - 1; i >= 0; i--) {
-        const btn = btns[i];
-        if (btn.parentElement?.querySelector('input[type="file"]')) continue;
-        if (isVisibleElement(btn)) return btn;
+      const composerRect = composer?.getBoundingClientRect?.() || null;
+      const candidateNodes = Array.from(
+        container.querySelectorAll(
+          [
+            "button",
+            '[role="button"]',
+            "div.ds-icon-button",
+            '[class*="send"]',
+            '[class*="Send"]',
+            '[aria-label*="send"]',
+            '[aria-label*="Send"]',
+            '[data-testid*="send"]',
+            '[data-testid*="Send"]',
+          ].join(", ")
+        )
+      );
+
+      let best = null;
+      let bestScore = -Infinity;
+      const seen = new Set();
+      for (const node of candidateNodes) {
+        const btn =
+          node.closest?.('button, [role="button"], div.ds-icon-button') ||
+          node;
+        if (!btn || seen.has(btn)) continue;
+        seen.add(btn);
+        if (!isVisibleElement(btn)) continue;
+        if (btn.querySelector?.('input[type="file"]')) continue;
+        if (btn.parentElement?.querySelector?.('input[type="file"]')) continue;
+
+        const label = [
+          btn.getAttribute?.("aria-label"),
+          btn.getAttribute?.("title"),
+          btn.textContent,
+          btn.className,
+        ].filter(Boolean).join(" ").toLowerCase();
+        if (/attach|upload|file|paperclip|deepthink|search/.test(label)) {
+          continue;
+        }
+
+        const rect = btn.getBoundingClientRect?.();
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+
+        let score = 0;
+        if (composerRect) {
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          const composerCenterY = composerRect.top + composerRect.height / 2;
+          const isComposerAdjacentY =
+            centerY >= composerRect.top - 80 &&
+            centerY <= composerRect.bottom + 120;
+
+          if (!isComposerAdjacentY) continue;
+          score += centerX - composerRect.left;
+          score -= Math.abs(centerY - composerCenterY);
+          if (centerX >= composerRect.right - 140) score += 500;
+          if (centerY >= composerRect.top) score += 100;
+        }
+        if (/send|发送/.test(label)) score += 300;
+        if (/primary|circle|filled/.test(label)) score += 80;
+        if (/disabled/.test(label)) score -= 1000;
+        if (btn.tagName === "BUTTON") score += 20;
+
+        if (score > bestScore) {
+          best = btn;
+          bestScore = score;
+        }
       }
-      return null;
+      return best;
     },
     stopButtonSelectors: [
       // DeepSeek transforms the send button into a stop button during streaming
@@ -422,9 +501,9 @@ const SITE_ADAPTERS = {
       // alone, so we rely entirely on SSE [DONE] + turn completion tracker for
       // completion detection. Empty array = findStopButton() always returns null.
     ],
-    userMessageSelector: "div.ds-message:not(:has(.ds-markdown))",
+    userMessageSelector: "div.ds-message",
     assistantMessageSelectors: [
-      "div.ds-message:has(.ds-markdown)",
+      "div.ds-message",
     ],
     conversationMessageSelector: "div.ds-message",
     getMessageRole(node) {
@@ -438,17 +517,24 @@ const SITE_ADAPTERS = {
     },
     conversationTurnSelector: null, // DeepSeek doesn't use conversation-turn wrappers
     actionBarSelectors: [
-      // DeepSeek's action bar buttons are ds-icon-button siblings of the message
+      // DeepSeek's action bar buttons are custom ds-button role buttons.
+      "div.ds-button[role='button']",
       "div.ds-icon-button[role='button']",
     ],
     thinkingSelectors: [
       // DeepSeek's DeepThink thinking content
+      ".ds-think-content .ds-markdown",
+      ".ds-think-content",
+      "[class*='think'] .ds-markdown",
+      "[class*='think']",
       "[class*='thinking'] .ds-markdown",
       "[class*='thinking']",
       "[class*='reasoning'] .ds-markdown",
       "[class*='reasoning']",
     ],
     pruneThinkingSelectors: [
+      ".ds-think-content",
+      "[class*='think']",
       "[class*='thinking']",
       "[class*='reasoning']",
     ],
@@ -1039,7 +1125,16 @@ async function typePromptAndVerify(promptText) {
 // ---------------------------------------------------------------------------
 
 function isEnabledButton(btn) {
-  return Boolean(btn) && !btn.disabled && !btn.hasAttribute("disabled") && isVisibleElement(btn);
+  const classText =
+    typeof btn?.className === "string"
+      ? btn.className
+      : btn?.getAttribute?.("class") || "";
+  return Boolean(btn) &&
+    !btn.disabled &&
+    !btn.hasAttribute("disabled") &&
+    btn.getAttribute?.("aria-disabled") !== "true" &&
+    !/disabled/i.test(classText) &&
+    isVisibleElement(btn);
 }
 
 async function waitForSendButton(timeoutMs = 10000) {
@@ -1099,6 +1194,96 @@ function dispatchSubmitViaForm(composer) {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
+function dispatchPointerClick(el) {
+  if (!el) return;
+  el.focus?.();
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    button: 0,
+    buttons: 1,
+  };
+  const pointerEventInit = {
+    ...eventInit,
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true,
+  };
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    const EventCtor =
+      type.startsWith("pointer") && typeof PointerEvent === "function"
+        ? PointerEvent
+        : MouseEvent;
+    el.dispatchEvent(
+      new EventCtor(
+        type,
+        type.startsWith("pointer") ? pointerEventInit : eventInit
+      )
+    );
+  }
+}
+
+function describeSubmitControl(btn) {
+  if (!btn) return "not_found";
+  const rect = btn.getBoundingClientRect?.();
+  const classText =
+    typeof btn.className === "string"
+      ? btn.className
+      : btn.getAttribute?.("class") || "";
+  const state = isEnabledButton(btn) ? "enabled" : "disabled_or_hidden";
+  const geometry = rect
+    ? `x=${Math.round(rect.x)},y=${Math.round(rect.y)},w=${Math.round(rect.width)},h=${Math.round(rect.height)}`
+    : "no_rect";
+  return `${state}; ${btn.tagName.toLowerCase()}; class=${classText.slice(0, 120)}; ${geometry}`;
+}
+
+function buildDiagnostic(overrides = {}) {
+  const diagnostic = {
+    siteId: SITE_ADAPTER?.siteId || null,
+    phase: overrides.phase || null,
+    reasonCode: overrides.reasonCode || null,
+    message: overrides.message || null,
+    composerTextMatched:
+      typeof overrides.composerTextMatched === "boolean"
+        ? overrides.composerTextMatched
+        : null,
+    uploadDetected:
+      typeof overrides.uploadDetected === "boolean"
+        ? overrides.uploadDetected
+        : null,
+    sendControlState:
+      overrides.sendControlState ||
+      describeSubmitControl(findSendButton(findComposerNow())),
+    clickAttempts:
+      Number.isFinite(Number(overrides.clickAttempts))
+        ? Math.max(0, Math.floor(Number(overrides.clickAttempts)))
+        : null,
+    requestObserved:
+      typeof overrides.requestObserved === "boolean"
+        ? overrides.requestObserved
+        : null,
+    streamObserved:
+      typeof overrides.streamObserved === "boolean"
+        ? overrides.streamObserved
+        : null,
+    userTurnMatched:
+      typeof overrides.userTurnMatched === "boolean"
+        ? overrides.userTurnMatched
+        : null,
+    assistantTurnMatched:
+      typeof overrides.assistantTurnMatched === "boolean"
+        ? overrides.assistantTurnMatched
+        : null,
+  };
+  lastDiagnostic = {
+    ...diagnostic,
+    at: Date.now(),
+  };
+  return diagnostic;
+}
+
 function hasPromptSubmissionSignal(
   transcript,
   baselineTranscriptCount,
@@ -1134,11 +1319,14 @@ async function waitForSubmissionSignal(
   baselineUserMessageCount,
   baselineTranscriptCount,
   timeoutMs = 15000,
+  baselineActiveStreamCount = activeConversationStreamCount,
 ) {
   const deadline = Date.now() + timeoutMs;
   let observedRequestContext = null;
+  let sawComposerSubmitted = false;
 
   while (Date.now() < deadline) {
+    const isDeepSeek = SITE_ADAPTER?.siteId === "deepseek";
     if (!observedRequestContext && SITE_ADAPTER?.siteId === "deepseek") {
       observedRequestContext = findObservedDeepSeekRequestContext(
         baselineOutboundRequestSerial,
@@ -1148,47 +1336,75 @@ async function waitForSubmissionSignal(
         return {
           delivered: true,
           requestObserved: true,
+          streamObserved: false,
+          composerSubmitted: sawComposerSubmitted,
           requestContext: observedRequestContext,
         };
       }
     }
 
     const composer = findComposerNow();
+    const userMessageCount = getUserMessageCount();
+    const streamObserved =
+      SITE_ADAPTER?.siteId === "deepseek" &&
+      activeConversationStreamCount > baselineActiveStreamCount;
     const signal = shared.hasDeliverySignal({
       baselineOutboundRequestSerial,
       outboundRequestSerial,
       baselineUserMessageCount,
-      userMessageCount: document.querySelectorAll(SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']").length,
+      userMessageCount,
       stopButtonVisible: !!findStopButton(),
       composerTextAfter: readComposerText(composer),
       promptText,
     });
     if (signal) {
+      if (isDeepSeek && userMessageCount <= baselineUserMessageCount && !streamObserved) {
+        sawComposerSubmitted = composerLooksSubmitted(promptText, composer);
+      } else {
+        return {
+          delivered: true,
+          requestObserved: Boolean(observedRequestContext),
+          streamObserved,
+          composerSubmitted: sawComposerSubmitted,
+          requestContext: observedRequestContext,
+        };
+      }
+    }
+
+    if (streamObserved) {
       return {
         delivered: true,
         requestObserved: Boolean(observedRequestContext),
+        streamObserved: true,
+        composerSubmitted: sawComposerSubmitted,
         requestContext: observedRequestContext,
       };
     }
 
     if (composerLooksSubmitted(promptText, composer)) {
-      return {
-        delivered: true,
-        requestObserved: Boolean(observedRequestContext),
-        requestContext: observedRequestContext,
-      };
+      sawComposerSubmitted = true;
+      if (!isDeepSeek) {
+        return {
+          delivered: true,
+          requestObserved: Boolean(observedRequestContext),
+          streamObserved: false,
+          composerSubmitted: true,
+          requestContext: observedRequestContext,
+        };
+      }
     }
 
-    if (
-      hasPromptSubmissionSignal(
-        extractConversationTranscript(),
-        baselineTranscriptCount,
-        promptText,
-      )
-    ) {
+    const promptSubmissionSignal = hasPromptSubmissionSignal(
+      extractConversationTranscript(),
+      baselineTranscriptCount,
+      promptText,
+    );
+    if (promptSubmissionSignal) {
       return {
         delivered: true,
         requestObserved: Boolean(observedRequestContext),
+        streamObserved,
+        composerSubmitted: sawComposerSubmitted,
         requestContext: observedRequestContext,
       };
     }
@@ -1197,16 +1413,24 @@ async function waitForSubmissionSignal(
   return {
     delivered: false,
     requestObserved: Boolean(observedRequestContext),
+    streamObserved: false,
+    composerSubmitted: sawComposerSubmitted,
     requestContext: observedRequestContext,
   };
 }
 
 async function submitMessageAndVerify(promptText) {
+  if (SITE_ADAPTER?.siteId === "deepseek") {
+    return submitDeepSeekMessageAndVerify(promptText);
+  }
+
   for (let attempt = 0; attempt < 2; attempt++) {
+    let clickAttempts = 0;
     const submitStrategies = [
       async (composer) => {
         const sendBtn = await waitForSendButtonEnabled(30000);
         if (!isEnabledButton(sendBtn)) return false;
+        clickAttempts++;
         sendBtn.click();
         return true;
       },
@@ -1222,9 +1446,7 @@ async function submitMessageAndVerify(promptText) {
       }
 
       const baselineTranscriptCount = extractConversationTranscript().count;
-      const baselineUserMessageCount = document.querySelectorAll(
-        SITE_ADAPTER?.userMessageSelector || "[data-message-author-role='user']"
-      ).length;
+      const baselineUserMessageCount = getUserMessageCount();
       const baselineOutboundRequestSerial = outboundRequestSerial;
 
       const submitStarted = await submit(composer, sendBtn);
@@ -1241,6 +1463,9 @@ async function submitMessageAndVerify(promptText) {
       if (delivered.delivered || delivered.requestObserved) {
         return {
           baselineOutboundRequestSerial,
+          clickAttempts,
+          requestObserved: Boolean(delivered.requestObserved),
+          streamObserved: Boolean(delivered.streamObserved),
           requestContext:
             delivered.requestContext ||
             findObservedDeepSeekRequestContext(
@@ -1258,6 +1483,114 @@ async function submitMessageAndVerify(promptText) {
   throw new Error("Prompt delivery failed: chat did not accept the prompt after 2 attempts.");
 }
 
+async function submitDeepSeekMessageAndVerify(promptText) {
+  let totalClickAttempts = 0;
+  let lastSubmitControl = "not_checked";
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const composer = await getComposerElement();
+    const baselineTranscriptCount = extractConversationTranscript().count;
+    const baselineUserMessageCount = getUserMessageCount();
+    const baselineOutboundRequestSerial = outboundRequestSerial;
+    const baselineActiveStreamCount = activeConversationStreamCount;
+    const deadline = Date.now() + 30000;
+    let lastClickAt = 0;
+
+    while (Date.now() < deadline) {
+      const remaining = Math.max(0, deadline - Date.now());
+      const delivery = await waitForSubmissionSignal(
+        promptText,
+        baselineOutboundRequestSerial,
+        baselineUserMessageCount,
+        baselineTranscriptCount,
+        Math.min(350, remaining),
+        baselineActiveStreamCount,
+      );
+      if (delivery.delivered || delivery.requestObserved) {
+        return {
+          baselineOutboundRequestSerial,
+          clickAttempts: totalClickAttempts,
+          requestObserved: Boolean(delivery.requestObserved),
+          streamObserved: Boolean(delivery.streamObserved),
+          composerSubmitted: Boolean(delivery.composerSubmitted),
+          requestContext:
+            delivery.requestContext ||
+            findObservedDeepSeekRequestContext(
+              baselineOutboundRequestSerial,
+              promptText,
+            ) ||
+            null,
+        };
+      }
+
+      const currentComposer = findComposerNow() || composer;
+      const sendBtn = findSendButton(currentComposer);
+      lastSubmitControl = describeSubmitControl(sendBtn);
+      const now = Date.now();
+      if (isEnabledButton(sendBtn) && now - lastClickAt >= 350) {
+        lastClickAt = now;
+        totalClickAttempts++;
+        dispatchPointerClick(sendBtn);
+
+        const postClick = await waitForSubmissionSignal(
+          promptText,
+          baselineOutboundRequestSerial,
+          baselineUserMessageCount,
+          baselineTranscriptCount,
+          Math.min(1500, Math.max(0, deadline - Date.now())),
+          baselineActiveStreamCount,
+        );
+        if (postClick.delivered || postClick.requestObserved) {
+          return {
+            baselineOutboundRequestSerial,
+            clickAttempts: totalClickAttempts,
+            requestObserved: Boolean(postClick.requestObserved),
+            streamObserved: Boolean(postClick.streamObserved),
+            composerSubmitted: Boolean(postClick.composerSubmitted),
+            requestContext:
+              postClick.requestContext ||
+              findObservedDeepSeekRequestContext(
+                baselineOutboundRequestSerial,
+                promptText,
+              ) ||
+              null,
+          };
+        }
+        if (composerLooksSubmitted(promptText, currentComposer)) {
+          buildDiagnostic({
+            phase: "submitted",
+            reasonCode: "composer_changed_without_authoritative_signal",
+            clickAttempts: totalClickAttempts,
+            requestObserved: false,
+            streamObserved: false,
+          });
+        }
+      } else {
+        await workerSleep(150);
+      }
+    }
+
+    await typePromptAndVerify(promptText);
+  }
+
+  const detail = totalClickAttempts > 0
+    ? `DeepSeek send was clicked ${totalClickAttempts} time(s), but no delivery signal was observed`
+    : `no clickable DeepSeek send control was found (${lastSubmitControl})`;
+  buildDiagnostic({
+    phase: "submitted",
+    reasonCode:
+      totalClickAttempts > 0
+        ? "submit_clicked_without_delivery_signal"
+        : "send_control_not_clickable",
+    message: detail,
+    sendControlState: lastSubmitControl,
+    clickAttempts: totalClickAttempts,
+    requestObserved: false,
+    streamObserved: false,
+  });
+  throw new Error(`Prompt delivery failed: ${detail}.`);
+}
+
 // ---------------------------------------------------------------------------
 // SSE interception listener (receives data from injected.js in MAIN world)
 // ---------------------------------------------------------------------------
@@ -1270,6 +1603,11 @@ let outboundRequestSerial = 0;
 let outboundRequestEvents = [];
 let activeConversationStreamCount = 0;
 let lastTransportActivityAt = 0;
+let mainWorldInjected = false;
+let networkHookActive = false;
+let lastRequestAt = 0;
+let lastStreamAt = 0;
+let lastDiagnostic = null;
 let historyScrapeInFlight = null; // null | Promise — concurrent callers wait
 let lastScrapeDebug = null;
 
@@ -1342,8 +1680,43 @@ function findObservedDeepSeekRequestContext(
   return exact || candidates[0] || null;
 }
 
+const pendingNetworkHealthRequests = new Map();
+
+function requestMainWorldHealth(timeoutMs = 250) {
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingNetworkHealthRequests.delete(nonce);
+      resolve(false);
+    }, timeoutMs);
+    pendingNetworkHealthRequests.set(nonce, (ok) => {
+      clearTimeout(timer);
+      pendingNetworkHealthRequests.delete(nonce);
+      resolve(Boolean(ok));
+    });
+    window.postMessage({
+      type: "SYNC_ZOTERO_NETWORK_HEALTH_REQUEST",
+      nonce,
+    }, "*");
+  });
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
+  if (event.data?.type === "SYNC_ZOTERO_INJECTED_READY") {
+    mainWorldInjected = true;
+    networkHookActive = event.data.networkHookActive !== false;
+    return;
+  }
+  if (event.data?.type === "SYNC_ZOTERO_NETWORK_HEALTH") {
+    mainWorldInjected = true;
+    networkHookActive = event.data.networkHookActive !== false;
+    const nonce = event.data.nonce || null;
+    if (nonce && pendingNetworkHealthRequests.has(nonce)) {
+      pendingNetworkHealthRequests.get(nonce)(networkHookActive);
+    }
+    return;
+  }
   if (event.data?.type === "SYNC_ZOTERO_DEEPSEEK_TRANSCRIPT_CACHE") {
     storeDeepSeekTranscriptSnapshot(event.data.snapshot);
     lastTransportActivityAt = Date.now();
@@ -1357,6 +1730,8 @@ window.addEventListener("message", (event) => {
   if (event.data?.type === "SYNC_ZOTERO_SSE") {
     sseText = mergeStreamFragments(sseText, event.data.text || "");
     sseThinking = mergeStreamFragments(sseThinking || "", event.data.thinking || "") || null;
+    networkHookActive = true;
+    lastStreamAt = Date.now();
     // Only mark SSE as done when this is the last active stream.
     // During multi-tool-use flows, earlier streams finish before the
     // actual answer stream — their [DONE] should not end the pipeline.
@@ -1378,16 +1753,22 @@ window.addEventListener("message", (event) => {
     // cause premature pipeline exit.
     sseDone = false;
     sseDoneAt = 0;
+    networkHookActive = true;
+    lastStreamAt = Date.now();
     lastTransportActivityAt = Date.now();
     return;
   }
   if (event.data?.type === "SYNC_ZOTERO_REQUEST") {
     storeOutboundRequestEvent(event.data);
+    networkHookActive = true;
+    lastRequestAt = Date.now();
     lastTransportActivityAt = Date.now();
     return;
   }
   if (event.data?.type === "SYNC_ZOTERO_STREAM_STATE") {
     activeConversationStreamCount = Math.max(0, Number(event.data.activeCount) || 0);
+    networkHookActive = true;
+    if (activeConversationStreamCount > 0) lastStreamAt = Date.now();
     lastTransportActivityAt = Date.now();
   }
 });
@@ -1539,10 +1920,29 @@ function hasResponseActionBar() {
 function getAssistantMessageNodes() {
   const selectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
   for (const selector of selectors) {
-    const nodes = Array.from(document.querySelectorAll(selector));
+    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => {
+      const role =
+        SITE_ADAPTER?.getMessageRole?.(node) ||
+        node.getAttribute?.("data-message-author-role");
+      if (role) return role === "assistant";
+      return /assistant/i.test(selector);
+    });
     if (nodes.length > 0) return nodes;
   }
   return [];
+}
+
+function getUserMessageCount() {
+  const selector =
+    SITE_ADAPTER?.conversationMessageSelector ||
+    SITE_ADAPTER?.userMessageSelector ||
+    "[data-message-author-role]";
+  return Array.from(document.querySelectorAll(selector)).filter((node) => {
+    const role =
+      SITE_ADAPTER?.getMessageRole?.(node) ||
+      node.getAttribute?.("data-message-author-role");
+    return role === "user";
+  }).length;
 }
 
 function buildAssistantAnchorId(node, index) {
@@ -1722,6 +2122,14 @@ async function streamResponseSnapshots(
   const baselineOutboundRequestSerial =
     Number(submissionMeta?.baselineOutboundRequestSerial) || 0;
   let requestContext = submissionMeta?.requestContext || null;
+  const makeTurnDiagnostic = (phase, overrides = {}) => buildDiagnostic({
+    phase,
+    requestObserved: Boolean(requestContext),
+    streamObserved: activeConversationStreamCount > 0 || Boolean(sseDoneAt),
+    userTurnMatched: Boolean(userTurnKey),
+    assistantTurnMatched: Boolean(assistantTurnKey),
+    ...overrides,
+  });
 
   recordTurnDebug("baseline_transcript", {
     seq,
@@ -1744,6 +2152,7 @@ async function streamResponseSnapshots(
     baselineTranscriptCount,
     baselineTranscriptHash,
     turnStatus: "submitted",
+    diagnostic: makeTurnDiagnostic("submitted"),
   });
 
   while (Date.now() < deadline) {
@@ -1800,6 +2209,7 @@ async function streamResponseSnapshots(
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus: "submitted",
+        diagnostic: makeTurnDiagnostic("submitted", { requestObserved: true }),
       });
     }
 
@@ -1829,6 +2239,9 @@ async function streamResponseSnapshots(
             baselineTranscriptHash,
             userTurnKey,
             turnStatus: "user_turn_matched",
+            diagnostic: makeTurnDiagnostic("user_turn_matched", {
+              userTurnMatched: true,
+            }),
           });
         }
       } else if (Date.now() > userTurnDeadline) {
@@ -1852,6 +2265,10 @@ async function streamResponseSnapshots(
               seq, attempt, remoteChatUrl, remoteChatId,
               baselineTranscriptCount, baselineTranscriptHash,
               userTurnKey, turnStatus: "user_turn_matched",
+              diagnostic: makeTurnDiagnostic("user_turn_matched", {
+                reasonCode: "user_turn_position_fallback",
+                userTurnMatched: true,
+              }),
             });
           } else if (deepseekRequestObserved) {
             if (!reportedDeepSeekMissingUserTurn) {
@@ -1889,6 +2306,10 @@ async function streamResponseSnapshots(
               baselineTranscriptCount,
               baselineTranscriptHash,
               turnStatus: "done",
+              diagnostic: makeTurnDiagnostic("done", {
+                reasonCode: "sse_fallback_without_dom_user_turn",
+                streamObserved: true,
+              }),
             });
             return;
           } else {
@@ -1945,6 +2366,9 @@ async function streamResponseSnapshots(
           userTurnKey,
           assistantTurnKey,
           turnStatus: "assistant_turn_matched",
+          diagnostic: makeTurnDiagnostic("assistant_turn_matched", {
+            assistantTurnMatched: true,
+          }),
         });
       }
     } else if (
@@ -1973,6 +2397,9 @@ async function streamResponseSnapshots(
           userTurnKey,
           assistantTurnKey,
           turnStatus: "assistant_turn_matched",
+          diagnostic: makeTurnDiagnostic("assistant_turn_matched", {
+            assistantTurnMatched: true,
+          }),
         });
       }
     }
@@ -2135,6 +2562,7 @@ async function streamResponseSnapshots(
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus,
+        diagnostic: makeTurnDiagnostic(turnStatus || "streaming"),
       });
       lastRunState = runState;
       lastCompletionReason = null;
@@ -2170,6 +2598,9 @@ async function streamResponseSnapshots(
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus: "done",
+        diagnostic: makeTurnDiagnostic("done", {
+          reasonCode: "verified_done",
+        }),
       });
       return;
     }
@@ -2220,6 +2651,10 @@ async function streamResponseSnapshots(
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus: "done",
+        diagnostic: makeTurnDiagnostic("done", {
+          reasonCode: "sse_fast_completion",
+          streamObserved: true,
+        }),
       });
       return;
     }
@@ -2262,6 +2697,9 @@ async function streamResponseSnapshots(
           baselineTranscriptCount,
           baselineTranscriptHash,
           turnStatus: "done",
+          diagnostic: makeTurnDiagnostic("done", {
+            reasonCode: "action_bar_fast_completion",
+          }),
         });
         return;
       }
@@ -2315,6 +2753,9 @@ async function streamResponseSnapshots(
           baselineTranscriptCount,
           baselineTranscriptHash,
           turnStatus: "done",
+          diagnostic: makeTurnDiagnostic("done", {
+            reasonCode: "deepseek_quiescent_fast_completion",
+          }),
         });
         return;
       }
@@ -2345,6 +2786,9 @@ async function streamResponseSnapshots(
           baselineTranscriptCount,
           baselineTranscriptHash,
           turnStatus: "incomplete",
+          diagnostic: makeTurnDiagnostic("incomplete", {
+            reasonCode: "deepseek_quiescent_incomplete",
+          }),
         });
         return;
       }
@@ -2376,6 +2820,9 @@ async function streamResponseSnapshots(
         userTurnKey,
         assistantTurnKey,
         turnStatus: "assistant_settling",
+        diagnostic: makeTurnDiagnostic("assistant_settling", {
+          reasonCode: "forced_cancel_attempt",
+        }),
       });
       await workerSleep(1500);
       continue;
@@ -2421,6 +2868,9 @@ async function streamResponseSnapshots(
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus: "incomplete",
+        diagnostic: makeTurnDiagnostic("incomplete", {
+          reasonCode: "forced_cancel_incomplete",
+        }),
       });
       return;
     }
@@ -2472,6 +2922,9 @@ async function streamResponseSnapshots(
       baselineTranscriptCount,
       baselineTranscriptHash,
       turnStatus: "incomplete",
+      diagnostic: makeTurnDiagnostic("incomplete", {
+        reasonCode: "timeout_incomplete",
+      }),
     });
     return;
   }
@@ -2863,7 +3316,9 @@ function getCurrentChatId(url = getCurrentChatUrl()) {
 }
 
 function normalizeUrl(url) {
-  return String(url || "").replace(/\/+$/, "");
+  return shared.normalizeConversationUrl
+    ? shared.normalizeConversationUrl(url)
+    : String(url || "").replace(/\/+$/, "");
 }
 
 function cloneRelayMessage(message) {
@@ -3931,8 +4386,48 @@ async function scrapeAllMessages(options = {}) {
 // PING handler (used by background to check if content script is alive)
 // ---------------------------------------------------------------------------
 
+async function collectHealthStatus() {
+  const hookResponded = await requestMainWorldHealth();
+  const composer = findComposerNow();
+  const sendBtn = findSendButton(composer);
+  const uploadControl = document.querySelector('input[type="file"]');
+  return {
+    ok: true,
+    contentScriptAlive: true,
+    siteId: SITE_ADAPTER?.siteId || null,
+    url: window.location.href,
+    mainWorldInjected: mainWorldInjected || hookResponded,
+    composerFound: Boolean(composer),
+    sendControlState: describeSubmitControl(sendBtn),
+    uploadControlFound: Boolean(uploadControl),
+    networkHookActive: networkHookActive || hookResponded,
+    lastRequestAt: lastRequestAt || null,
+    lastStreamAt: lastStreamAt || null,
+    lastDiagnostic,
+  };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "PING") { sendResponse({ pong: true }); return false; }
+
+  if (msg.type === "HEALTH_CHECK") {
+    collectHealthStatus()
+      .then((status) => sendResponse(status))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          contentScriptAlive: true,
+          siteId: SITE_ADAPTER?.siteId || null,
+          url: window.location.href,
+          lastDiagnostic: buildDiagnostic({
+            phase: "health_check",
+            reasonCode: "health_check_failed",
+            message: err?.message || String(err),
+          }),
+        }),
+      );
+    return true;
+  }
 
   // [webchat] Trigger immediate sidebar history scrape (force re-send)
   if (msg.type === "SCRAPE_HISTORY_NOW") {
@@ -4055,6 +4550,9 @@ if (!window.__syncZoteroListenerRegistered) {
 
       const seq = msg.seq; // track seq for end-to-end validation
       const attempt = msg.attempt || 0;
+      let uploadDetected = false;
+      let composerTextMatched = false;
+      let clickAttempts = 0;
 
       try {
         const baselineTranscript = extractConversationTranscript();
@@ -4066,21 +4564,49 @@ if (!window.__syncZoteroListenerRegistered) {
         // Attach PDF whenever provided — the plugin controls when to send via chip state
         if (msg.pdfBase64) {
           await attachPDF(msg.pdfBase64, msg.pdfFilename);
+          uploadDetected = true;
         }
         if (msg.images && msg.images.length > 0) {
           console.log(`[sync-zotero] Attaching ${msg.images.length} image(s)…`);
           try {
             await attachImages(msg.images);
+            uploadDetected = true;
           } catch (imgErr) {
             console.warn("[sync-zotero] Image attachment failed:", imgErr);
           }
         }
         // Mode switching disabled — users control thinking mode directly on chatgpt.com
         await typePromptAndVerify(msg.prompt);
-        port.postMessage({ type: "phase", seq, attempt, phase: "prompt_applied" });
+        composerTextMatched = true;
+        port.postMessage({
+          type: "phase",
+          seq,
+          attempt,
+          phase: "prompt_applied",
+          diagnostic: buildDiagnostic({
+            phase: "prompt_applied",
+            composerTextMatched,
+            uploadDetected,
+            clickAttempts,
+          }),
+        });
 
         const submission = await submitMessageAndVerify(msg.prompt);
-        port.postMessage({ type: "phase", seq, attempt, phase: "submitted" });
+        clickAttempts = Number(submission?.clickAttempts) || clickAttempts;
+        port.postMessage({
+          type: "phase",
+          seq,
+          attempt,
+          phase: "submitted",
+          diagnostic: buildDiagnostic({
+            phase: "submitted",
+            composerTextMatched,
+            uploadDetected,
+            clickAttempts,
+            requestObserved: Boolean(submission?.requestObserved),
+            streamObserved: Boolean(submission?.streamObserved),
+          }),
+        });
 
         await streamResponseSnapshots(
           port,
@@ -4094,7 +4620,22 @@ if (!window.__syncZoteroListenerRegistered) {
         );
 
       } catch (err) {
-        try { port.postMessage({ type: "error", seq, attempt, error: err.message }); } catch (_) {}
+        try {
+          port.postMessage({
+            type: "error",
+            seq,
+            attempt,
+            error: err.message,
+            diagnostic: buildDiagnostic({
+              phase: "error",
+              reasonCode: "pipeline_error",
+              message: err.message,
+              composerTextMatched,
+              uploadDetected,
+              clickAttempts,
+            }),
+          });
+        } catch (_) {}
       }
     });
   });

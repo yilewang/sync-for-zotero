@@ -923,6 +923,17 @@
     }
     if (event.data?.type === "SYNC_ZOTERO_NETWORK_CACHE_CLEAR") {
       clearDeepSeekNetworkCache(event.data.scope || "all");
+      return;
+    }
+    if (event.data?.type === "SYNC_ZOTERO_NETWORK_HEALTH_REQUEST") {
+      postPageEvent({
+        type: "SYNC_ZOTERO_NETWORK_HEALTH",
+        nonce: event.data.nonce || null,
+        patchVersion: PATCH_VERSION,
+        networkHookActive: true,
+        activeStreamCount: activeConversationStreamCount,
+        timestamp: Date.now(),
+      });
     }
   });
 
@@ -1144,6 +1155,14 @@
     window.WebSocket.prototype = OriginalWebSocket.prototype;
   }
   // ── Fine patch WebSocket ───────────────────────────────────────────────────
+
+  postPageEvent({
+    type: "SYNC_ZOTERO_INJECTED_READY",
+    host: currentHost,
+    patchVersion: PATCH_VERSION,
+    networkHookActive: true,
+    timestamp: Date.now(),
+  });
 
   function postActiveStreamCount() {
     postPageEvent({
