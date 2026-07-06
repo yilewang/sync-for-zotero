@@ -13,21 +13,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Crea il pacchetto Chrome (zip) come previsto dall'autore
-      - name: Zip extension folder
+      # 1. Build the Chrome package (.zip)
+      - name: Zip extension folder (Chrome)
         run: zip -r extension.zip extension/
 
-      # 2. Genera la versione Firefox al volo partendo da quella Chrome
-      - name: Genera e crea pacchetto Firefox (XPI)
+      # 2. Build the Firefox package (.xpi) on the fly from the Chrome source
+      - name: Generate and build Firefox package (XPI)
         run: |
-          # Copia temporanea della cartella originale
+          # Create a temporary folder for the Firefox build
           cp -r extension extension-firefox-build
           cd extension-firefox-build
           
-          # Applica le modifiche a background.js
-          sed -i 's/importScripts("webchat_shared.js");/\/\/ importScripts rimosso per Firefox/g' background.js
+          # Remove importScripts from background.js since Firefox event pages do not support it
+          sed -i 's/importScripts("webchat_shared.js");/\/\/ importScripts removed for Firefox/g' background.js
           
-          # Modifica manifest.json usando jq per renderlo compatibile con Firefox
+          # Modify manifest.json dynamically using jq for Firefox compatibility
           jq '
             del(.minimum_chrome_version) | 
             .browser_specific_settings = {"gecko": {"id": "sync-for-zotero@unipd.it", "strict_min_version": "115.0"}} | 
@@ -37,11 +37,11 @@ jobs:
           ' manifest.json > manifest_tmp.json
           mv manifest_tmp.json manifest.json
           
-          # Crea il pacchetto .xpi zippando da DENTRO la cartella (Firefox lo richiede alla radice)
+          # Package the .xpi by zipping from inside the folder (Firefox requires manifest.json at the root)
           zip -r ../extension-firefox.xpi *
           cd ..
 
-      # 3. Carica entrambi i file (.zip per Chrome e .xpi per Firefox) nella Release
+      # 3. Upload both assets (Chrome .zip and Firefox .xpi) to the published release
       - name: Upload to release
         run: |
           gh release upload "${{ github.event.release.tag_name }}" extension.zip --clobber
