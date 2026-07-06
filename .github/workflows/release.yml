@@ -13,10 +13,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Crea il pacchetto Chrome (zip) come previsto dall'autore
       - name: Zip extension folder
         run: zip -r extension.zip extension/
 
+      # 2. Genera la versione Firefox al volo partendo da quella Chrome
+      - name: Genera e crea pacchetto Firefox (XPI)
+        run: |
+          # Copia temporanea della cartella originale
+          cp -r extension extension-firefox-build
+          cd extension-firefox-build
+          
+          # Applica le modifiche a background.js
+          sed -i 's/importScripts("webchat_shared.js");/\/\/ importScripts rimosso per Firefox/g' background.js
+          
+          # Modifica manifest.json usando jq per renderlo compatibile con Firefox
+          jq '
+            del(.minimum_chrome_version) | 
+            .browser_specific_settings = {"gecko": {"id": "sync-for-zotero@unipd.it", "strict_min_version": "115.0"}} | 
+            del(.background.service_worker) | 
+            .background.scripts = ["webchat_shared.js", "background.js"] | 
+            del(.content_scripts[] | select(.world == "MAIN"))
+          ' manifest.json > manifest_tmp.json
+          mv manifest_tmp.json manifest.json
+          
+          # Crea il pacchetto .xpi zippando da DENTRO la cartella (Firefox lo richiede alla radice)
+          zip -r ../extension-firefox.xpi *
+          cd ..
+
+      # 3. Carica entrambi i file (.zip per Chrome e .xpi per Firefox) nella Release
       - name: Upload to release
-        run: gh release upload "${{ github.event.release.tag_name }}" extension.zip --clobber
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" extension.zip --clobber
+          gh release upload "${{ github.event.release.tag_name }}" extension-firefox.xpi --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
