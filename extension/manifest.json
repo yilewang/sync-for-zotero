@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Sync for Zotero",
   "version": "0.0.10",
-  "description": "Bridge LLM for Zotero with ChatGPT and DeepSeek web chats",
+  "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek and Lucrez-IA web chats",
   "minimum_chrome_version": "102",
   "permissions": [
     "tabs",
@@ -14,6 +14,8 @@
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.deepseek.com/*",
+    "https://web.lucrezia.unipd.it/*",
+    "https://mrh6ov00t4.execute-api.eu-west-1.amazonaws.com/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
@@ -22,13 +24,21 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.deepseek.com/*",
+        "https://web.lucrezia.unipd.it/*"
+      ],
       "js": ["injected.js"],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.deepseek.com/*",
+        "https://web.lucrezia.unipd.it/*"
+      ],
       "js": ["webchat_shared.js", "content_script.js"],
       "run_at": "document_idle"
     }
@@ -38,8 +48,8 @@
     "default_title": "Sync for Zotero"
   },
   "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
     "128": "icons/icon128.png"
   }
 }
