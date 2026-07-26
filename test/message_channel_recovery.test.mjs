@@ -220,6 +220,55 @@ test("does not shorten completion timing from the action bar alone", () => {
   );
 });
 
+test("uses a short verification window only for combined terminal signals", () => {
+  const strongSignal = {
+    sseDone: false,
+    transportObserved: true,
+    activeConversationStreamCount: 0,
+    actionBarVisible: true,
+    stopButtonVisible: false,
+    busyComposer: false,
+  };
+
+  assert.equal(
+    shared.hasStrongTransportCompletionSignal(strongSignal),
+    true,
+  );
+  assert.equal(
+    shared.hasStrongTransportCompletionSignal({
+      ...strongSignal,
+      stopButtonVisible: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shared.hasStrongTransportCompletionSignal({
+      ...strongSignal,
+      actionBarVisible: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shared.hasStrongTransportCompletionSignal({
+      ...strongSignal,
+      transportObserved: false,
+    }),
+    false,
+  );
+  assert.deepEqual(
+    shared.completionTimingForSignals({
+      ...strongSignal,
+      strongTransportCompletion: true,
+      answerVisible: true,
+      toolUseDetected: false,
+    }),
+    {
+      quietWindowMs: 500,
+      reboundWindowMs: 250,
+    },
+  );
+});
+
 test("rejects a growing answer prefix as a stable terminal snapshot", () => {
   assert.equal(
     shared.terminalAnswerSnapshotIsStable(

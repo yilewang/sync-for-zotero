@@ -13,6 +13,85 @@
 (function () {
   "use strict";
 
+  const COMPOSER_BRIDGE_VERSION = 1;
+  if (
+    (window.__syncZoteroComposerBridgeVersion || 0) <
+    COMPOSER_BRIDGE_VERSION
+  ) {
+    window.__syncZoteroComposerBridgeVersion = COMPOSER_BRIDGE_VERSION;
+    window.addEventListener("message", (event) => {
+      const payload = event.data;
+      if (
+        !payload ||
+        payload.source !== "sync-zotero-content" ||
+        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT" ||
+        typeof payload.requestId !== "string"
+      ) {
+        return;
+      }
+
+      let ok = false;
+      let actualText = "";
+      let error = null;
+      window.__syncZoteroLastComposerBridge = {
+        requestId: payload.requestId,
+        receivedAt: Date.now(),
+        textLength: String(payload.text || "").length,
+        ok: false,
+        error: null,
+      };
+      try {
+        const composer = document.querySelector("#prompt-textarea");
+        if (!(composer instanceof HTMLElement)) {
+          throw new Error("ChatGPT composer was not found.");
+        }
+
+        composer.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(composer);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+
+        const clipboardData = new DataTransfer();
+        clipboardData.setData("text/plain", String(payload.text || ""));
+        composer.dispatchEvent(new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          clipboardData,
+        }));
+
+        actualText = composer.innerText || composer.textContent || "";
+        ok = normalizeWhitespace(actualText) ===
+          normalizeWhitespace(payload.text || "");
+      } catch (cause) {
+        error = String(cause?.message || cause || "Composer update failed.");
+      }
+      window.__syncZoteroLastComposerBridge = {
+        ...window.__syncZoteroLastComposerBridge,
+        completedAt: Date.now(),
+        ok,
+        error,
+      };
+      window.__syncZoteroComposerBridgeHistory = [
+        ...(Array.isArray(window.__syncZoteroComposerBridgeHistory)
+          ? window.__syncZoteroComposerBridgeHistory
+          : []),
+        window.__syncZoteroLastComposerBridge,
+      ].slice(-12);
+
+      window.postMessage({
+        source: "sync-zotero-page",
+        type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT",
+        requestId: payload.requestId,
+        ok,
+        actualText,
+        error,
+      }, "*");
+    });
+  }
+
   const PATCH_VERSION = 4;
   if (window.__syncZoteroFetchPatched >= PATCH_VERSION) return;
   window.__syncZoteroFetchPatched = PATCH_VERSION;

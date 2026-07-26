@@ -27,6 +27,186 @@
     return collapse(a) === collapse(b);
   }
 
+  function normalizeAttachmentEvidence(text) {
+    return String(text || "")
+      .normalize("NFC")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function attachmentEvidenceMatchesFilename(evidence, expectedFilename) {
+    const normalizedEvidence = normalizeAttachmentEvidence(evidence);
+    const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
+    if (!normalizedFilename || !normalizedEvidence) return false;
+    if (normalizedEvidence.includes(normalizedFilename)) return true;
+
+    const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
+    if (!pdfMatch) return false;
+    const escapeRegExp = (value) =>
+      value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const providerDuplicateName = new RegExp(
+      `${escapeRegExp(pdfMatch[1])}\\s*\\(\\d+\\)${escapeRegExp(pdfMatch[2])}(?:\\b|$)`,
+      "i",
+    );
+    return providerDuplicateName.test(normalizedEvidence);
+  }
+
+  function attachmentEvidenceIsReady(evidence, expectedFilename) {
+    if (!attachmentEvidenceMatchesFilename(evidence, expectedFilename)) {
+      return false;
+    }
+    const normalizedEvidence = normalizeAttachmentEvidence(evidence);
+    return !(
+      /\b(?:parsing|uploading|processing|scanning|reading)\b/.test(
+        normalizedEvidence,
+      ) ||
+      /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
+        normalizedEvidence,
+      )
+    );
+  }
+
+  function attachmentEvidenceHasFileCardSignal(
+    evidence,
+    hasExplicitFileControl = false,
+  ) {
+    const normalizedEvidence = normalizeAttachmentEvidence(evidence);
+    return Boolean(
+      /\b\d+(?:\.\d+)?\s*(?:kb|mb|gb)\b/.test(normalizedEvidence) ||
+        /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/.test(
+          normalizedEvidence,
+        ) ||
+        /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
+          normalizedEvidence,
+        ) ||
+        (hasExplicitFileControl && /\bpdf\b/.test(normalizedEvidence)),
+    );
+  }
+
+  function hasPendingPdfEvidence(evidenceList) {
+    return (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) =>
+      /\.pdf(?:\b|$)/i.test(normalizeAttachmentEvidence(evidence)),
+    );
+  }
+
+  function attachmentListContainsExpectedFilename(
+    attachments,
+    expectedFilename,
+  ) {
+    return (Array.isArray(attachments) ? attachments : []).some((attachment) =>
+      attachmentEvidenceMatchesFilename(attachment, expectedFilename),
+    );
+  }
+
+  function conversationMessagesAfterBaseline(
+    currentMessages,
+    baselineMessages,
+    baselineCount = 0,
+  ) {
+    const current = Array.isArray(currentMessages) ? currentMessages : [];
+    const baseline = Array.isArray(baselineMessages) ? baselineMessages : [];
+    const baselineKeys = new Set(
+      baseline
+        .map((message) => String(message?.messageKey || ""))
+        .filter(Boolean),
+    );
+    const messagesWithNewKeys = baselineKeys.size > 0
+      ? current.filter((message) => {
+        const key = String(message?.messageKey || "");
+        return key && !baselineKeys.has(key);
+      })
+      : [];
+
+    if (messagesWithNewKeys.length > 0) {
+      return messagesWithNewKeys;
+    }
+    return current.slice(Math.max(0, Number(baselineCount) || 0));
+  }
+
+  function hasNewExpectedAttachmentEvidence({
+    baselineEvidence = [],
+    currentEvidence = [],
+    expectedFilename = "",
+    requireReady = true,
+  } = {}) {
+    const countMatchingEvidence = (evidenceList) =>
+      (Array.isArray(evidenceList) ? evidenceList : []).filter((evidence) =>
+        requireReady
+          ? attachmentEvidenceIsReady(evidence, expectedFilename)
+          : attachmentEvidenceMatchesFilename(evidence, expectedFilename),
+      ).length;
+
+    return (
+      countMatchingEvidence(currentEvidence) >
+      countMatchingEvidence(baselineEvidence)
+    );
+  }
+
+  async function waitForNewExpectedAttachmentEvidence({
+    baselineEvidence = [],
+    expectedFilename = "",
+    readEvidence,
+    wait,
+    now = () => Date.now(),
+    timeoutMs = 7000,
+    pollIntervalMs = 100,
+    requireReady = true,
+  } = {}) {
+    if (!expectedFilename) {
+      throw new TypeError("expectedFilename is required");
+    }
+    if (typeof readEvidence !== "function") {
+      throw new TypeError("readEvidence must be a function");
+    }
+    if (typeof wait !== "function") {
+      throw new TypeError("wait must be a function");
+    }
+
+    const startedAt = now();
+    const boundedTimeoutMs = Math.max(0, Number(timeoutMs) || 0);
+    const boundedPollIntervalMs = Math.max(
+      10,
+      Number(pollIntervalMs) || 100,
+    );
+    const deadline = startedAt + boundedTimeoutMs;
+
+    while (true) {
+      const currentEvidence = await readEvidence();
+      if (
+        hasNewExpectedAttachmentEvidence({
+          baselineEvidence,
+          currentEvidence,
+          expectedFilename,
+          requireReady,
+        })
+      ) {
+        const evidence = currentEvidence.find((entry) =>
+          requireReady
+            ? attachmentEvidenceIsReady(entry, expectedFilename)
+            : attachmentEvidenceMatchesFilename(entry, expectedFilename),
+        );
+        return {
+          evidence: evidence || expectedFilename,
+          elapsedMs: Math.max(0, now() - startedAt),
+        };
+      }
+
+      const currentTime = now();
+      if (currentTime >= deadline) {
+        throw new Error(
+          requireReady
+            ? `The website did not confirm that "${expectedFilename}" was ready.`
+            : `The website did not confirm attachment of "${expectedFilename}".`,
+        );
+      }
+      await wait(
+        Math.min(boundedPollIntervalMs, Math.max(0, deadline - currentTime)),
+      );
+    }
+  }
+
   function isPlaceholderAssistantText(text) {
     const normalized = normalizeComposerText(text).toLowerCase();
     const collapsed = normalized.replace(/\s+/g, " ").trim();
@@ -121,11 +301,30 @@
     return tab?.active === false;
   }
 
+  function hasStrongTransportCompletionSignal(signals = {}) {
+    return Boolean(
+      (signals.sseDone === true || signals.transportObserved === true) &&
+        Number(signals.activeConversationStreamCount || 0) === 0 &&
+        signals.actionBarVisible === true &&
+        signals.stopButtonVisible !== true &&
+        signals.busyComposer !== true,
+    );
+  }
+
   function completionTimingForSignals(signals = {}) {
     if (signals.toolUseDetected === true) {
       return {
         quietWindowMs: 15000,
         reboundWindowMs: 3000,
+      };
+    }
+    if (
+      signals.strongTransportCompletion === true &&
+      signals.answerVisible === true
+    ) {
+      return {
+        quietWindowMs: 500,
+        reboundWindowMs: 250,
       };
     }
     if (
@@ -422,16 +621,24 @@
     TURN_COMPLETION_QUIET_WINDOW_MS,
     TURN_COMPLETION_REBOUND_WINDOW_MS,
     advanceTurnCompletionTracker,
+    attachmentListContainsExpectedFilename,
+    attachmentEvidenceMatchesFilename,
+    attachmentEvidenceHasFileCardSignal,
+    attachmentEvidenceIsReady,
     attemptToken,
     canReuseReadyTranscriptForScrape,
     classifyContentScriptMessageError,
     completionTimingForSignals,
     composerTextMatchesPrompt,
+    conversationMessagesAfterBaseline,
     contentScriptMessageRetryDelayMs,
     conversationUrlsMatch,
     createTurnCompletionTracker,
     hasMeaningfulAssistantText,
+    hasNewExpectedAttachmentEvidence,
+    hasPendingPdfEvidence,
     hasDeliverySignal,
+    hasStrongTransportCompletionSignal,
     isPlaceholderAssistantText,
     isRecoverableContentScriptMessageError,
     isRetrySafeContentScriptMessage,
@@ -441,5 +648,6 @@
     tabNeedsActivation,
     tabNeedsLifecycleReload,
     terminalAnswerSnapshotIsStable,
+    waitForNewExpectedAttachmentEvidence,
   };
 });

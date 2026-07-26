@@ -217,6 +217,12 @@ const shared = globalThis.SyncZoteroShared || {
       return { quietWindowMs: 15000, reboundWindowMs: 3000 };
     }
     if (
+      signals.strongTransportCompletion === true &&
+      signals.answerVisible === true
+    ) {
+      return { quietWindowMs: 500, reboundWindowMs: 250 };
+    }
+    if (
       signals.sseDone === true &&
       Number(signals.activeConversationStreamCount || 0) === 0 &&
       signals.answerVisible === true
@@ -225,6 +231,12 @@ const shared = globalThis.SyncZoteroShared || {
     }
     return { quietWindowMs: 7000, reboundWindowMs: 1500 };
   },
+  hasStrongTransportCompletionSignal: (signals = {}) =>
+    (signals.sseDone === true || signals.transportObserved === true) &&
+    Number(signals.activeConversationStreamCount || 0) === 0 &&
+    signals.actionBarVisible === true &&
+    signals.stopButtonVisible !== true &&
+    signals.busyComposer !== true,
   isPlaceholderAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase();
     return !normalized || normalized === "thinking" || normalized === "quick answer";
@@ -249,6 +261,122 @@ const shared = globalThis.SyncZoteroShared || {
     return normalize(actualUrl) === normalizedExpected;
   },
   normalizeComposerText: (text) => String(text || "").trim(),
+  conversationMessagesAfterBaseline: (
+    currentMessages,
+    _baselineMessages,
+    baselineCount,
+  ) =>
+    (Array.isArray(currentMessages) ? currentMessages : [])
+      .slice(Math.max(0, Number(baselineCount) || 0)),
+  attachmentEvidenceMatchesFilename: (evidence, expectedFilename) => {
+    const normalize = (value) =>
+      String(value || "")
+        .normalize("NFC")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    const normalizedEvidence = normalize(evidence);
+    const normalizedFilename = normalize(expectedFilename);
+    if (!normalizedFilename || !normalizedEvidence) return false;
+    if (normalizedEvidence.includes(normalizedFilename)) return true;
+    const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
+    if (!pdfMatch) return false;
+    const escapeRegExp = (value) =>
+      value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(
+      `${escapeRegExp(pdfMatch[1])}\\s*\\(\\d+\\)${escapeRegExp(pdfMatch[2])}(?:\\b|$)`,
+      "i",
+    ).test(normalizedEvidence);
+  },
+  attachmentEvidenceIsReady: (evidence, expectedFilename) =>
+    shared.attachmentEvidenceMatchesFilename(evidence, expectedFilename) &&
+    !/\b(?:parsing|uploading|processing|scanning|reading)\b/i.test(
+      String(evidence || ""),
+    ),
+  attachmentEvidenceHasFileCardSignal: (
+    evidence,
+    hasExplicitFileControl = false,
+  ) =>
+    /\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b/i.test(String(evidence || "")) ||
+    /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/i.test(
+      String(evidence || ""),
+    ) ||
+    (hasExplicitFileControl && /\bPDF\b/i.test(String(evidence || ""))),
+  hasPendingPdfEvidence: (evidenceList) =>
+    (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) =>
+      /\.pdf(?:\b|$)/i.test(String(evidence || "")),
+    ),
+  attachmentListContainsExpectedFilename: (
+    attachments,
+    expectedFilename,
+  ) =>
+    (Array.isArray(attachments) ? attachments : []).some((attachment) =>
+      shared.attachmentEvidenceMatchesFilename(
+        attachment,
+        expectedFilename,
+      ),
+    ),
+  hasNewExpectedAttachmentEvidence: ({
+    baselineEvidence = [],
+    currentEvidence = [],
+    expectedFilename = "",
+    requireReady = true,
+  } = {}) => {
+    const matches = (entry) =>
+      requireReady
+        ? shared.attachmentEvidenceIsReady(entry, expectedFilename)
+        : shared.attachmentEvidenceMatchesFilename(
+          entry,
+          expectedFilename,
+        );
+    return currentEvidence.filter(matches).length >
+      baselineEvidence.filter(matches).length;
+  },
+  waitForNewExpectedAttachmentEvidence: async ({
+    baselineEvidence = [],
+    expectedFilename = "",
+    readEvidence,
+    wait,
+    timeoutMs = 7000,
+    pollIntervalMs = 100,
+    requireReady = true,
+  } = {}) => {
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+    while (true) {
+      const currentEvidence = await readEvidence();
+      if (shared.hasNewExpectedAttachmentEvidence({
+        baselineEvidence,
+        currentEvidence,
+        expectedFilename,
+        requireReady,
+      })) {
+        return {
+          evidence:
+            currentEvidence.find((entry) =>
+              requireReady
+                ? shared.attachmentEvidenceIsReady(
+                  entry,
+                  expectedFilename,
+                )
+                : shared.attachmentEvidenceMatchesFilename(
+                  entry,
+                  expectedFilename,
+                ),
+            ) || expectedFilename,
+          elapsedMs: Date.now() - startedAt,
+        };
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          requireReady
+            ? `The website did not confirm that "${expectedFilename}" was ready.`
+            : `The website did not confirm attachment of "${expectedFilename}".`,
+        );
+      }
+      await wait(Math.min(pollIntervalMs, deadline - Date.now()));
+    }
+  },
   terminalAnswerSnapshotIsStable: (candidate, latest) => {
     const candidateText = String(candidate?.text || "").trim();
     const latestText = String(latest?.text || "").trim();
@@ -727,13 +855,96 @@ function dispatchComposerInput(composer, inputType, data) {
   composer.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function setContentEditableText(composer, promptText) {
+let composerTextBridgeSerial = 0;
+
+function setMainWorldChatGPTComposerText(promptText, timeoutMs = 1000) {
+  const requestId = [
+    Date.now(),
+    ++composerTextBridgeSerial,
+    Math.random().toString(36).slice(2),
+  ].join(":");
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("message", onMessage);
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const onMessage = (event) => {
+      const payload = event.data;
+      if (
+        !payload ||
+        payload.source !== "sync-zotero-page" ||
+        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT" ||
+        payload.requestId !== requestId
+      ) {
+        return;
+      }
+      finish(payload.ok === true);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    window.addEventListener("message", onMessage);
+    window.postMessage({
+      source: "sync-zotero-content",
+      type: "SYNC_ZOTERO_SET_COMPOSER_TEXT",
+      requestId,
+      text: String(promptText || ""),
+    }, "*");
+  });
+}
+
+async function setContentEditableText(composer, promptText) {
+  composer.focus();
   const selection = window.getSelection();
   const range = document.createRange();
   range.selectNodeContents(composer);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+
+  // ChatGPT's composer is ProseMirror-backed. Its paste handler applies a real
+  // editor transaction (including replacement with an empty string), whereas
+  // direct DOM mutation and execCommand can make text visible without updating
+  // the editor state that controls Send.
+  if (SITE_ADAPTER?.siteId === "chatgpt") {
+    try {
+      const updated = await setMainWorldChatGPTComposerText(promptText);
+      if (updated &&
+        shared.composerTextMatchesPrompt(
+          shared.normalizeComposerText(promptText),
+          shared.normalizeComposerText(
+            readComposerText(findComposerNow() || composer),
+          ),
+        )
+      ) {
+        return;
+      }
+    } catch (_) {
+      // Fall through to generic contenteditable insertion.
+    }
+  }
+
+  // execCommand is retained for other contenteditable composers and as a
+  // compatibility fallback when a site does not handle synthetic paste.
+  let insertedByEditor = false;
+  try {
+    if (typeof document.execCommand === "function") {
+      document.execCommand("delete", false);
+      insertedByEditor = !promptText ||
+        document.execCommand("insertText", false, promptText);
+    }
+  } catch (_) {
+    insertedByEditor = false;
+  }
+
+  if (insertedByEditor) return;
+
+  range.selectNodeContents(composer);
   range.deleteContents();
   range.collapse(true);
-
   if (!promptText) {
     composer.textContent = "";
     selection?.removeAllRanges();
@@ -744,12 +955,10 @@ function setContentEditableText(composer, promptText) {
 
   const textNode = document.createTextNode(promptText);
   range.insertNode(textNode);
-
   range.setStartAfter(textNode);
   range.collapse(true);
   selection?.removeAllRanges();
   selection?.addRange(range);
-
   dispatchComposerInput(composer, "insertText", promptText);
 }
 
@@ -796,7 +1005,204 @@ async function attachImages(imageDataUrls) {
 // Step 1b: Attach PDF
 // ---------------------------------------------------------------------------
 
+const PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS = 15000;
+const PDF_ATTACHMENT_READY_TIMEOUT_MS = 30000;
+const PDF_ATTACHMENT_POLL_INTERVAL_MS = 100;
+const SUBMITTED_PDF_VERIFY_TIMEOUT_MS = 3000;
+
+function readAttachmentEvidenceText(element) {
+  if (!element) return "";
+  const renderedText =
+    typeof element.innerText === "string"
+      ? element.innerText
+      : element.textContent;
+  return [
+    element.getAttribute?.("aria-label"),
+    element.getAttribute?.("title"),
+    renderedText,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasExplicitComposerFileControl(region, expectedFilename) {
+  if (!region) return false;
+  const selectors = [
+    "[data-testid*='file']",
+    "[class*='attachment']",
+    "[class*='file-pill']",
+    "button[aria-label*='Remove file']",
+  ];
+  return selectors.some((selector) =>
+    Array.from(region.querySelectorAll?.(selector) || []).some((control) => {
+      if (!isVisibleElement(control)) return false;
+      const controlText = readAttachmentEvidenceText(control);
+      return expectedFilename
+        ? shared.attachmentEvidenceMatchesFilename(
+          controlText,
+          expectedFilename,
+        )
+        : shared.hasPendingPdfEvidence([controlText]);
+    }),
+  );
+}
+
+function collectComposerRegionAttachmentEvidence(
+  expectedFilename,
+  messageSelector,
+) {
+  const composer = findComposerNow();
+  if (!composer) return null;
+  let region = composer?.parentElement || null;
+
+  for (let depth = 0; depth < 8 && region; depth++) {
+    if (
+      region.matches?.("main, [role='main'], .ds-virtual-list") ||
+      region.querySelector?.(messageSelector)
+    ) {
+      break;
+    }
+    const text = readAttachmentEvidenceText(region);
+    if (text.length > 5000) {
+      break;
+    }
+    const hasExplicitFileControl =
+      hasExplicitComposerFileControl(region, expectedFilename);
+    const hasAttachmentMetadata =
+      shared.attachmentEvidenceHasFileCardSignal(
+        text,
+        hasExplicitFileControl,
+      );
+    const matchesExpected = expectedFilename
+      ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
+      : shared.hasPendingPdfEvidence([text]);
+    if (matchesExpected && hasAttachmentMetadata) {
+      if (!expectedFilename) {
+        return [text];
+      }
+      const normalizedText = String(text || "").normalize("NFC").toLowerCase();
+      const normalizedFilename = String(expectedFilename || "")
+        .normalize("NFC")
+        .toLowerCase();
+      let occurrenceCount = 0;
+      let searchFrom = 0;
+      while (normalizedFilename) {
+        const foundAt = normalizedText.indexOf(
+          normalizedFilename,
+          searchFrom,
+        );
+        if (foundAt < 0) break;
+        occurrenceCount += 1;
+        searchFrom = foundAt + normalizedFilename.length;
+      }
+      return Array(Math.max(1, occurrenceCount)).fill(text);
+    }
+    region = region.parentElement;
+  }
+
+  return [];
+}
+
+function collectVisibleComposerAttachmentEvidence(expectedFilename) {
+  const selector =
+    SITE_ADAPTER?.attachmentPillSelector ||
+    '[data-testid*="file"], [class*="attachment"], [class*="file-pill"]';
+  const messageSelector =
+    SITE_ADAPTER?.conversationMessageSelector ||
+    "[data-message-author-role]";
+  const composerRegionEvidence =
+    collectComposerRegionAttachmentEvidence(
+      expectedFilename,
+      messageSelector,
+    );
+  if (composerRegionEvidence !== null) {
+    return composerRegionEvidence;
+  }
+  const evidence = [];
+  const seenEvidenceNodes = new Set();
+  const candidates = Array.from(document.querySelectorAll(selector));
+  const seenCandidates = new Set(candidates);
+  document
+    .querySelectorAll("div, span, [aria-label], [title]")
+    .forEach((candidate) => {
+      const text = readAttachmentEvidenceText(candidate);
+      const isRelevant =
+        text.length <= 2000 &&
+        (expectedFilename
+          ? shared.attachmentEvidenceMatchesFilename(
+            text,
+            expectedFilename,
+          )
+          : shared.hasPendingPdfEvidence([text]));
+      if (isRelevant && !seenCandidates.has(candidate)) {
+        seenCandidates.add(candidate);
+        candidates.push(candidate);
+      }
+    });
+
+  for (const candidate of candidates) {
+    if (!isVisibleElement(candidate)) continue;
+    if (!expectedFilename && candidate.closest?.(messageSelector)) {
+      continue;
+    }
+
+    let evidenceNode = candidate;
+    for (let depth = 0; depth < 5 && evidenceNode; depth++) {
+      if (
+        !expectedFilename &&
+        evidenceNode.closest?.(messageSelector)
+      ) {
+        break;
+      }
+      const text = readAttachmentEvidenceText(evidenceNode);
+      const hasAttachmentMetadata =
+        /\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b/i.test(text) ||
+        /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/i.test(
+          text,
+        ) ||
+        /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(text);
+      const matchesExpected = expectedFilename
+        ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
+        : shared.hasPendingPdfEvidence([text]);
+      if (matchesExpected && hasAttachmentMetadata) {
+        if (!seenEvidenceNodes.has(evidenceNode)) {
+          seenEvidenceNodes.add(evidenceNode);
+          evidence.push(text);
+        }
+        break;
+      }
+      evidenceNode = evidenceNode.parentElement;
+    }
+  }
+
+  return evidence;
+}
+
+async function waitForPdfAttachmentConfirmation({
+  baselineEvidence,
+  pdfFilename,
+  timeoutMs,
+  requireReady,
+}) {
+  return shared.waitForNewExpectedAttachmentEvidence({
+    baselineEvidence,
+    expectedFilename: pdfFilename,
+    readEvidence: () =>
+      collectVisibleComposerAttachmentEvidence(pdfFilename),
+    wait: sleep,
+    timeoutMs,
+    pollIntervalMs: PDF_ATTACHMENT_POLL_INTERVAL_MS,
+    requireReady,
+  });
+}
+
 async function attachPDF(pdfBase64, pdfFilename) {
+  const startedAt = Date.now();
+  const baselineEvidence =
+    collectVisibleComposerAttachmentEvidence(pdfFilename);
+
   // Decode base64 → Uint8Array → File
   const binary = atob(pdfBase64);
   const bytes = new Uint8Array(binary.length);
@@ -806,35 +1212,60 @@ async function attachPDF(pdfBase64, pdfFilename) {
   const dt = new DataTransfer();
   dt.items.add(file);
 
-  // Find the composer / drop target
   let dropTarget = document.body;
   for (const sel of (SITE_ADAPTER?.dropTargetSelectors || [])) {
     const el = document.querySelector(sel);
-    if (el) { dropTarget = el; break; }
+    if (el) {
+      dropTarget = el;
+      break;
+    }
   }
-
-  // Simulate drag-and-drop (same as manually dragging a file into the window)
-  dropTarget.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: dt }));
+  dropTarget.dispatchEvent(
+    new DragEvent("dragenter", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: dt,
+    }),
+  );
   await sleep(100);
-  dropTarget.dispatchEvent(new DragEvent("dragover",  { bubbles: true, cancelable: true, dataTransfer: dt }));
+  dropTarget.dispatchEvent(
+    new DragEvent("dragover", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: dt,
+    }),
+  );
   await sleep(100);
-  dropTarget.dispatchEvent(new DragEvent("drop",      { bubbles: true, cancelable: true, dataTransfer: dt }));
+  dropTarget.dispatchEvent(
+    new DragEvent("drop", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: dt,
+    }),
+  );
 
-  // Wait for the attachment pill to appear (confirms upload was accepted)
-  const pillSelector = SITE_ADAPTER?.attachmentPillSelector ||
-    '[data-testid*="file"], [class*="attachment"], [class*="file-pill"]';
-  for (let i = 0; i < 20; i++) {
-    await sleep(500);
-    const pill = document.querySelector(pillSelector);
-    if (pill) return; // success
-  }
-
-  // Fallback: try the file input directly if drag-and-drop wasn't picked up
-  const fileInput = document.querySelector("input[type='file']");
-  if (fileInput) {
-    Object.defineProperty(fileInput, "files", { value: dt.files, configurable: true });
-    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-    await sleep(1500);
+  try {
+    await waitForPdfAttachmentConfirmation({
+      baselineEvidence,
+      pdfFilename,
+      timeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
+      requireReady: false,
+    });
+    const confirmation = await waitForPdfAttachmentConfirmation({
+      baselineEvidence,
+      pdfFilename,
+      timeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
+      requireReady: true,
+    });
+    return {
+      ...confirmation,
+      method: "drag_drop",
+      totalElapsedMs: Date.now() - startedAt,
+    };
+  } catch (_) {
+    throw new Error(
+      `PDF attachment failed: the website did not confirm that "${pdfFilename}" was accepted and ready after the drag-and-drop attempt.`,
+    );
   }
 }
 
@@ -1002,8 +1433,12 @@ async function selectChatGPTMode(mode) {
 // Step 2: Type prompt
 // ---------------------------------------------------------------------------
 
-async function typePromptAndVerify(promptText) {
+async function typePromptAndVerify(
+  promptText,
+  { requireEnabledSendControl = false } = {},
+) {
   const expectedText = shared.normalizeComposerText(promptText);
+  let promptTextMatched = false;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const composer = await getComposerElement();
@@ -1013,18 +1448,30 @@ async function typePromptAndVerify(promptText) {
       setNativeValue(composer, "");
       setNativeValue(composer, promptText);
     } else {
-      setContentEditableText(composer, "");
-      setContentEditableText(composer, promptText);
+      await setContentEditableText(composer, "");
+      await setContentEditableText(composer, promptText);
     }
 
     await sleep(300);
 
-    const actualText = shared.normalizeComposerText(readComposerText(composer));
+    const currentComposer = findComposerNow() || composer;
+    const actualText = shared.normalizeComposerText(
+      readComposerText(currentComposer),
+    );
     if (shared.composerTextMatchesPrompt(expectedText, actualText)) {
-      return composer;
+      promptTextMatched = true;
+      if (!requireEnabledSendControl) return currentComposer;
+
+      const sendBtn = await waitForSendButtonEnabled(1500);
+      if (isEnabledButton(sendBtn)) return currentComposer;
     }
   }
 
+  if (promptTextMatched && requireEnabledSendControl) {
+    throw new Error(
+      "Prompt verification failed: ChatGPT displayed the prompt but did not enable Send.",
+    );
+  }
   throw new Error("Prompt verification failed: composer text did not match the requested prompt.");
 }
 
@@ -1184,6 +1631,27 @@ function buildDiagnostic(overrides = {}) {
       typeof overrides.assistantTurnMatched === "boolean"
         ? overrides.assistantTurnMatched
         : null,
+    attachmentFilename: overrides.attachmentFilename || null,
+    attachmentMethod: overrides.attachmentMethod || null,
+    attachmentVerificationMs:
+      Number.isFinite(Number(overrides.attachmentVerificationMs))
+        ? Math.max(0, Math.floor(Number(overrides.attachmentVerificationMs)))
+        : null,
+    attachmentPreviewVerified:
+      typeof overrides.attachmentPreviewVerified === "boolean"
+        ? overrides.attachmentPreviewVerified
+        : null,
+    submittedAttachmentVerified:
+      typeof overrides.submittedAttachmentVerified === "boolean"
+        ? overrides.submittedAttachmentVerified
+        : null,
+    completionDetectionMs:
+      overrides.completionDetectionMs == null
+        ? null
+        : Math.max(
+          0,
+          Math.floor(Number(overrides.completionDetectionMs) || 0),
+        ),
   };
   lastDiagnostic = {
     ...diagnostic,
@@ -1511,6 +1979,7 @@ let outboundRequestSerial = 0;
 let outboundRequestEvents = [];
 let activeConversationStreamCount = 0;
 let lastTransportActivityAt = 0;
+let lastTransportCompletedAt = 0;
 let mainWorldInjected = false;
 let networkHookActive = false;
 let lastRequestAt = 0;
@@ -1674,9 +2143,16 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (event.data?.type === "SYNC_ZOTERO_STREAM_STATE") {
+    const previousActiveStreamCount = activeConversationStreamCount;
     activeConversationStreamCount = Math.max(0, Number(event.data.activeCount) || 0);
     networkHookActive = true;
     if (activeConversationStreamCount > 0) lastStreamAt = Date.now();
+    if (
+      previousActiveStreamCount > 0 &&
+      activeConversationStreamCount === 0
+    ) {
+      lastTransportCompletedAt = Date.now();
+    }
     lastTransportActivityAt = Date.now();
   }
 });
@@ -1763,13 +2239,28 @@ function hasBusyComposerHint() {
   return false;
 }
 
-function isConversationStillRunning(stopBtn = findStopButton()) {
+function isConversationStillRunning(
+  stopBtn = findStopButton(),
+  {
+    busyComposer = hasBusyComposerHint(),
+    strongTransportCompletion = false,
+  } = {},
+) {
   // Grace period: treat the conversation as still running if we saw transport
   // activity recently. Bridges gaps between sequential streams — ChatGPT's
   // "text → think → text" and DeepSeek's agentic tool-use phases can have
-  // pauses of several seconds between streams.
-  const recentActivity = (Date.now() - lastTransportActivityAt) < 8000;
-  return Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint() || recentActivity;
+  // pauses of several seconds between streams. Once transport is done and the
+  // site exposes its terminal action bar, that combined signal supersedes the
+  // grace period and lets the stable-snapshot verifier finish promptly.
+  const recentActivity =
+    !strongTransportCompletion &&
+    (Date.now() - lastTransportActivityAt) < 8000;
+  return (
+    Boolean(stopBtn) ||
+    activeConversationStreamCount > 0 ||
+    busyComposer ||
+    recentActivity
+  );
 }
 
 /**
@@ -2027,15 +2518,46 @@ async function streamResponseSnapshots(
   let lastActiveRun = null;
   let toolUseDetected = false;
   let completionTracker = shared.createTurnCompletionTracker(Date.now());
+  const baselineLastStreamAt = lastStreamAt;
+  const baselineTransportCompletedAt = lastTransportCompletedAt;
+  const expectedPdfFilename = String(attachmentFingerprint || "")
+    .split("|", 1)[0]
+    .trim();
+  let submittedPdfVerified = !expectedPdfFilename;
+  let submittedPdfMismatchObservedAt = 0;
   const baselineOutboundRequestSerial =
     Number(submissionMeta?.baselineOutboundRequestSerial) || 0;
   let requestContext = submissionMeta?.requestContext || null;
+  const getCompletionDetectionMs = () => {
+    const completedAt = Math.max(
+      sseDoneAt,
+      lastTransportCompletedAt > baselineTransportCompletedAt
+        ? lastTransportCompletedAt
+        : 0,
+    );
+    return completedAt > 0
+      ? Math.max(0, Date.now() - completedAt)
+      : null;
+  };
   const makeTurnDiagnostic = (phase, overrides = {}) => buildDiagnostic({
     phase,
     requestObserved: Boolean(requestContext),
-    streamObserved: activeConversationStreamCount > 0 || Boolean(sseDoneAt),
+    streamObserved:
+      activeConversationStreamCount > 0 ||
+      lastStreamAt > baselineLastStreamAt ||
+      Boolean(sseDoneAt),
     userTurnMatched: Boolean(userTurnKey),
     assistantTurnMatched: Boolean(assistantTurnKey),
+    attachmentFilename: expectedPdfFilename || null,
+    attachmentMethod:
+      submissionMeta?.pdfAttachmentReceipt?.method || null,
+    attachmentVerificationMs:
+      submissionMeta?.pdfAttachmentReceipt?.totalElapsedMs ?? null,
+    attachmentPreviewVerified: expectedPdfFilename
+      ? Boolean(submissionMeta?.pdfAttachmentReceipt)
+      : null,
+    submittedAttachmentVerified: submittedPdfVerified,
+    completionDetectionMs: getCompletionDetectionMs(),
     ...overrides,
   });
 
@@ -2066,7 +2588,23 @@ async function streamResponseSnapshots(
   while (Date.now() < deadline) {
     const nowMs = Date.now();
     const stopBtn = findStopButton();
-    const activeRun = isConversationStillRunning(stopBtn);
+    const busyComposer = hasBusyComposerHint();
+    const actionBarVisible = hasResponseActionBar();
+    const strongTransportCompletion =
+      shared.hasStrongTransportCompletionSignal({
+        sseDone,
+        transportObserved:
+          lastStreamAt > baselineLastStreamAt ||
+          lastTransportCompletedAt > baselineTransportCompletedAt,
+        activeConversationStreamCount,
+        actionBarVisible,
+        stopButtonVisible: Boolean(stopBtn),
+        busyComposer,
+      });
+    const activeRun = isConversationStillRunning(stopBtn, {
+      busyComposer,
+      strongTransportCompletion,
+    });
     if (SITE_ADAPTER?.siteId === "deepseek" && !requestContext) {
       requestContext = findObservedDeepSeekRequestContext(
         baselineOutboundRequestSerial,
@@ -2121,12 +2659,16 @@ async function streamResponseSnapshots(
       });
     }
 
+    const matchedUserTurn =
+      !userTurnKey || !submittedPdfVerified
+        ? findMatchingUserTurn(
+          transcript,
+          baselineTranscriptCount,
+          promptText,
+          baseline.messages,
+        )
+        : null;
     if (!userTurnKey) {
-      const matchedUserTurn = findMatchingUserTurn(
-        transcript,
-        baselineTranscriptCount,
-        promptText,
-      );
       if (matchedUserTurn) {
         userTurnKey = matchedUserTurn.messageKey;
         if (!reportedUserTurn) {
@@ -2161,8 +2703,11 @@ async function streamResponseSnapshots(
 
         if (!strictActiveRun) {
           // Fallback: take the last user message after baseline (position-based).
-          const fallbackCandidates = transcript.messages
-            .slice(Math.max(0, baselineTranscriptCount))
+          const fallbackCandidates = shared.conversationMessagesAfterBaseline(
+            transcript.messages,
+            baseline.messages,
+            baselineTranscriptCount,
+          )
             .filter((m) => m.role === "user");
           if (fallbackCandidates.length > 0) {
             const fallback = fallbackCandidates[fallbackCandidates.length - 1];
@@ -2225,6 +2770,47 @@ async function streamResponseSnapshots(
           }
         }
       }
+    }
+
+    if (expectedPdfFilename && matchedUserTurn && !submittedPdfVerified) {
+      const attachments = Array.isArray(matchedUserTurn.attachments)
+        ? matchedUserTurn.attachments
+        : [];
+      submittedPdfVerified =
+        shared.attachmentListContainsExpectedFilename(
+          attachments,
+          expectedPdfFilename,
+        );
+      if (submittedPdfVerified) {
+        userTurnKey = matchedUserTurn.messageKey;
+        recordTurnDebug("submitted_pdf_verified", {
+          seq,
+          attempt,
+          userTurnKey,
+          expectedPdfFilename,
+          attachments,
+        });
+      } else if (!submittedPdfMismatchObservedAt) {
+        submittedPdfMismatchObservedAt = nowMs;
+        recordTurnDebug("submitted_pdf_missing", {
+          seq,
+          attempt,
+          userTurnKey: matchedUserTurn.messageKey,
+          expectedPdfFilename,
+          attachments,
+        });
+      }
+    }
+    if (
+      expectedPdfFilename &&
+      !submittedPdfVerified &&
+      submittedPdfMismatchObservedAt &&
+      nowMs - submittedPdfMismatchObservedAt >=
+        SUBMITTED_PDF_VERIFY_TIMEOUT_MS
+    ) {
+      throw new Error(
+        `The submitted user turn did not include the expected PDF "${expectedPdfFilename}".`,
+      );
     }
 
     const previousAssistantTurnKey = assistantTurnKey;
@@ -2380,11 +2966,6 @@ async function streamResponseSnapshots(
       }
     }
 
-    // The action bar is advisory UI only. It can become visible before the
-    // response DOM has exposed its complete text, so it must not shorten the
-    // stabilization window or directly authorize terminal delivery.
-    const actionBarVisible = hasResponseActionBar();
-
     const {
       quietWindowMs,
       reboundWindowMs,
@@ -2394,6 +2975,7 @@ async function streamResponseSnapshots(
       toolUseDetected,
       sseDone,
       activeConversationStreamCount,
+      strongTransportCompletion,
     });
 
     const completion = shared.advanceTurnCompletionTracker(completionTracker, {
@@ -2473,11 +3055,11 @@ async function streamResponseSnapshots(
       lastAssistantTurnKey = assistantTurnKey;
     }
 
-    if (completion.emitDone) {
+    if (completion.emitDone && submittedPdfVerified) {
       // Re-read the bound assistant turn after a final rebound delay. ChatGPT
       // can expose a prefix in the DOM long enough to satisfy visual completion
       // heuristics, especially after a discarded-tab reload.
-      await workerSleep(750);
+      await workerSleep(strongTransportCompletion ? 250 : 750);
       const confirmedTranscript = extractConversationTranscript();
       const confirmedAssistantTurn = resolveBoundAssistantTurn(
         confirmedTranscript,
@@ -2558,6 +3140,7 @@ async function streamResponseSnapshots(
       shared.hasMeaningfulAssistantText(sseText) &&
       !stopBtn &&
       !hasBusyComposerHint() &&
+      submittedPdfVerified &&
       completion.phase !== "verified_done"
     ) {
       // Use DOM answer if available, otherwise SSE answer
@@ -2609,6 +3192,7 @@ async function streamResponseSnapshots(
       !stopBtn &&
       !hasBusyComposerHint() &&
       (Boolean(requestContext) || Boolean(assistantTurnKey)) &&
+      submittedPdfVerified &&
       quietSinceMs >= deepseekQuietThresholdMs &&
       completion.phase !== "verified_done"
     ) {
@@ -3486,6 +4070,28 @@ function extractAttachmentNames(node) {
       }
     });
   }
+  // DeepSeek currently renders submitted file cards with generated class names.
+  // Recover PDF names only from compact card-like regions that also expose a
+  // PDF type/size label, avoiding ordinary prompt text that happens to mention
+  // a filename.
+  node.querySelectorAll("div, span").forEach((element) => {
+    const text = shared.normalizeComposerText(element.textContent || "");
+    if (!/\.pdf$/i.test(text) || text.length > 300) return;
+
+    let card = element.parentElement;
+    for (let depth = 0; depth < 4 && card; depth++) {
+      const cardText = shared.normalizeComposerText(card.textContent || "");
+      if (
+        shared.attachmentEvidenceMatchesFilename(cardText, text) &&
+        (/\bPDF\b/i.test(cardText) ||
+          /\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b/i.test(cardText))
+      ) {
+        if (!names.includes(text)) names.push(text);
+        break;
+      }
+      card = card.parentElement;
+    }
+  });
   // Image attachment detection — ChatGPT renders uploaded images as <img> elements
   // inside the user message node. Detect these so image-only messages aren't
   // skipped by extractConversationTranscript's filter.
@@ -3851,10 +4457,18 @@ function wordJaccardSimilarity(a, b) {
   return intersection / (wordsA.size + wordsB.size - intersection);
 }
 
-function findMatchingUserTurn(transcript, baselineCount, promptText) {
+function findMatchingUserTurn(
+  transcript,
+  baselineCount,
+  promptText,
+  baselineMessages = [],
+) {
   const normalizedPrompt = shared.normalizeComposerText(promptText).normalize("NFC").toLowerCase();
-  const candidates = transcript.messages
-    .slice(Math.max(0, baselineCount))
+  const candidates = shared.conversationMessagesAfterBaseline(
+    transcript.messages,
+    baselineMessages,
+    baselineCount,
+  )
     .filter((message) => message.role === "user");
   if (candidates.length === 0) return null;
   if (!normalizedPrompt) {
@@ -4444,6 +5058,7 @@ if (!window.__syncZoteroListenerRegistered) {
       const seq = msg.seq; // track seq for end-to-end validation
       const attempt = msg.attempt || 0;
       let uploadDetected = false;
+      let pdfAttachmentReceipt = null;
       let composerTextMatched = false;
       let clickAttempts = 0;
 
@@ -4454,9 +5069,25 @@ if (!window.__syncZoteroListenerRegistered) {
           Array.isArray(msg.images) ? msg.images.length : 0,
         ].join("|");
 
+        if (
+          !msg.pdfBase64 &&
+          (!Array.isArray(msg.images) || msg.images.length === 0)
+        ) {
+          const pendingPdfEvidence =
+            collectVisibleComposerAttachmentEvidence("");
+          if (pendingPdfEvidence.length > 0) {
+            throw new Error(
+              "Prompt-only send blocked because the web composer still contains a PDF attachment. Remove it or reload the chat tab, then try again.",
+            );
+          }
+        }
+
         // Attach PDF whenever provided — the plugin controls when to send via chip state
         if (msg.pdfBase64) {
-          await attachPDF(msg.pdfBase64, msg.pdfFilename);
+          pdfAttachmentReceipt = await attachPDF(
+            msg.pdfBase64,
+            msg.pdfFilename,
+          );
           uploadDetected = true;
         }
         if (msg.images && msg.images.length > 0) {
@@ -4469,7 +5100,10 @@ if (!window.__syncZoteroListenerRegistered) {
           }
         }
         // Mode switching disabled — users control thinking mode directly on chatgpt.com
-        await typePromptAndVerify(msg.prompt);
+        await typePromptAndVerify(msg.prompt, {
+          requireEnabledSendControl:
+            SITE_ADAPTER?.siteId === "chatgpt" && !uploadDetected,
+        });
         composerTextMatched = true;
         port.postMessage({
           type: "phase",
@@ -4481,6 +5115,11 @@ if (!window.__syncZoteroListenerRegistered) {
             composerTextMatched,
             uploadDetected,
             clickAttempts,
+            attachmentFilename: msg.pdfFilename || null,
+            attachmentMethod: pdfAttachmentReceipt?.method || null,
+            attachmentVerificationMs:
+              pdfAttachmentReceipt?.totalElapsedMs ?? null,
+            attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
           }),
         });
 
@@ -4498,6 +5137,11 @@ if (!window.__syncZoteroListenerRegistered) {
             clickAttempts,
             requestObserved: Boolean(submission?.requestObserved),
             streamObserved: Boolean(submission?.streamObserved),
+            attachmentFilename: msg.pdfFilename || null,
+            attachmentMethod: pdfAttachmentReceipt?.method || null,
+            attachmentVerificationMs:
+              pdfAttachmentReceipt?.totalElapsedMs ?? null,
+            attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
           }),
         });
 
@@ -4508,7 +5152,10 @@ if (!window.__syncZoteroListenerRegistered) {
           baselineTranscript,
           msg.prompt || "",
           attachmentFingerprint,
-          submission,
+          {
+            ...submission,
+            pdfAttachmentReceipt,
+          },
           RESPONSE_TIMEOUT_MS,
         );
 
@@ -4526,6 +5173,11 @@ if (!window.__syncZoteroListenerRegistered) {
               composerTextMatched,
               uploadDetected,
               clickAttempts,
+              attachmentFilename: msg.pdfFilename || null,
+              attachmentMethod: pdfAttachmentReceipt?.method || null,
+              attachmentVerificationMs:
+                pdfAttachmentReceipt?.totalElapsedMs ?? null,
+              attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
             }),
           });
         } catch (_) {}
