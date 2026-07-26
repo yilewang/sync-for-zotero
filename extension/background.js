@@ -45,10 +45,23 @@ const shared = globalThis.SyncZoteroShared || {
       return Array.isArray(message.attachments) && message.attachments.length > 0;
     });
   },
+  classifyContentScriptMessageError: (error) => ({
+    code: "other",
+    recoverable: false,
+    message: String(error?.message || error || ""),
+  }),
+  isRecoverableContentScriptMessageError: () => false,
+  isRetrySafeContentScriptMessage: () => false,
+  retryRecoverableContentScriptMessage: async ({ sendAttempt }) =>
+    sendAttempt(1),
+  tabNeedsActivation: (tab) => tab?.active === false,
+  tabNeedsLifecycleReload: (tab) => Boolean(tab?.discarded),
 };
 
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
 const MAX_PRE_SUBMIT_RELEASES = 3;
+const MAX_CONTENT_SCRIPT_MESSAGE_ATTEMPTS = 3;
+const CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS = 30_000;
 const RELAY_POLL_INTERVAL_MS = 500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const TAB_LOAD_TIMEOUT_MS = 120_000;
@@ -1039,6 +1052,11 @@ async function runPipeline(query) {
       activeChatTabId = tab.id;
     }
 
+    // ChatGPT defers parts of its client-side text rendering in inactive tabs.
+    // Select the target tab within its Chrome window before navigation and
+    // submission so a throttled prefix cannot look terminal to the bridge.
+    tab = await ensureTabActive(tab.id);
+
     const shouldNavigateFresh = startsFresh;
 
     if (shouldNavigateFresh) {
@@ -1167,10 +1185,19 @@ async function runPipeline(query) {
     );
 
   } catch (err) {
-    if (err?.name === "PreSubmitDisconnect" && attempt < MAX_PRE_SUBMIT_RELEASES) {
+    if (
+      (
+        err?.name === "PreSubmitDisconnect" ||
+        err?.name === "ContentScriptMessageUnavailable"
+      ) &&
+      attempt < MAX_PRE_SUBMIT_RELEASES
+    ) {
       try {
         await releaseQuery(seq, attempt);
-        broadcastStatus("running", "Retrying prompt delivery after a pre-submit disconnect…");
+        broadcastStatus(
+          "running",
+          "Reconnecting to the chat tab before prompt delivery…",
+        );
         return;
       } catch (_) {
         // Fall through to surfacing a real error if the release itself failed.
@@ -1441,17 +1468,10 @@ function streamPipeline(tabId, payload) {
 }
 
 // ---------------------------------------------------------------------------
-// Simple one-shot message (used for PING only)
+// Idempotent one-shot content-script messaging
 // ---------------------------------------------------------------------------
 
-async function sendToContentScript(tabId, message) {
-  // Ensure the tab is fully loaded before attempting
-  await ensureTabReady(tabId);
-
-  // Ensure the content script is injected and responsive
-  await ensureContentScript(tabId);
-
-  // Send the actual message
+function sendContentScriptMessageOnce(tabId, message) {
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
       if (chrome.runtime.lastError) {
@@ -1463,27 +1483,83 @@ async function sendToContentScript(tabId, message) {
   });
 }
 
-async function ensureTabReady(tabId) {
-  // Wait for the tab to reach "complete" status
+async function recoverContentScriptMessage(
+  tabId,
+  { delayMs, classification, nextAttempt },
+) {
+  if (delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
   const tab = await chrome.tabs.get(tabId);
-  if (tab.status === "complete") return;
+  if (shared.tabNeedsLifecycleReload(tab)) {
+    await reloadTab(tabId);
+    await waitForTabLoad(tabId, CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS);
+  }
+  console.warn(
+    `[sync-zotero] Recovering content-script message after ${classification.code}; retry ${nextAttempt}/${MAX_CONTENT_SCRIPT_MESSAGE_ATTEMPTS}`,
+  );
+  await ensureContentScript(tabId);
+}
 
-  await new Promise((resolve) => {
-    const listener = (id, info) => {
-      if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    setTimeout(resolve, 10000); // max wait 10s
-  });
+async function sendToContentScript(tabId, message) {
+  const retrySafe = shared.isRetrySafeContentScriptMessage(message);
+  const maxAttempts = retrySafe
+    ? MAX_CONTENT_SCRIPT_MESSAGE_ATTEMPTS
+    : 1;
+  try {
+    return await shared.retryRecoverableContentScriptMessage({
+      maxAttempts,
+      sendAttempt: async () => {
+        await ensureTabReady(tabId);
+        await ensureContentScript(tabId);
+        return sendContentScriptMessageOnce(tabId, message);
+      },
+      recover: (context) => recoverContentScriptMessage(tabId, context),
+    });
+  } catch (error) {
+    const classification =
+      shared.classifyContentScriptMessageError(error);
+    if (classification.recoverable) {
+      error.name = "ContentScriptMessageUnavailable";
+      error.code = classification.code;
+    }
+    throw error;
+  }
+}
+
+async function ensureTabReady(
+  tabId,
+  timeoutMs = CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS,
+) {
+  // A discarded tab can still report status=complete even though its document
+  // and content-script context no longer exist.
+  let tab = await chrome.tabs.get(tabId);
+  if (shared.tabNeedsLifecycleReload(tab)) {
+    await reloadTab(tabId);
+    await waitForTabLoad(tabId, timeoutMs);
+    tab = await chrome.tabs.get(tabId);
+  }
+
+  // Chrome's status is a coarse navigation signal and can remain "loading"
+  // after the target document is interactive. Content-script PING/injection
+  // below is the authoritative readiness probe, so do not fail solely because
+  // this status has not caught up.
+  return tab;
+}
+
+async function ensureTabActive(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!shared.tabNeedsActivation(tab)) return tab;
+  return chrome.tabs.update(tabId, { active: true });
 }
 
 async function reloadTab(tabId) {
-  await new Promise((resolve) => {
+  await new Promise((resolve, reject) => {
     chrome.tabs.reload(tabId, () => {
-      void chrome.runtime.lastError;
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
       resolve();
     });
   });
@@ -1510,10 +1586,12 @@ async function ensureContentScript(tabId) {
 
   if (alive) return;
 
-  // Content script not responsive — inject it
+  // Content script not responsive — inject the shared helpers and listener in
+  // manifest order. This also repairs tabs whose old extension context became
+  // stale after an extension reload.
   await chrome.scripting.executeScript({
     target: { tabId },
-    files:  ["content_script.js"],
+    files:  ["webchat_shared.js", "content_script.js"],
   });
 
   // Poll briefly instead of always paying a fixed 1s delay after injection.
@@ -1526,6 +1604,12 @@ async function ensureContentScript(tabId) {
     if (ready) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+
+  const error = new Error(
+    "Content script did not respond after reinjection.",
+  );
+  error.code = "content_script_unresponsive";
+  throw error;
 }
 
 // ---------------------------------------------------------------------------

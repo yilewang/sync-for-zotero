@@ -212,6 +212,19 @@ const shared = globalThis.SyncZoteroShared || {
     if ((snapshot.userMessageCount || 0) > (snapshot.baselineUserMessageCount || 0)) return true;
     return false;
   },
+  completionTimingForSignals: (signals = {}) => {
+    if (signals.toolUseDetected === true) {
+      return { quietWindowMs: 15000, reboundWindowMs: 3000 };
+    }
+    if (
+      signals.sseDone === true &&
+      Number(signals.activeConversationStreamCount || 0) === 0 &&
+      signals.answerVisible === true
+    ) {
+      return { quietWindowMs: 2000, reboundWindowMs: 500 };
+    }
+    return { quietWindowMs: 7000, reboundWindowMs: 1500 };
+  },
   isPlaceholderAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase();
     return !normalized || normalized === "thinking" || normalized === "quick answer";
@@ -236,6 +249,15 @@ const shared = globalThis.SyncZoteroShared || {
     return normalize(actualUrl) === normalizedExpected;
   },
   normalizeComposerText: (text) => String(text || "").trim(),
+  terminalAnswerSnapshotIsStable: (candidate, latest) => {
+    const candidateText = String(candidate?.text || "").trim();
+    const latestText = String(latest?.text || "").trim();
+    if (!candidateText || candidateText !== latestText) return false;
+    const candidateTurnKey = String(candidate?.assistantTurnKey || "");
+    const latestTurnKey = String(latest?.assistantTurnKey || "");
+    return !candidateTurnKey || !latestTurnKey ||
+      candidateTurnKey === latestTurnKey;
+  },
 };
 
 const WEBCHAT_DEBUG = false;
@@ -2358,27 +2380,21 @@ async function streamResponseSnapshots(
       }
     }
 
-    // Detect ChatGPT's action bar — strong positive completion signal.
+    // The action bar is advisory UI only. It can become visible before the
+    // response DOM has exposed its complete text, so it must not shorten the
+    // stabilization window or directly authorize terminal delivery.
     const actionBarVisible = hasResponseActionBar();
 
-    // Adaptive quiet/rebound windows:
-    // - Action bar visible: very short — ChatGPT itself considers the response done
-    // - Tool-use: longer windows to bridge gaps between tool streams
-    // - SSE-done simple responses: shorter windows for faster completion
-    let quietWindowMs, reboundWindowMs;
-    if (actionBarVisible && answerVisible) {
-      quietWindowMs = 500;
-      reboundWindowMs = 200;
-    } else if (toolUseDetected) {
-      quietWindowMs = 15000;
-      reboundWindowMs = 3000;
-    } else if (sseDone && activeConversationStreamCount === 0 && answerVisible) {
-      quietWindowMs = 2000;
-      reboundWindowMs = 500;
-    } else {
-      quietWindowMs = undefined; // use default (7000)
-      reboundWindowMs = undefined; // use default (1500)
-    }
+    const {
+      quietWindowMs,
+      reboundWindowMs,
+    } = shared.completionTimingForSignals({
+      actionBarVisible,
+      answerVisible,
+      toolUseDetected,
+      sseDone,
+      activeConversationStreamCount,
+    });
 
     const completion = shared.advanceTurnCompletionTracker(completionTracker, {
       nowMs,
@@ -2458,29 +2474,66 @@ async function streamResponseSnapshots(
     }
 
     if (completion.emitDone) {
+      // Re-read the bound assistant turn after a final rebound delay. ChatGPT
+      // can expose a prefix in the DOM long enough to satisfy visual completion
+      // heuristics, especially after a discarded-tab reload.
+      await workerSleep(750);
+      const confirmedTranscript = extractConversationTranscript();
+      const confirmedAssistantTurn = resolveBoundAssistantTurn(
+        confirmedTranscript,
+        userTurnKey,
+        assistantTurnKey,
+      );
+      const confirmedAnswerText = confirmedAssistantTurn?.text || "";
+      const confirmedAssistantTurnKey =
+        confirmedAssistantTurn?.messageKey || assistantTurnKey;
+      const stableTerminalSnapshot =
+        shared.terminalAnswerSnapshotIsStable(
+          {
+            text: lastAnswerText,
+            assistantTurnKey,
+          },
+          {
+            text: confirmedAnswerText,
+            assistantTurnKey: confirmedAssistantTurnKey,
+          },
+        );
+      if (!stableTerminalSnapshot) {
+        recordTurnDebug("terminal_snapshot_rebounded", {
+          seq,
+          attempt,
+          candidateTextLength: lastAnswerText.length,
+          confirmedTextLength: confirmedAnswerText.length,
+          candidateAssistantTurnKey: assistantTurnKey,
+          confirmedAssistantTurnKey,
+        });
+        completionTracker = shared.createTurnCompletionTracker(Date.now());
+        continue;
+      }
+
       recordTurnDebug("verified_done_emit", {
         seq,
         attempt,
-        transcriptHash: transcript.hash,
+        transcriptHash: confirmedTranscript.hash,
         answerRevision,
         thinkingRevision,
       });
       postTerminal(port, {
         seq,
         attempt,
-        text: lastAnswerText,
+        text: confirmedAnswerText,
         thinking: lastThinkingText || null,
-        answerAnchorId: assistantTurnKey,
+        answerAnchorId: confirmedAssistantTurnKey,
         answerRevision,
         thinkingRevision,
         runState: "done",
         completionReason: "settled",
-        finalTranscriptHash: transcript.hash,
-        verifiedAt: nowMs,
+        finalTranscriptHash: confirmedTranscript.hash,
+        verifiedAt: Date.now(),
         remoteChatUrl,
         remoteChatId,
         userTurnKey,
-        assistantTurnKey,
+        assistantTurnKey: confirmedAssistantTurnKey,
         baselineTranscriptCount,
         baselineTranscriptHash,
         turnStatus: "done",
@@ -2543,52 +2596,6 @@ async function streamResponseSnapshots(
         }),
       });
       return;
-    }
-
-    // Action-bar-based fast completion: the action bar (copy, regenerate, etc.)
-    // only appears when ChatGPT considers the response fully complete.
-    // This works even when SSE interception fails.
-    if (
-      actionBarVisible &&
-      answerVisible &&
-      !stopBtn &&
-      !hasBusyComposerHint() &&
-      completion.phase !== "verified_done"
-    ) {
-      const finalText = lastAnswerText || sseText;
-      const finalThinking = lastThinkingText || sseThinking || null;
-      if (shared.hasMeaningfulAssistantText(finalText)) {
-        recordTurnDebug("action_bar_fast_completion", {
-          seq,
-          attempt,
-          domAnswerLen: lastAnswerText.length,
-          sseTextLen: (sseText || "").length,
-        });
-        postTerminal(port, {
-          seq,
-          attempt,
-          text: finalText,
-          thinking: finalThinking,
-          answerAnchorId: assistantTurnKey,
-          answerRevision,
-          thinkingRevision,
-          runState: "done",
-          completionReason: "settled",
-          finalTranscriptHash: transcript.hash,
-          verifiedAt: nowMs,
-          remoteChatUrl,
-          remoteChatId,
-          userTurnKey,
-          assistantTurnKey,
-          baselineTranscriptCount,
-          baselineTranscriptHash,
-          turnStatus: "done",
-          diagnostic: makeTurnDiagnostic("done", {
-            reasonCode: "action_bar_fast_completion",
-          }),
-        });
-        return;
-      }
     }
 
     // DeepSeek-specific fast completion: require a longer quiet period when

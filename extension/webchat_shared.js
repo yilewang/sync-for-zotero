@@ -113,6 +113,57 @@
     return false;
   }
 
+  function tabNeedsLifecycleReload(tab) {
+    return Boolean(tab?.discarded);
+  }
+
+  function tabNeedsActivation(tab) {
+    return tab?.active === false;
+  }
+
+  function completionTimingForSignals(signals = {}) {
+    if (signals.toolUseDetected === true) {
+      return {
+        quietWindowMs: 15000,
+        reboundWindowMs: 3000,
+      };
+    }
+    if (
+      signals.sseDone === true &&
+      Number(signals.activeConversationStreamCount || 0) === 0 &&
+      signals.answerVisible === true
+    ) {
+      return {
+        quietWindowMs: 2000,
+        reboundWindowMs: 500,
+      };
+    }
+    return {
+      quietWindowMs: TURN_COMPLETION_QUIET_WINDOW_MS,
+      reboundWindowMs: TURN_COMPLETION_REBOUND_WINDOW_MS,
+    };
+  }
+
+  function terminalAnswerSnapshotIsStable(candidate, latest) {
+    const candidateText = normalizeComposerText(candidate?.text || "");
+    const latestText = normalizeComposerText(latest?.text || "");
+    if (
+      !hasMeaningfulAssistantText(candidateText) ||
+      !hasMeaningfulAssistantText(latestText) ||
+      candidateText !== latestText
+    ) {
+      return false;
+    }
+
+    const candidateTurnKey = String(candidate?.assistantTurnKey || "");
+    const latestTurnKey = String(latest?.assistantTurnKey || "");
+    return (
+      !candidateTurnKey ||
+      !latestTurnKey ||
+      candidateTurnKey === latestTurnKey
+    );
+  }
+
   function attemptToken(seq, attempt) {
     return `${Number(seq) || 0}:${Number(attempt) || 0}`;
   }
@@ -269,19 +320,126 @@
     };
   }
 
+  const RETRY_SAFE_CONTENT_SCRIPT_MESSAGES = new Set([
+    "HEALTH_CHECK",
+    "WAIT_FOR_CHAT_READY",
+    "SCRAPE_HISTORY_NOW",
+    "SCRAPE_MESSAGES",
+    "RESET_NETWORK_CACHE",
+  ]);
+
+  function classifyContentScriptMessageError(error) {
+    const message = String(error?.message || error || "").trim();
+    const code = String(error?.code || "").trim();
+    if (
+      code === "content_script_unresponsive" ||
+      /message channel closed before a response was received/i.test(message) ||
+      /message port closed before a response was received/i.test(message) ||
+      /port closed before a response was received/i.test(message)
+    ) {
+      return { code: "channel_closed", recoverable: true, message };
+    }
+    if (
+      /receiving end does not exist/i.test(message) ||
+      /could not establish connection/i.test(message)
+    ) {
+      return { code: "receiver_missing", recoverable: true, message };
+    }
+    if (
+      /frame (?:with id )?[^ ]+ was (?:removed|detached)/i.test(message) ||
+      /extension context invalidated/i.test(message)
+    ) {
+      return { code: "context_replaced", recoverable: true, message };
+    }
+    if (
+      /no tab with id/i.test(message) ||
+      /tab (?:was )?closed/i.test(message) ||
+      /tab not found/i.test(message)
+    ) {
+      return { code: "tab_unavailable", recoverable: false, message };
+    }
+    return { code: "other", recoverable: false, message };
+  }
+
+  function isRecoverableContentScriptMessageError(error) {
+    return classifyContentScriptMessageError(error).recoverable;
+  }
+
+  function isRetrySafeContentScriptMessage(message) {
+    return RETRY_SAFE_CONTENT_SCRIPT_MESSAGES.has(
+      String(message?.type || "").trim(),
+    );
+  }
+
+  function contentScriptMessageRetryDelayMs(attempt) {
+    const normalizedAttempt = Math.max(1, Math.floor(Number(attempt) || 1));
+    return Math.min(1000, 100 * 2 ** (normalizedAttempt - 1));
+  }
+
+  async function retryRecoverableContentScriptMessage({
+    sendAttempt,
+    recover,
+    maxAttempts = 3,
+  }) {
+    if (typeof sendAttempt !== "function") {
+      throw new TypeError("sendAttempt must be a function");
+    }
+    const boundedAttempts = Math.max(
+      1,
+      Math.min(5, Math.floor(Number(maxAttempts) || 1)),
+    );
+
+    for (let attempt = 1; attempt <= boundedAttempts; attempt++) {
+      try {
+        return await sendAttempt(attempt);
+      } catch (error) {
+        const classification = classifyContentScriptMessageError(error);
+        if (!classification.recoverable || attempt >= boundedAttempts) {
+          throw error;
+        }
+        if (typeof recover === "function") {
+          try {
+            await recover({
+              attempt,
+              nextAttempt: attempt + 1,
+              error,
+              classification,
+              delayMs: contentScriptMessageRetryDelayMs(attempt),
+            });
+          } catch (recoveryError) {
+            if (!isRecoverableContentScriptMessageError(recoveryError)) {
+              throw recoveryError;
+            }
+          }
+        }
+      }
+    }
+
+    throw new Error("Content-script message retry exhausted unexpectedly.");
+  }
+
   return {
     TURN_COMPLETION_QUIET_WINDOW_MS,
     TURN_COMPLETION_REBOUND_WINDOW_MS,
     advanceTurnCompletionTracker,
     attemptToken,
     canReuseReadyTranscriptForScrape,
+    classifyContentScriptMessageError,
+    completionTimingForSignals,
     composerTextMatchesPrompt,
+    contentScriptMessageRetryDelayMs,
     conversationUrlsMatch,
     createTurnCompletionTracker,
     hasMeaningfulAssistantText,
     hasDeliverySignal,
     isPlaceholderAssistantText,
+    isRecoverableContentScriptMessageError,
+    isRetrySafeContentScriptMessage,
     normalizeComposerText,
     normalizeConversationUrl,
+    retryRecoverableContentScriptMessage,
+    tabNeedsActivation,
+    tabNeedsLifecycleReload,
+    terminalAnswerSnapshotIsStable,
   };
 });
