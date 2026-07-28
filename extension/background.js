@@ -1355,14 +1355,54 @@ function streamPipeline(tabId, payload) {
       if (msg.attempt !== undefined && msg.attempt !== payload.attempt) return;
 
       if (msg.type === "phase") {
-        if (msg.phase === "submitted" || msg.phase === "streaming") {
+        const requiresDurableAck =
+          msg.phase === "prompt_applied" || msg.phase === "submit_started";
+        if (
+          msg.phase === "submit_started" ||
+          msg.phase === "submitted" ||
+          msg.phase === "streaming"
+        ) {
           submitted = true;
         }
-        if (!(await postRelayUpdate(
-          `phase:${msg.phase}`,
-          msg.diagnostic || null,
-          () => ackQueryPhase(payload.seq, payload.attempt, msg.phase, msg.diagnostic || null),
-        ))) return;
+        if (requiresDurableAck) {
+          try {
+            await ackQueryPhase(
+              payload.seq,
+              payload.attempt,
+              msg.phase,
+              msg.diagnostic || null,
+            );
+            relayPostFailureCount = 0;
+            port.postMessage({
+              type: "phase_ack",
+              seq: payload.seq,
+              attempt: payload.attempt,
+              phase: msg.phase,
+            });
+          } catch (err) {
+            const reason = err?.message || String(err);
+            const error = new Error(
+              `Relay update failed during phase:${msg.phase}: ${reason}`,
+            );
+            error.diagnostic = msg.diagnostic || null;
+            finish(reject, error);
+          }
+          return;
+        }
+        if (
+          !(await postRelayUpdate(
+            `phase:${msg.phase}`,
+            msg.diagnostic || null,
+            () =>
+              ackQueryPhase(
+                payload.seq,
+                payload.attempt,
+                msg.phase,
+                msg.diagnostic || null,
+              ),
+          ))
+        )
+          return;
       } else if (msg.type === "turn_state") {
         if (!(await postRelayUpdate(
           `turn_state:${msg.turnStatus || "unknown"}`,
@@ -1618,7 +1658,12 @@ async function ensureContentScript(tabId) {
 
 function broadcastStatus(state, message) {
   chrome.storage.session.set({ pipelineStatus: { state, message } });
-  chrome.runtime.sendMessage({ type: "STATUS_UPDATE", state, message }).catch(() => {});
+  chrome.runtime.sendMessage({
+    type: "STATUS_UPDATE",
+    state,
+    message,
+    relayAlive: zoteroConnected,
+  }).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------

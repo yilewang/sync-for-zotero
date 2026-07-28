@@ -62,6 +62,14 @@ chrome.runtime.sendMessage({ type: "GET_FULL_STATUS" }, (status) => {
 // Live updates
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "STATUS_UPDATE") {
+    if (typeof msg.relayAlive === "boolean") {
+      setIndicator(
+        dotHost,
+        valHost,
+        msg.relayAlive,
+        msg.relayAlive ? "Connected" : "Offline",
+      );
+    }
     setPipelineIndicator(msg.state, msg.message);
   }
 });

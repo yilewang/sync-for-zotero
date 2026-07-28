@@ -5105,13 +5105,28 @@ if (!window.__syncZoteroListenerRegistered) {
             SITE_ADAPTER?.siteId === "chatgpt" && !uploadDetected,
         });
         composerTextMatched = true;
-        port.postMessage({
-          type: "phase",
+        await shared.postPhaseAndWaitForAck(port, {
           seq,
           attempt,
           phase: "prompt_applied",
           diagnostic: buildDiagnostic({
             phase: "prompt_applied",
+            composerTextMatched,
+            uploadDetected,
+            clickAttempts,
+            attachmentFilename: msg.pdfFilename || null,
+            attachmentMethod: pdfAttachmentReceipt?.method || null,
+            attachmentVerificationMs:
+              pdfAttachmentReceipt?.totalElapsedMs ?? null,
+            attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
+          }),
+        });
+        await shared.postPhaseAndWaitForAck(port, {
+          seq,
+          attempt,
+          phase: "submit_started",
+          diagnostic: buildDiagnostic({
+            phase: "submit_started",
             composerTextMatched,
             uploadDetected,
             clickAttempts,

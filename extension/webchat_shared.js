@@ -617,6 +617,91 @@
     throw new Error("Content-script message retry exhausted unexpectedly.");
   }
 
+  function postPhaseAndWaitForAck(
+    port,
+    {
+      seq,
+      attempt,
+      phase,
+      diagnostic = null,
+      timeoutMs = 15_000,
+    } = {},
+  ) {
+    if (
+      !port ||
+      typeof port.postMessage !== "function" ||
+      typeof port.onMessage?.addListener !== "function"
+    ) {
+      return Promise.reject(
+        new TypeError("A connected extension port is required."),
+      );
+    }
+    if (!phase) {
+      return Promise.reject(new TypeError("phase is required"));
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId = null;
+
+      const cleanup = () => {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        port.onMessage.removeListener?.(handleMessage);
+        port.onDisconnect?.removeListener?.(handleDisconnect);
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const handleMessage = (message) => {
+        if (
+          message?.type !== "phase_ack" ||
+          message.seq !== seq ||
+          message.attempt !== attempt ||
+          message.phase !== phase
+        ) {
+          return;
+        }
+        finish(resolve, message);
+      };
+      const handleDisconnect = () => {
+        finish(
+          reject,
+          new Error(
+            `Extension port disconnected before the ${phase} phase was acknowledged.`,
+          ),
+        );
+      };
+
+      port.onMessage.addListener(handleMessage);
+      port.onDisconnect?.addListener?.(handleDisconnect);
+      timeoutId = setTimeout(
+        () =>
+          finish(
+            reject,
+            new Error(
+              `Timed out waiting for the ${phase} phase acknowledgement.`,
+            ),
+          ),
+        Math.max(1, Number(timeoutMs) || 15_000),
+      );
+
+      try {
+        port.postMessage({
+          type: "phase",
+          seq,
+          attempt,
+          phase,
+          ...(diagnostic ? { diagnostic } : {}),
+        });
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+  }
+
   return {
     TURN_COMPLETION_QUIET_WINDOW_MS,
     TURN_COMPLETION_REBOUND_WINDOW_MS,
@@ -644,6 +729,7 @@
     isRetrySafeContentScriptMessage,
     normalizeComposerText,
     normalizeConversationUrl,
+    postPhaseAndWaitForAck,
     retryRecoverableContentScriptMessage,
     tabNeedsActivation,
     tabNeedsLifecycleReload,

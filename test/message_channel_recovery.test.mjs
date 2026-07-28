@@ -1,9 +1,22 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
 
 const require = createRequire(import.meta.url);
 const shared = require("../extension/webchat_shared.js");
+const backgroundSource = fs.readFileSync(
+  new URL("../extension/background.js", import.meta.url),
+  "utf8",
+);
+const contentScriptSource = fs.readFileSync(
+  new URL("../extension/content_script.js", import.meta.url),
+  "utf8",
+);
+const popupSource = fs.readFileSync(
+  new URL("../extension/popup.js", import.meta.url),
+  "utf8",
+);
 
 test("classifies Chrome message-channel lifecycle failures as recoverable", () => {
   const messages = [
@@ -65,6 +78,134 @@ test("retries only idempotent content-script messages", () => {
   for (const type of ["START", "STOP", "NAVIGATE", "DELETE_CHAT"]) {
     assert.equal(shared.isRetrySafeContentScriptMessage({ type }), false, type);
   }
+});
+
+test("waits for the matching durable phase acknowledgement before continuing", async () => {
+  const messageListeners = new Set();
+  const disconnectListeners = new Set();
+  const postedMessages = [];
+  const port = {
+    onMessage: {
+      addListener: (listener) => messageListeners.add(listener),
+      removeListener: (listener) => messageListeners.delete(listener),
+    },
+    onDisconnect: {
+      addListener: (listener) => disconnectListeners.add(listener),
+      removeListener: (listener) => disconnectListeners.delete(listener),
+    },
+    postMessage: (message) => postedMessages.push(message),
+  };
+
+  let sideEffectAllowed = false;
+  const gatedSideEffect = shared
+    .postPhaseAndWaitForAck(port, {
+      seq: 41,
+      attempt: 2,
+      phase: "submit_started",
+      diagnostic: { composerTextMatched: true },
+      timeoutMs: 1_000,
+    })
+    .then(() => {
+      sideEffectAllowed = true;
+    });
+
+  await Promise.resolve();
+  assert.equal(sideEffectAllowed, false);
+  assert.deepEqual(postedMessages, [
+    {
+      type: "phase",
+      seq: 41,
+      attempt: 2,
+      phase: "submit_started",
+      diagnostic: { composerTextMatched: true },
+    },
+  ]);
+
+  for (const listener of messageListeners) {
+    listener({
+      type: "phase_ack",
+      seq: 41,
+      attempt: 1,
+      phase: "submit_started",
+    });
+  }
+  await Promise.resolve();
+  assert.equal(sideEffectAllowed, false);
+
+  for (const listener of messageListeners) {
+    listener({
+      type: "phase_ack",
+      seq: 41,
+      attempt: 2,
+      phase: "submit_started",
+    });
+  }
+  await gatedSideEffect;
+
+  assert.equal(sideEffectAllowed, true);
+  assert.equal(messageListeners.size, 0);
+  assert.equal(disconnectListeners.size, 0);
+});
+
+test("orders the durable submit handshake before the send side effect", () => {
+  const pipelineStart = contentScriptSource.indexOf(
+    "await typePromptAndVerify(msg.prompt",
+  );
+  const pipelineEnd = contentScriptSource.indexOf(
+    "await streamResponseSnapshots(",
+    pipelineStart,
+  );
+  const pipelineSource = contentScriptSource.slice(pipelineStart, pipelineEnd);
+  const promptAppliedIndex = pipelineSource.indexOf(
+    'phase: "prompt_applied"',
+  );
+  const submitStartedIndex = pipelineSource.indexOf(
+    'phase: "submit_started"',
+  );
+  const sendSideEffectIndex = pipelineSource.indexOf(
+    "const submission = await submitMessageAndVerify(msg.prompt)",
+  );
+
+  assert.ok(pipelineStart >= 0);
+  assert.ok(pipelineEnd > pipelineStart);
+  assert.ok(promptAppliedIndex >= 0);
+  assert.ok(submitStartedIndex > promptAppliedIndex);
+  assert.ok(sendSideEffectIndex > submitStartedIndex);
+  assert.match(
+    pipelineSource,
+    /await shared\.postPhaseAndWaitForAck\(port, \{[\s\S]*phase: "submit_started"/,
+  );
+
+  const durableAckStart = backgroundSource.indexOf(
+    "const requiresDurableAck =",
+  );
+  const durableAckEnd = backgroundSource.indexOf(
+    '} else if (msg.type === "turn_state")',
+    durableAckStart,
+  );
+  const durableAckSource = backgroundSource.slice(
+    durableAckStart,
+    durableAckEnd,
+  );
+  const relayAckIndex = durableAckSource.indexOf("await ackQueryPhase(");
+  const portAckIndex = durableAckSource.indexOf('type: "phase_ack"');
+
+  assert.ok(durableAckStart >= 0);
+  assert.ok(durableAckEnd > durableAckStart);
+  assert.match(durableAckSource, /msg\.phase === "submit_started"/);
+  assert.ok(relayAckIndex >= 0);
+  assert.ok(portAckIndex > relayAckIndex);
+});
+
+test("refreshes the popup relay indicator after connection recovery", () => {
+  assert.match(
+    backgroundSource,
+    /type: "STATUS_UPDATE",[\s\S]*relayAlive: zoteroConnected/,
+  );
+  assert.match(
+    popupSource,
+    /typeof msg\.relayAlive === "boolean"[\s\S]*setIndicator\([\s\S]*msg\.relayAlive/,
+  );
 });
 
 test("returns a stable message response without invoking recovery", async () => {
