@@ -62,6 +62,30 @@ When a new version is available, choose one of the following methods depending o
 3. Click the extension icon to verify connection status
 4. Send queries from Zotero — the extension handles the rest
 
+## Releasing (maintainers)
+
+Run one of the following commands from a clean `main` branch:
+
+```bash
+npm run release:patch
+npm run release:minor
+npm run release:major
+```
+
+The release command validates the repository, runs the automated checks, requires you to confirm the live Zotero-to-WebChat smoke test, updates the extension version when needed, creates and pushes the release tag, prepares release notes, creates a draft GitHub release, and dispatches the packaging workflow.
+GitHub Actions validates the tag, runs the tests again, creates `extension.zip`, and uploads it to the draft.
+The command publishes the release only after the workflow succeeds and the ZIP asset is present.
+
+Preview a patch release without creating a commit, tag, workflow run, or release:
+
+```bash
+npm run release:patch -- --dry-run
+```
+
+Generated release notes come from commit subjects since the latest published tag.
+Use `--edit-notes` to edit them before release, or `--notes-file <path>` to supply a prepared Markdown file.
+If a network or workflow failure interrupts a release, fix the reported problem and rerun the same command; the command resumes the matching draft or tag instead of incrementing the version again.
+
 ## Browser Compatibility
 
 This extension targets modern Chromium browsers with Manifest V3 support, including Google Chrome and Microsoft Edge. It uses Chrome extension APIs such as `chrome.storage.session`, service workers, and `MAIN` world content scripts, so older Chromium builds are not supported.

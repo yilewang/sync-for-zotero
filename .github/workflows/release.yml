@@ -1,22 +1,52 @@
 name: Release Extension
+run-name: Release ${{ inputs.tag }}
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package into its draft release
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   upload-extension:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate tag and manifest version
+        run: npm run release:validate -- "$RELEASE_TAG"
+
+      - name: Run tests
+        run: npm test
 
       - name: Zip extension folder
-        run: zip -r extension.zip extension/
+        run: zip -r -X extension.zip extension/
 
-      - name: Upload to release
-        run: gh release upload "${{ github.event.release.tag_name }}" extension.zip --clobber
+      - name: Verify release archive
+        run: unzip -t extension.zip
+
+      - name: Upload archive to draft release
+        run: gh release upload "$RELEASE_TAG" extension.zip --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
