@@ -242,49 +242,139 @@
     }
   }
 
+  function attachmentCardIsSettled(card) {
+    const normalized = normalizeAttachmentEvidence(card);
+    return !(
+      /\b(?:parsing|uploading|processing|scanning|reading)\b/.test(normalized) ||
+      /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(normalized)
+    );
+  }
+
   /**
    * Wait for the site to accept the attachment, then for it to report the file
-   * as ready. Acceptance is required — without it there is nothing attached.
-   * Readiness is best-effort: some sites render a finished card that never says
-   * "ready", so a readiness timeout downgrades to readyConfirmed: false rather
-   * than failing a send whose file is already on screen.
+   * as ready.
+   *
+   * We dropped exactly one file into a composer whose prior state we captured,
+   * so the question that matters is "did a new file card appear?", not "is it
+   * labelled the way we expect". Sites shorten, translate, and re-render file
+   * names, and every name check is a chance to reject an upload that worked.
+   * A new card therefore counts as acceptance on its own; matching the expected
+   * filename only upgrades the result to filenameConfirmed.
+   *
+   * Readiness is best-effort either way: a card that never reports itself ready
+   * downgrades to readyConfirmed: false rather than failing a send whose file is
+   * already on screen.
    */
   async function confirmAttachmentAcceptedThenReady({
-    baselineEvidence = [],
+    baseline = { evidence: [], cards: [] },
     expectedFilename = "",
-    readEvidence,
+    readState,
     wait,
     now = () => Date.now(),
     acceptTimeoutMs = 15000,
     readyTimeoutMs = 30000,
     pollIntervalMs = 100,
   } = {}) {
-    const acceptance = await waitForNewExpectedAttachmentEvidence({
-      baselineEvidence,
-      expectedFilename,
-      readEvidence,
-      wait,
-      now,
-      timeoutMs: acceptTimeoutMs,
-      pollIntervalMs,
-      requireReady: false,
-    });
-
-    try {
-      const readiness = await waitForNewExpectedAttachmentEvidence({
-        baselineEvidence,
-        expectedFilename,
-        readEvidence,
-        wait,
-        now,
-        timeoutMs: readyTimeoutMs,
-        pollIntervalMs,
-        requireReady: true,
-      });
-      return { ...readiness, readyConfirmed: true };
-    } catch (_) {
-      return { ...acceptance, readyConfirmed: false };
+    if (typeof readState !== "function") {
+      throw new TypeError("readState must be a function");
     }
+    if (typeof wait !== "function") {
+      throw new TypeError("wait must be a function");
+    }
+
+    const baselineEvidence = Array.isArray(baseline?.evidence)
+      ? baseline.evidence
+      : [];
+    const baselineCards = Array.isArray(baseline?.cards) ? baseline.cards : [];
+    const boundedPollIntervalMs = Math.max(10, Number(pollIntervalMs) || 100);
+    const startedAt = now();
+
+    const poll = async (deadline, isSatisfied) => {
+      while (true) {
+        const state = (await readState()) || {};
+        const evidence = Array.isArray(state.evidence) ? state.evidence : [];
+        const cards = Array.isArray(state.cards) ? state.cards : [];
+        const satisfied = isSatisfied(evidence, cards);
+        if (satisfied) return satisfied;
+        const currentTime = now();
+        if (currentTime >= deadline) return null;
+        await wait(
+          Math.min(boundedPollIntervalMs, Math.max(0, deadline - currentTime)),
+        );
+      }
+    };
+
+    const acceptance = await poll(
+      startedAt + Math.max(0, Number(acceptTimeoutMs) || 0),
+      (evidence, cards) => {
+        if (
+          hasNewExpectedAttachmentEvidence({
+            baselineEvidence,
+            currentEvidence: evidence,
+            expectedFilename,
+            requireReady: false,
+          })
+        ) {
+          const matched = evidence.find((entry) =>
+            attachmentEvidenceMatchesFilename(entry, expectedFilename),
+          );
+          return {
+            evidence: matched || expectedFilename,
+            filenameConfirmed: true,
+          };
+        }
+        if (cards.length > baselineCards.length) {
+          return {
+            evidence: cards[cards.length - 1] || expectedFilename,
+            filenameConfirmed: false,
+          };
+        }
+        return null;
+      },
+    );
+
+    if (!acceptance) {
+      throw new Error(
+        `The website did not confirm attachment of "${expectedFilename}".`,
+      );
+    }
+
+    const readiness = await poll(
+      now() + Math.max(0, Number(readyTimeoutMs) || 0),
+      (evidence, cards) => {
+        if (acceptance.filenameConfirmed) {
+          if (
+            hasNewExpectedAttachmentEvidence({
+              baselineEvidence,
+              currentEvidence: evidence,
+              expectedFilename,
+              requireReady: true,
+            })
+          ) {
+            return {
+              evidence:
+                evidence.find((entry) =>
+                  attachmentEvidenceIsReady(entry, expectedFilename),
+                ) || acceptance.evidence,
+            };
+          }
+          return null;
+        }
+        // Nothing here identifies the file, so the best available signal that
+        // the upload finished is that no card is still reporting progress.
+        return cards.length > baselineCards.length &&
+            cards.every(attachmentCardIsSettled)
+          ? { evidence: cards[cards.length - 1] || acceptance.evidence }
+          : null;
+      },
+    );
+
+    return {
+      evidence: readiness?.evidence || acceptance.evidence,
+      filenameConfirmed: acceptance.filenameConfirmed,
+      readyConfirmed: Boolean(readiness),
+      elapsedMs: Math.max(0, now() - startedAt),
+    };
   }
 
   function isPlaceholderAssistantText(text) {
@@ -790,6 +880,7 @@
     attachmentEvidenceMatchesFilename,
     attachmentEvidenceHasFileCardSignal,
     attachmentEvidenceIsReady,
+    attachmentCardIsSettled,
     attemptToken,
     canReuseReadyTranscriptForScrape,
     classifyContentScriptMessageError,

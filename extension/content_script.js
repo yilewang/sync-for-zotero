@@ -392,26 +392,100 @@ const shared = globalThis.SyncZoteroShared || {
       await wait(Math.min(pollIntervalMs, deadline - Date.now()));
     }
   },
+  attachmentCardIsSettled: (card) =>
+    !/\b(?:parsing|uploading|processing|scanning|reading)\b/i.test(
+      String(card || ""),
+    ) &&
+    !/(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
+      String(card || ""),
+    ),
   confirmAttachmentAcceptedThenReady: async ({
+    baseline = { evidence: [], cards: [] },
+    expectedFilename = "",
+    readState,
+    wait,
     acceptTimeoutMs = 15000,
     readyTimeoutMs = 30000,
-    ...rest
+    pollIntervalMs = 100,
   } = {}) => {
-    const acceptance = await shared.waitForNewExpectedAttachmentEvidence({
-      ...rest,
-      timeoutMs: acceptTimeoutMs,
-      requireReady: false,
-    });
-    try {
-      const readiness = await shared.waitForNewExpectedAttachmentEvidence({
-        ...rest,
-        timeoutMs: readyTimeoutMs,
-        requireReady: true,
-      });
-      return { ...readiness, readyConfirmed: true };
-    } catch (_) {
-      return { ...acceptance, readyConfirmed: false };
+    const baselineEvidence = baseline?.evidence || [];
+    const baselineCards = baseline?.cards || [];
+    const startedAt = Date.now();
+    const poll = async (deadline, isSatisfied) => {
+      while (true) {
+        const state = (await readState()) || {};
+        const satisfied = isSatisfied(
+          state.evidence || [],
+          state.cards || [],
+        );
+        if (satisfied) return satisfied;
+        if (Date.now() >= deadline) return null;
+        await wait(Math.min(pollIntervalMs, deadline - Date.now()));
+      }
+    };
+
+    const acceptance = await poll(
+      startedAt + acceptTimeoutMs,
+      (evidence, cards) => {
+        if (
+          shared.hasNewExpectedAttachmentEvidence({
+            baselineEvidence,
+            currentEvidence: evidence,
+            expectedFilename,
+            requireReady: false,
+          })
+        ) {
+          return {
+            evidence:
+              evidence.find((entry) =>
+                shared.attachmentEvidenceMatchesFilename(
+                  entry,
+                  expectedFilename,
+                ),
+              ) || expectedFilename,
+            filenameConfirmed: true,
+          };
+        }
+        return cards.length > baselineCards.length
+          ? {
+            evidence: cards[cards.length - 1] || expectedFilename,
+            filenameConfirmed: false,
+          }
+          : null;
+      },
+    );
+    if (!acceptance) {
+      throw new Error(
+        `The website did not confirm attachment of "${expectedFilename}".`,
+      );
     }
+
+    const readiness = await poll(
+      Date.now() + readyTimeoutMs,
+      (evidence, cards) => {
+        if (acceptance.filenameConfirmed) {
+          return shared.hasNewExpectedAttachmentEvidence({
+            baselineEvidence,
+            currentEvidence: evidence,
+            expectedFilename,
+            requireReady: true,
+          })
+            ? { evidence: acceptance.evidence }
+            : null;
+        }
+        return cards.length > baselineCards.length &&
+            cards.every(shared.attachmentCardIsSettled)
+          ? { evidence: acceptance.evidence }
+          : null;
+      },
+    );
+
+    return {
+      evidence: acceptance.evidence,
+      filenameConfirmed: acceptance.filenameConfirmed,
+      readyConfirmed: Boolean(readiness),
+      elapsedMs: Date.now() - startedAt,
+    };
   },
   terminalAnswerSnapshotIsStable: (candidate, latest) => {
     const candidateText = String(candidate?.text || "").trim();
@@ -1217,15 +1291,47 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
   return evidence;
 }
 
-async function waitForPdfAttachmentConfirmation({
-  baselineEvidence,
-  pdfFilename,
-}) {
+/**
+ * Every visible file card attached to the composer, regardless of what it is
+ * named. Counting these is how an upload is confirmed when the site renders a
+ * name we cannot match; the pre-drop baseline cancels out the composer's own
+ * static file controls and any attachment that was already there.
+ */
+function collectComposerFileCards() {
+  const selector =
+    SITE_ADAPTER?.attachmentPillSelector ||
+    '[data-testid*="file"], [class*="attachment"], [class*="file-pill"]';
+  const messageSelector =
+    SITE_ADAPTER?.conversationMessageSelector ||
+    "[data-message-author-role]";
+  const candidates = Array.from(document.querySelectorAll(selector)).filter(
+    (node) =>
+      isVisibleElement(node) &&
+      !node.closest?.(messageSelector) &&
+      readAttachmentEvidenceText(node),
+  );
+  // Keep the innermost node of each nested group so one card counts once even
+  // when a wrapper matches the same selector.
+  return candidates
+    .filter(
+      (node) =>
+        !candidates.some((other) => other !== node && node.contains(other)),
+    )
+    .map(readAttachmentEvidenceText);
+}
+
+function readPdfAttachmentState(pdfFilename) {
+  return {
+    evidence: collectVisibleComposerAttachmentEvidence(pdfFilename),
+    cards: collectComposerFileCards(),
+  };
+}
+
+async function waitForPdfAttachmentConfirmation({ baseline, pdfFilename }) {
   return shared.confirmAttachmentAcceptedThenReady({
-    baselineEvidence,
+    baseline,
     expectedFilename: pdfFilename,
-    readEvidence: () =>
-      collectVisibleComposerAttachmentEvidence(pdfFilename),
+    readState: () => readPdfAttachmentState(pdfFilename),
     wait: sleep,
     acceptTimeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
     readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
@@ -1235,8 +1341,7 @@ async function waitForPdfAttachmentConfirmation({
 
 async function attachPDF(pdfBase64, pdfFilename) {
   const startedAt = Date.now();
-  const baselineEvidence =
-    collectVisibleComposerAttachmentEvidence(pdfFilename);
+  const baseline = readPdfAttachmentState(pdfFilename);
 
   // Decode base64 → Uint8Array → File
   const binary = atob(pdfBase64);
@@ -1282,12 +1387,17 @@ async function attachPDF(pdfBase64, pdfFilename) {
   let confirmation;
   try {
     confirmation = await waitForPdfAttachmentConfirmation({
-      baselineEvidence,
+      baseline,
       pdfFilename,
     });
   } catch (_) {
     throw new Error(
-      `PDF attachment failed: the website did not confirm that "${pdfFilename}" was accepted after the drag-and-drop attempt.`,
+      `PDF attachment failed: no file appeared in the composer after the drag-and-drop attempt for "${pdfFilename}".`,
+    );
+  }
+  if (!confirmation.filenameConfirmed) {
+    console.warn(
+      `[sync-zotero] A file card appeared for "${pdfFilename}" but the site renders a name we cannot match — accepting it.`,
     );
   }
   if (!confirmation.readyConfirmed) {
@@ -2809,11 +2919,26 @@ async function streamResponseSnapshots(
       const attachments = Array.isArray(matchedUserTurn.attachments)
         ? matchedUserTurn.attachments
         : [];
-      submittedPdfVerified =
-        shared.attachmentListContainsExpectedFilename(
-          attachments,
-          expectedPdfFilename,
+      const nameMatched = shared.attachmentListContainsExpectedFilename(
+        attachments,
+        expectedPdfFilename,
+      );
+      // A turn that carries a file is a sent PDF. Only a turn with no
+      // attachment at all is a real failure — the name the site renders is not
+      // something we can insist on without rejecting successful sends.
+      submittedPdfVerified = nameMatched || attachments.length > 0;
+      if (submittedPdfVerified && !nameMatched) {
+        console.warn(
+          `[sync-zotero] The submitted turn carries an attachment the site names differently from "${expectedPdfFilename}" — accepting it.`,
         );
+        recordTurnDebug("submitted_pdf_name_unmatched", {
+          seq,
+          attempt,
+          userTurnKey: matchedUserTurn.messageKey,
+          expectedPdfFilename,
+          attachments,
+        });
+      }
       if (submittedPdfVerified) {
         userTurnKey = matchedUserTurn.messageKey;
         recordTurnDebug("submitted_pdf_verified", {
@@ -2842,7 +2967,7 @@ async function streamResponseSnapshots(
         SUBMITTED_PDF_VERIFY_TIMEOUT_MS
     ) {
       throw new Error(
-        `The submitted user turn did not include the expected PDF "${expectedPdfFilename}".`,
+        `The submitted user turn carried no attachment; "${expectedPdfFilename}" did not reach the chat.`,
       );
     }
 

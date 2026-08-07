@@ -275,26 +275,12 @@ test("waits only until new expected evidence appears", async () => {
   assert.equal(waits, 2);
 });
 
-test("confirms an attachment the website marks ready", async () => {
-  const result = await shared.confirmAttachmentAcceptedThenReady({
-    baselineEvidence: [],
-    expectedFilename: filename,
-    readEvidence: () => [`${filename}\nReady`],
-    wait: async () => {},
-    acceptTimeoutMs: 1000,
-    readyTimeoutMs: 1000,
-  });
-
-  assert.equal(result.readyConfirmed, true);
-  assert.equal(result.evidence, `${filename}\nReady`);
-});
-
-test("keeps an accepted attachment that never reports ready", async () => {
+function confirmWithFakeClock(state, options = {}) {
   let nowMs = 0;
-  const result = await shared.confirmAttachmentAcceptedThenReady({
-    baselineEvidence: [],
+  return shared.confirmAttachmentAcceptedThenReady({
+    baseline: { evidence: [], cards: [] },
     expectedFilename: filename,
-    readEvidence: () => [`${filename}\nParsing...`],
+    readState: typeof state === "function" ? state : () => state,
     wait: async (ms) => {
       nowMs += ms;
     },
@@ -302,28 +288,75 @@ test("keeps an accepted attachment that never reports ready", async () => {
     acceptTimeoutMs: 1000,
     readyTimeoutMs: 1000,
     pollIntervalMs: 100,
+    ...options,
+  });
+}
+
+test("confirms an attachment the website marks ready", async () => {
+  const card = `${filename}\nReady`;
+  const result = await confirmWithFakeClock({
+    evidence: [card],
+    cards: [card],
+  });
+
+  assert.equal(result.readyConfirmed, true);
+  assert.equal(result.filenameConfirmed, true);
+  assert.equal(result.evidence, card);
+});
+
+test("keeps an accepted attachment that never reports ready", async () => {
+  const card = `${filename}\nParsing...`;
+  const result = await confirmWithFakeClock({
+    evidence: [card],
+    cards: [card],
   });
 
   assert.equal(result.readyConfirmed, false);
-  assert.equal(result.evidence, `${filename}\nParsing...`);
+  assert.equal(result.filenameConfirmed, true);
+  assert.equal(result.evidence, card);
 });
 
-test("fails when the website never accepts the attachment at all", async () => {
-  let nowMs = 0;
+test("accepts a new file card the expected filename cannot be read from", async () => {
+  const card = "Aerie — mission planning\nPDF";
+  const result = await confirmWithFakeClock({ evidence: [], cards: [card] });
+
+  assert.equal(result.filenameConfirmed, false);
+  assert.equal(result.readyConfirmed, true);
+  assert.equal(result.evidence, card);
+});
+
+test("waits for an unreadable file card to stop uploading", async () => {
+  const result = await confirmWithFakeClock({
+    evidence: [],
+    cards: ["Aerie — mission planning\nUploading…"],
+  });
+
+  assert.equal(result.filenameConfirmed, false);
+  assert.equal(result.readyConfirmed, false);
+});
+
+test("fails when no new file card appears at all", async () => {
+  await assert.rejects(
+    confirmWithFakeClock(
+      { evidence: [], cards: [] },
+      { acceptTimeoutMs: 250, readyTimeoutMs: 250 },
+    ),
+    /did not confirm attachment/,
+  );
+});
+
+test("does not mistake a pre-existing file card for the new attachment", async () => {
+  const stale = "Older paper.pdf\nPDF 1.10MB";
 
   await assert.rejects(
-    shared.confirmAttachmentAcceptedThenReady({
-      baselineEvidence: [],
-      expectedFilename: filename,
-      readEvidence: () => [],
-      wait: async (ms) => {
-        nowMs += ms;
+    confirmWithFakeClock(
+      { evidence: [], cards: [stale] },
+      {
+        baseline: { evidence: [], cards: [stale] },
+        acceptTimeoutMs: 250,
+        readyTimeoutMs: 250,
       },
-      now: () => nowMs,
-      acceptTimeoutMs: 250,
-      readyTimeoutMs: 250,
-      pollIntervalMs: 100,
-    }),
+    ),
     /did not confirm attachment/,
   );
 });
