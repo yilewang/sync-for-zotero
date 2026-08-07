@@ -36,11 +36,46 @@
       .toLowerCase();
   }
 
+  // Chat sites elide long file names in the composer card ("Long paper na…"),
+  // so the full name never appears in the DOM. Accept an elision only when
+  // enough of the expected name precedes it to identify the file.
+  const MIN_ELIDED_FILENAME_PREFIX_LENGTH = 16;
+
+  function evidenceMatchesElidedFilename(
+    normalizedEvidence,
+    normalizedFilename,
+  ) {
+    if (normalizedFilename.length <= MIN_ELIDED_FILENAME_PREFIX_LENGTH) {
+      return false;
+    }
+    const elisions = /…|\.\.\./g;
+    let elision;
+    while ((elision = elisions.exec(normalizedEvidence))) {
+      const beforeElision = normalizedEvidence.slice(0, elision.index);
+      for (
+        let prefixLength = Math.min(
+          beforeElision.length,
+          normalizedFilename.length,
+        );
+        prefixLength >= MIN_ELIDED_FILENAME_PREFIX_LENGTH;
+        prefixLength--
+      ) {
+        if (beforeElision.endsWith(normalizedFilename.slice(0, prefixLength))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function attachmentEvidenceMatchesFilename(evidence, expectedFilename) {
     const normalizedEvidence = normalizeAttachmentEvidence(evidence);
     const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
     if (!normalizedFilename || !normalizedEvidence) return false;
     if (normalizedEvidence.includes(normalizedFilename)) return true;
+    if (evidenceMatchesElidedFilename(normalizedEvidence, normalizedFilename)) {
+      return true;
+    }
 
     const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
     if (!pdfMatch) return false;
@@ -204,6 +239,51 @@
       await wait(
         Math.min(boundedPollIntervalMs, Math.max(0, deadline - currentTime)),
       );
+    }
+  }
+
+  /**
+   * Wait for the site to accept the attachment, then for it to report the file
+   * as ready. Acceptance is required — without it there is nothing attached.
+   * Readiness is best-effort: some sites render a finished card that never says
+   * "ready", so a readiness timeout downgrades to readyConfirmed: false rather
+   * than failing a send whose file is already on screen.
+   */
+  async function confirmAttachmentAcceptedThenReady({
+    baselineEvidence = [],
+    expectedFilename = "",
+    readEvidence,
+    wait,
+    now = () => Date.now(),
+    acceptTimeoutMs = 15000,
+    readyTimeoutMs = 30000,
+    pollIntervalMs = 100,
+  } = {}) {
+    const acceptance = await waitForNewExpectedAttachmentEvidence({
+      baselineEvidence,
+      expectedFilename,
+      readEvidence,
+      wait,
+      now,
+      timeoutMs: acceptTimeoutMs,
+      pollIntervalMs,
+      requireReady: false,
+    });
+
+    try {
+      const readiness = await waitForNewExpectedAttachmentEvidence({
+        baselineEvidence,
+        expectedFilename,
+        readEvidence,
+        wait,
+        now,
+        timeoutMs: readyTimeoutMs,
+        pollIntervalMs,
+        requireReady: true,
+      });
+      return { ...readiness, readyConfirmed: true };
+    } catch (_) {
+      return { ...acceptance, readyConfirmed: false };
     }
   }
 
@@ -735,5 +815,6 @@
     tabNeedsLifecycleReload,
     terminalAnswerSnapshotIsStable,
     waitForNewExpectedAttachmentEvidence,
+    confirmAttachmentAcceptedThenReady,
   };
 });

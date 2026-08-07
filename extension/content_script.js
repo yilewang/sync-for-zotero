@@ -279,6 +279,21 @@ const shared = globalThis.SyncZoteroShared || {
     const normalizedFilename = normalize(expectedFilename);
     if (!normalizedFilename || !normalizedEvidence) return false;
     if (normalizedEvidence.includes(normalizedFilename)) return true;
+    const MIN_ELIDED_PREFIX = 16;
+    if (normalizedFilename.length > MIN_ELIDED_PREFIX) {
+      const elisions = /…|\.\.\./g;
+      let elision;
+      while ((elision = elisions.exec(normalizedEvidence))) {
+        const before = normalizedEvidence.slice(0, elision.index);
+        for (
+          let len = Math.min(before.length, normalizedFilename.length);
+          len >= MIN_ELIDED_PREFIX;
+          len--
+        ) {
+          if (before.endsWith(normalizedFilename.slice(0, len))) return true;
+        }
+      }
+    }
     const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
     if (!pdfMatch) return false;
     const escapeRegExp = (value) =>
@@ -375,6 +390,27 @@ const shared = globalThis.SyncZoteroShared || {
         );
       }
       await wait(Math.min(pollIntervalMs, deadline - Date.now()));
+    }
+  },
+  confirmAttachmentAcceptedThenReady: async ({
+    acceptTimeoutMs = 15000,
+    readyTimeoutMs = 30000,
+    ...rest
+  } = {}) => {
+    const acceptance = await shared.waitForNewExpectedAttachmentEvidence({
+      ...rest,
+      timeoutMs: acceptTimeoutMs,
+      requireReady: false,
+    });
+    try {
+      const readiness = await shared.waitForNewExpectedAttachmentEvidence({
+        ...rest,
+        timeoutMs: readyTimeoutMs,
+        requireReady: true,
+      });
+      return { ...readiness, readyConfirmed: true };
+    } catch (_) {
+      return { ...acceptance, readyConfirmed: false };
     }
   },
   terminalAnswerSnapshotIsStable: (candidate, latest) => {
@@ -1102,7 +1138,9 @@ function collectComposerRegionAttachmentEvidence(
     region = region.parentElement;
   }
 
-  return [];
+  // Nothing conclusive around the composer — let the caller fall back to the
+  // document-wide scan instead of reporting "no attachment".
+  return null;
 }
 
 function collectVisibleComposerAttachmentEvidence(expectedFilename) {
@@ -1158,11 +1196,10 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
       }
       const text = readAttachmentEvidenceText(evidenceNode);
       const hasAttachmentMetadata =
-        /\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b/i.test(text) ||
-        /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/i.test(
+        shared.attachmentEvidenceHasFileCardSignal(
           text,
-        ) ||
-        /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(text);
+          hasExplicitComposerFileControl(evidenceNode, expectedFilename),
+        );
       const matchesExpected = expectedFilename
         ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
         : shared.hasPendingPdfEvidence([text]);
@@ -1183,18 +1220,16 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
 async function waitForPdfAttachmentConfirmation({
   baselineEvidence,
   pdfFilename,
-  timeoutMs,
-  requireReady,
 }) {
-  return shared.waitForNewExpectedAttachmentEvidence({
+  return shared.confirmAttachmentAcceptedThenReady({
     baselineEvidence,
     expectedFilename: pdfFilename,
     readEvidence: () =>
       collectVisibleComposerAttachmentEvidence(pdfFilename),
     wait: sleep,
-    timeoutMs,
+    acceptTimeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
+    readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
     pollIntervalMs: PDF_ATTACHMENT_POLL_INTERVAL_MS,
-    requireReady,
   });
 }
 
@@ -1244,29 +1279,27 @@ async function attachPDF(pdfBase64, pdfFilename) {
     }),
   );
 
+  let confirmation;
   try {
-    await waitForPdfAttachmentConfirmation({
+    confirmation = await waitForPdfAttachmentConfirmation({
       baselineEvidence,
       pdfFilename,
-      timeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
-      requireReady: false,
     });
-    const confirmation = await waitForPdfAttachmentConfirmation({
-      baselineEvidence,
-      pdfFilename,
-      timeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
-      requireReady: true,
-    });
-    return {
-      ...confirmation,
-      method: "drag_drop",
-      totalElapsedMs: Date.now() - startedAt,
-    };
   } catch (_) {
     throw new Error(
-      `PDF attachment failed: the website did not confirm that "${pdfFilename}" was accepted and ready after the drag-and-drop attempt.`,
+      `PDF attachment failed: the website did not confirm that "${pdfFilename}" was accepted after the drag-and-drop attempt.`,
     );
   }
+  if (!confirmation.readyConfirmed) {
+    console.warn(
+      `[sync-zotero] "${pdfFilename}" was attached but the site never reported it as ready — sending anyway.`,
+    );
+  }
+  return {
+    ...confirmation,
+    method: "drag_drop",
+    totalElapsedMs: Date.now() - startedAt,
+  };
 }
 
 // ---------------------------------------------------------------------------

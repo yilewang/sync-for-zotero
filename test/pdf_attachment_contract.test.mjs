@@ -86,6 +86,64 @@ test("does not accept unrelated or partial filename evidence", () => {
   );
 });
 
+test("accepts a card whose long filename the site elided", () => {
+  const longFilename =
+    "Dailis 等 - Aerie A Modern Multi-Mission Planning, Scheduling, " +
+    "and Sequencing System.pdf";
+
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(
+      "Dailis 等 - Aerie A Modern Multi-…\nPDF",
+      longFilename,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(
+      "Dailis 等 - Aerie A Modern Multi-...\nPDF",
+      longFilename,
+    ),
+    true,
+  );
+});
+
+test("accepts a card whose filename the site elided in the middle", () => {
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(
+      `Panzeri et al. - 2022 - The str…correlations.pdf\nPDF 1.95MB`,
+      filename,
+    ),
+    true,
+  );
+});
+
+test("does not accept an elided filename from a different file", () => {
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(
+      "Dailis et al. - 2019 - A completely different paper…\nPDF",
+      filename,
+    ),
+    false,
+  );
+});
+
+test("does not accept an elision after too little of the filename", () => {
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename("Panzeri…\nPDF", filename),
+    false,
+  );
+});
+
+test("does not treat an elided filename as ready while it is parsing", () => {
+  assert.equal(
+    shared.attachmentEvidenceIsReady(
+      `Panzeri et al. - 2022 - The str…\nParsing...`,
+      filename,
+    ),
+    false,
+  );
+});
+
 test("accepts ChatGPT's numeric duplicate suffix on a submitted PDF", () => {
   assert.equal(
     shared.attachmentEvidenceMatchesFilename(
@@ -215,6 +273,59 @@ test("waits only until new expected evidence appears", async () => {
   assert.equal(result.evidence, `${filename}\nReady`);
   assert.equal(reads, 3);
   assert.equal(waits, 2);
+});
+
+test("confirms an attachment the website marks ready", async () => {
+  const result = await shared.confirmAttachmentAcceptedThenReady({
+    baselineEvidence: [],
+    expectedFilename: filename,
+    readEvidence: () => [`${filename}\nReady`],
+    wait: async () => {},
+    acceptTimeoutMs: 1000,
+    readyTimeoutMs: 1000,
+  });
+
+  assert.equal(result.readyConfirmed, true);
+  assert.equal(result.evidence, `${filename}\nReady`);
+});
+
+test("keeps an accepted attachment that never reports ready", async () => {
+  let nowMs = 0;
+  const result = await shared.confirmAttachmentAcceptedThenReady({
+    baselineEvidence: [],
+    expectedFilename: filename,
+    readEvidence: () => [`${filename}\nParsing...`],
+    wait: async (ms) => {
+      nowMs += ms;
+    },
+    now: () => nowMs,
+    acceptTimeoutMs: 1000,
+    readyTimeoutMs: 1000,
+    pollIntervalMs: 100,
+  });
+
+  assert.equal(result.readyConfirmed, false);
+  assert.equal(result.evidence, `${filename}\nParsing...`);
+});
+
+test("fails when the website never accepts the attachment at all", async () => {
+  let nowMs = 0;
+
+  await assert.rejects(
+    shared.confirmAttachmentAcceptedThenReady({
+      baselineEvidence: [],
+      expectedFilename: filename,
+      readEvidence: () => [],
+      wait: async (ms) => {
+        nowMs += ms;
+      },
+      now: () => nowMs,
+      acceptTimeoutMs: 250,
+      readyTimeoutMs: 250,
+      pollIntervalMs: 100,
+    }),
+    /did not confirm attachment/,
+  );
 });
 
 test("fails closed when the website never exposes expected PDF evidence", async () => {
