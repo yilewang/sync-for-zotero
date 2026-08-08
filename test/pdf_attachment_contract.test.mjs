@@ -278,7 +278,7 @@ test("waits only until new expected evidence appears", async () => {
 function confirmWithFakeClock(state, options = {}) {
   let nowMs = 0;
   return shared.confirmAttachmentAcceptedThenReady({
-    baseline: { evidence: [], cards: [] },
+    baselineEvidence: [],
     expectedFilename: filename,
     readState: typeof state === "function" ? state : () => state,
     wait: async (ms) => {
@@ -296,7 +296,7 @@ test("confirms an attachment the website marks ready", async () => {
   const card = `${filename}\nReady`;
   const result = await confirmWithFakeClock({
     evidence: [card],
-    cards: [card],
+    newCards: [card],
   });
 
   assert.equal(result.readyConfirmed, true);
@@ -308,7 +308,7 @@ test("keeps an accepted attachment that never reports ready", async () => {
   const card = `${filename}\nParsing...`;
   const result = await confirmWithFakeClock({
     evidence: [card],
-    cards: [card],
+    newCards: [card],
   });
 
   assert.equal(result.readyConfirmed, false);
@@ -318,7 +318,7 @@ test("keeps an accepted attachment that never reports ready", async () => {
 
 test("accepts a new file card the expected filename cannot be read from", async () => {
   const card = "Aerie — mission planning\nPDF";
-  const result = await confirmWithFakeClock({ evidence: [], cards: [card] });
+  const result = await confirmWithFakeClock({ evidence: [], newCards: [card] });
 
   assert.equal(result.filenameConfirmed, false);
   assert.equal(result.readyConfirmed, true);
@@ -328,7 +328,7 @@ test("accepts a new file card the expected filename cannot be read from", async 
 test("waits for an unreadable file card to stop uploading", async () => {
   const result = await confirmWithFakeClock({
     evidence: [],
-    cards: ["Aerie — mission planning\nUploading…"],
+    newCards: ["Aerie — mission planning\nUploading…"],
   });
 
   assert.equal(result.filenameConfirmed, false);
@@ -338,7 +338,7 @@ test("waits for an unreadable file card to stop uploading", async () => {
 test("fails when no new file card appears at all", async () => {
   await assert.rejects(
     confirmWithFakeClock(
-      { evidence: [], cards: [] },
+      { evidence: [], newCards: [] },
       { acceptTimeoutMs: 250, readyTimeoutMs: 250 },
     ),
     /did not confirm attachment/,
@@ -346,18 +346,21 @@ test("fails when no new file card appears at all", async () => {
 });
 
 test("does not mistake a pre-existing file card for the new attachment", async () => {
-  const stale = "Older paper.pdf\nPDF 1.10MB";
-
+  // The caller diffs against the nodes present before the drop, so a card that
+  // was already on screen never reaches newCards.
   await assert.rejects(
     confirmWithFakeClock(
-      { evidence: [], cards: [stale] },
-      {
-        baseline: { evidence: [], cards: [stale] },
-        acceptTimeoutMs: 250,
-        readyTimeoutMs: 250,
-      },
+      { evidence: [], newCards: [] },
+      { acceptTimeoutMs: 250, readyTimeoutMs: 250 },
     ),
     /did not confirm attachment/,
+  );
+});
+
+test("treats a byte-sized file card as a real attachment card", () => {
+  assert.equal(
+    shared.attachmentEvidenceHasFileCardSignal(`${filename}\nPDF 607B`, false),
+    true,
   );
 });
 

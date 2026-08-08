@@ -312,7 +312,7 @@ const shared = globalThis.SyncZoteroShared || {
     evidence,
     hasExplicitFileControl = false,
   ) =>
-    /\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b/i.test(String(evidence || "")) ||
+    /\b\d+(?:\.\d+)?\s*(?:B|KB|MB|GB)\b/i.test(String(evidence || "")) ||
     /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/i.test(
       String(evidence || ""),
     ) ||
@@ -400,7 +400,7 @@ const shared = globalThis.SyncZoteroShared || {
       String(card || ""),
     ),
   confirmAttachmentAcceptedThenReady: async ({
-    baseline = { evidence: [], cards: [] },
+    baselineEvidence = [],
     expectedFilename = "",
     readState,
     wait,
@@ -408,15 +408,13 @@ const shared = globalThis.SyncZoteroShared || {
     readyTimeoutMs = 30000,
     pollIntervalMs = 100,
   } = {}) => {
-    const baselineEvidence = baseline?.evidence || [];
-    const baselineCards = baseline?.cards || [];
     const startedAt = Date.now();
     const poll = async (deadline, isSatisfied) => {
       while (true) {
         const state = (await readState()) || {};
         const satisfied = isSatisfied(
           state.evidence || [],
-          state.cards || [],
+          state.newCards || [],
         );
         if (satisfied) return satisfied;
         if (Date.now() >= deadline) return null;
@@ -426,7 +424,7 @@ const shared = globalThis.SyncZoteroShared || {
 
     const acceptance = await poll(
       startedAt + acceptTimeoutMs,
-      (evidence, cards) => {
+      (evidence, newCards) => {
         if (
           shared.hasNewExpectedAttachmentEvidence({
             baselineEvidence,
@@ -446,9 +444,9 @@ const shared = globalThis.SyncZoteroShared || {
             filenameConfirmed: true,
           };
         }
-        return cards.length > baselineCards.length
+        return newCards.length > 0
           ? {
-            evidence: cards[cards.length - 1] || expectedFilename,
+            evidence: newCards[newCards.length - 1] || expectedFilename,
             filenameConfirmed: false,
           }
           : null;
@@ -462,7 +460,7 @@ const shared = globalThis.SyncZoteroShared || {
 
     const readiness = await poll(
       Date.now() + readyTimeoutMs,
-      (evidence, cards) => {
+      (evidence, newCards) => {
         if (acceptance.filenameConfirmed) {
           return shared.hasNewExpectedAttachmentEvidence({
             baselineEvidence,
@@ -473,8 +471,8 @@ const shared = globalThis.SyncZoteroShared || {
             ? { evidence: acceptance.evidence }
             : null;
         }
-        return cards.length > baselineCards.length &&
-            cards.every(shared.attachmentCardIsSettled)
+        return newCards.length > 0 &&
+            newCards.every(shared.attachmentCardIsSettled)
           ? { evidence: acceptance.evidence }
           : null;
       },
@@ -1291,47 +1289,70 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
   return evidence;
 }
 
+// A file card is short — a name, a type, a size. Prose that merely mentions a
+// PDF is not, so length is what separates the two when class names tell us
+// nothing (DeepSeek ships scrambled class names such as "e70accd6").
+const FILE_CARD_MAX_TEXT_LENGTH = 300;
+
 /**
- * Every visible file card attached to the composer, regardless of what it is
- * named. Counting these is how an upload is confirmed when the site renders a
- * name we cannot match; the pre-drop baseline cancels out the composer's own
- * static file controls and any attachment that was already there.
+ * Every visible file card node attached to the composer, regardless of what it
+ * is named. Diffing these against the pre-drop snapshot is how an upload is
+ * confirmed when the site renders a name we cannot match — ChatGPT's card, for
+ * one, is identifiable only by a localized "Remove file" label.
  */
-function collectComposerFileCards() {
+function collectComposerFileCardNodes() {
   const selector =
     SITE_ADAPTER?.attachmentPillSelector ||
     '[data-testid*="file"], [class*="attachment"], [class*="file-pill"]';
   const messageSelector =
     SITE_ADAPTER?.conversationMessageSelector ||
     "[data-message-author-role]";
+  const isCandidate = (node) =>
+    isVisibleElement(node) &&
+    !node.closest?.(messageSelector) &&
+    readAttachmentEvidenceText(node);
   const candidates = Array.from(document.querySelectorAll(selector)).filter(
-    (node) =>
-      isVisibleElement(node) &&
-      !node.closest?.(messageSelector) &&
-      readAttachmentEvidenceText(node),
+    isCandidate,
   );
+  // Sites whose class names are generated expose no selector to match, so fall
+  // back to shape: a small node whose text reads like a file card.
+  document.querySelectorAll("div, span").forEach((node) => {
+    if (candidates.includes(node) || !isCandidate(node)) return;
+    const text = readAttachmentEvidenceText(node);
+    if (text.length > FILE_CARD_MAX_TEXT_LENGTH) return;
+    if (
+      /\.pdf(?:\b|$)/i.test(text) &&
+      shared.attachmentEvidenceHasFileCardSignal(text, true)
+    ) {
+      candidates.push(node);
+    }
+  });
   // Keep the innermost node of each nested group so one card counts once even
-  // when a wrapper matches the same selector.
-  return candidates
-    .filter(
-      (node) =>
-        !candidates.some((other) => other !== node && node.contains(other)),
-    )
-    .map(readAttachmentEvidenceText);
+  // when a wrapper matches too.
+  return candidates.filter(
+    (node) =>
+      !candidates.some((other) => other !== node && node.contains(other)),
+  );
 }
 
-function readPdfAttachmentState(pdfFilename) {
+function readPdfAttachmentState(pdfFilename, baselineCardNodes) {
   return {
     evidence: collectVisibleComposerAttachmentEvidence(pdfFilename),
-    cards: collectComposerFileCards(),
+    newCards: collectComposerFileCardNodes()
+      .filter((node) => !baselineCardNodes.has(node))
+      .map(readAttachmentEvidenceText),
   };
 }
 
-async function waitForPdfAttachmentConfirmation({ baseline, pdfFilename }) {
+async function waitForPdfAttachmentConfirmation({
+  baselineEvidence,
+  baselineCardNodes,
+  pdfFilename,
+}) {
   return shared.confirmAttachmentAcceptedThenReady({
-    baseline,
+    baselineEvidence,
     expectedFilename: pdfFilename,
-    readState: () => readPdfAttachmentState(pdfFilename),
+    readState: () => readPdfAttachmentState(pdfFilename, baselineCardNodes),
     wait: sleep,
     acceptTimeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
     readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
@@ -1341,7 +1362,9 @@ async function waitForPdfAttachmentConfirmation({ baseline, pdfFilename }) {
 
 async function attachPDF(pdfBase64, pdfFilename) {
   const startedAt = Date.now();
-  const baseline = readPdfAttachmentState(pdfFilename);
+  const baselineEvidence =
+    collectVisibleComposerAttachmentEvidence(pdfFilename);
+  const baselineCardNodes = new Set(collectComposerFileCardNodes());
 
   // Decode base64 → Uint8Array → File
   const binary = atob(pdfBase64);
@@ -1387,7 +1410,8 @@ async function attachPDF(pdfBase64, pdfFilename) {
   let confirmation;
   try {
     confirmation = await waitForPdfAttachmentConfirmation({
-      baseline,
+      baselineEvidence,
+      baselineCardNodes,
       pdfFilename,
     });
   } catch (_) {

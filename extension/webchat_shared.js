@@ -109,7 +109,7 @@
   ) {
     const normalizedEvidence = normalizeAttachmentEvidence(evidence);
     return Boolean(
-      /\b\d+(?:\.\d+)?\s*(?:kb|mb|gb)\b/.test(normalizedEvidence) ||
+      /\b\d+(?:\.\d+)?\s*(?:b|kb|mb|gb)\b/.test(normalizedEvidence) ||
         /\b(?:parsing|uploading|processing|scanning|reading|ready)\b/.test(
           normalizedEvidence,
         ) ||
@@ -254,7 +254,8 @@
    * Wait for the site to accept the attachment, then for it to report the file
    * as ready.
    *
-   * We dropped exactly one file into a composer whose prior state we captured,
+   * We dropped exactly one file into a composer whose prior cards the caller
+   * captured, and readState reports only the cards that were not there before,
    * so the question that matters is "did a new file card appear?", not "is it
    * labelled the way we expect". Sites shorten, translate, and re-render file
    * names, and every name check is a chance to reject an upload that worked.
@@ -266,7 +267,7 @@
    * already on screen.
    */
   async function confirmAttachmentAcceptedThenReady({
-    baseline = { evidence: [], cards: [] },
+    baselineEvidence = [],
     expectedFilename = "",
     readState,
     wait,
@@ -282,10 +283,6 @@
       throw new TypeError("wait must be a function");
     }
 
-    const baselineEvidence = Array.isArray(baseline?.evidence)
-      ? baseline.evidence
-      : [];
-    const baselineCards = Array.isArray(baseline?.cards) ? baseline.cards : [];
     const boundedPollIntervalMs = Math.max(10, Number(pollIntervalMs) || 100);
     const startedAt = now();
 
@@ -293,8 +290,8 @@
       while (true) {
         const state = (await readState()) || {};
         const evidence = Array.isArray(state.evidence) ? state.evidence : [];
-        const cards = Array.isArray(state.cards) ? state.cards : [];
-        const satisfied = isSatisfied(evidence, cards);
+        const newCards = Array.isArray(state.newCards) ? state.newCards : [];
+        const satisfied = isSatisfied(evidence, newCards);
         if (satisfied) return satisfied;
         const currentTime = now();
         if (currentTime >= deadline) return null;
@@ -306,7 +303,7 @@
 
     const acceptance = await poll(
       startedAt + Math.max(0, Number(acceptTimeoutMs) || 0),
-      (evidence, cards) => {
+      (evidence, newCards) => {
         if (
           hasNewExpectedAttachmentEvidence({
             baselineEvidence,
@@ -323,9 +320,9 @@
             filenameConfirmed: true,
           };
         }
-        if (cards.length > baselineCards.length) {
+        if (newCards.length > 0) {
           return {
-            evidence: cards[cards.length - 1] || expectedFilename,
+            evidence: newCards[newCards.length - 1] || expectedFilename,
             filenameConfirmed: false,
           };
         }
@@ -341,7 +338,7 @@
 
     const readiness = await poll(
       now() + Math.max(0, Number(readyTimeoutMs) || 0),
-      (evidence, cards) => {
+      (evidence, newCards) => {
         if (acceptance.filenameConfirmed) {
           if (
             hasNewExpectedAttachmentEvidence({
@@ -362,9 +359,8 @@
         }
         // Nothing here identifies the file, so the best available signal that
         // the upload finished is that no card is still reporting progress.
-        return cards.length > baselineCards.length &&
-            cards.every(attachmentCardIsSettled)
-          ? { evidence: cards[cards.length - 1] || acceptance.evidence }
+        return newCards.length > 0 && newCards.every(attachmentCardIsSettled)
+          ? { evidence: newCards[newCards.length - 1] || acceptance.evidence }
           : null;
       },
     );
