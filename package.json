@@ -6,6 +6,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "test:webchat:relay-live": "node scripts/test-webchat-live.mjs",
     "release": "node scripts/release.mjs",
     "release:patch": "node scripts/release.mjs patch",
     "release:minor": "node scripts/release.mjs minor",

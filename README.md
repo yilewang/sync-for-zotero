@@ -92,6 +92,28 @@ This extension targets modern Chromium browsers with Manifest V3 support, includ
 
 On Windows, make sure Windows Defender Firewall or third-party security software allows Zotero to accept loopback connections from the browser. The extension discovers the LLM for Zotero webchat relay on `127.0.0.1` or `localhost`, ports `23119`-`23128`.
 
+## Relay-level WebChat delivery gate
+
+Run the opt-in live gate with Zotero, the development extension, and a signed-in ChatGPT tab open:
+
+```bash
+npm run test:webchat:relay-live
+```
+
+For targeted diagnosis, run only one branch:
+
+```bash
+npm run test:webchat:relay-live -- --pdf-only
+npm run test:webchat:relay-live -- --prompt-only
+```
+
+The first turn uploads a generated PDF whose hidden sentinel is not present in the prompt.
+The gate requires ChatGPT to return that sentinel and requires the relay receipt to identify the exact PDF in both the composer preview and submitted user turn.
+The second turn is prompt-only and requires a receipt showing that the submitted user turn contains zero PDFs.
+Any missing, ambiguous, mismatched, or unexpected attachment evidence fails the gate instead of being reported as success.
+This command begins at the relay and intentionally does not exercise Zotero's composer UI.
+For the continuous Zotero UI -> relay -> Chrome -> ChatGPT -> Zotero gate, run `npm run test:webchat:live` in the paired `llm-for-zotero` repository.
+
 ## License
 
 See [LICENSE](LICENSE) for details.

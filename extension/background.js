@@ -54,6 +54,83 @@ const shared = globalThis.SyncZoteroShared || {
   isRetrySafeContentScriptMessage: () => false,
   retryRecoverableContentScriptMessage: async ({ sendAttempt }) =>
     sendAttempt(1),
+  supportsDeliveryContract: (supportedVersions, requiredVersion) =>
+    Number.isInteger(Number(requiredVersion)) &&
+    Number(requiredVersion) > 0 &&
+    (Array.isArray(supportedVersions) ? supportedVersions : []).some(
+      (version) => Number(version) === Number(requiredVersion),
+    ),
+  contentScriptMeetsDeliveryContractRequirement: (
+    capabilityProbe,
+    requiredVersion,
+  ) => capabilityProbe?.pong === true && (
+    requiredVersion === undefined ||
+    requiredVersion === null ||
+    Number(requiredVersion) === 0 ||
+    (Number.isInteger(Number(requiredVersion)) &&
+      (Array.isArray(capabilityProbe.supportedDeliveryContracts)
+        ? capabilityProbe.supportedDeliveryContracts
+        : []).some(
+        (version) => Number(version) === Number(requiredVersion),
+      ))
+  ),
+  buildExtensionStatusReport: ({
+    chatTabAlive = false,
+    chatUrl = null,
+    targetSiteId = null,
+    capabilityProbe = null,
+    health = null,
+  } = {}) => {
+    const probeAlive = capabilityProbe?.pong === true;
+    const supportedDeliveryContracts = probeAlive
+      ? capabilityProbe.supportedDeliveryContracts
+      : health?.supportedDeliveryContracts;
+    return {
+      chatTabAlive: Boolean(chatTabAlive),
+      chatUrl: chatUrl || null,
+      siteId: health?.siteId || targetSiteId || null,
+      url: health?.url || chatUrl || null,
+      contentScriptAlive:
+        probeAlive || health?.contentScriptAlive === true,
+      mainWorldInjected: health?.mainWorldInjected === true,
+      composerFound: health?.composerFound === true,
+      sendControlState: health?.sendControlState || null,
+      uploadControlFound: health?.uploadControlFound === true,
+      networkHookActive: health?.networkHookActive === true,
+      supportedDeliveryContracts: Array.isArray(
+        supportedDeliveryContracts,
+      )
+        ? supportedDeliveryContracts
+        : [],
+      lastRequestAt: health?.lastRequestAt || null,
+      lastStreamAt: health?.lastStreamAt || null,
+      lastDiagnostic: health?.lastDiagnostic || null,
+    };
+  },
+  stopSubmittedProviderAttempt: async ({
+    submitted,
+    seq,
+    attempt,
+    sendStop,
+  }) => {
+    if (submitted !== true) {
+      return { requested: false, acknowledged: false };
+    }
+    return new Promise((resolve) => {
+      sendStop(
+        {
+          type: "STOP",
+          seq: Number(seq) || 0,
+          attempt: Number(attempt) || 0,
+        },
+        (response) =>
+          resolve({
+            requested: true,
+            acknowledged: response?.ok === true,
+          }),
+      );
+    });
+  },
   tabNeedsActivation: (tab) => tab?.active === false,
   tabNeedsLifecycleReload: (tab) => Boolean(tab?.discarded),
 };
@@ -66,6 +143,8 @@ const RELAY_POLL_INTERVAL_MS = 500;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const TAB_LOAD_TIMEOUT_MS = 120_000;
 const PIPELINE_TIMEOUT_MS = 60 * 60_000;
+const RELAY_ATTEMPT_WATCHDOG_INTERVAL_MS = 2_000;
+const RELAY_ATTEMPT_WATCHDOG_FAILURE_LIMIT = 3;
 const RELAY_HOSTS = ["127.0.0.1", "localhost"];
 const WEBCHAT_DEBUG = false;
 
@@ -186,6 +265,11 @@ async function discoverZoteroPort() {
             } else {
               console.log(`[sync-zotero] Found Zotero server at ${host}:${port}`);
             }
+            // A Zotero restart clears the relay's in-memory capability status
+            // even when it comes back on the same port. Publish a fresh status
+            // immediately instead of waiting for an MV3 timer that may have
+            // been suspended with the service worker.
+            await heartbeat();
             return;
           }
         } catch { /* try next host/port */ }
@@ -245,6 +329,7 @@ async function heartbeat() {
       try {
         let chatTabAlive = false;
         let chatUrl = null;
+        let capabilityProbe = null;
         let health = null;
         const targetConfig = getSiteConfig(activeTarget);
         const tabs = await chrome.tabs.query({ url: targetConfig.urlPattern });
@@ -256,11 +341,19 @@ async function heartbeat() {
           chatUrl = preferred?.url || null;
           if (preferred?.id !== undefined && preferred?.id !== null) {
             try {
-              health = await sendToContentScript(preferred.id, { type: "HEALTH_CHECK" });
+              // PING is synchronous and is the authoritative capability
+              // advertisement for the exact content-script instance. Rich
+              // health is best-effort and must not erase a verified contract
+              // if its asynchronous response channel closes during a SPA
+              // navigation.
+              capabilityProbe = await ensureContentScript(preferred.id);
+              health = await sendContentScriptMessageOnce(preferred.id, {
+                type: "HEALTH_CHECK",
+              });
             } catch (err) {
               health = {
                 ok: false,
-                contentScriptAlive: false,
+                contentScriptAlive: capabilityProbe?.pong === true,
                 siteId: targetConfig.siteId,
                 url: chatUrl,
                 mainWorldInjected: false,
@@ -268,6 +361,8 @@ async function heartbeat() {
                 sendControlState: null,
                 uploadControlFound: false,
                 networkHookActive: false,
+                supportedDeliveryContracts:
+                  capabilityProbe?.supportedDeliveryContracts || [],
                 lastRequestAt: null,
                 lastStreamAt: null,
                 lastDiagnostic: {
@@ -280,24 +375,17 @@ async function heartbeat() {
             }
           }
         }
+        const extensionStatus = shared.buildExtensionStatusReport({
+          chatTabAlive,
+          chatUrl,
+          targetSiteId: targetConfig.siteId,
+          capabilityProbe,
+          health,
+        });
         relayFetch(`${SERVER}/extension_status`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chatTabAlive,
-            chatUrl,
-            siteId: health?.siteId || targetConfig.siteId,
-            url: health?.url || chatUrl,
-            contentScriptAlive: health?.contentScriptAlive === true,
-            mainWorldInjected: health?.mainWorldInjected === true,
-            composerFound: health?.composerFound === true,
-            sendControlState: health?.sendControlState || null,
-            uploadControlFound: health?.uploadControlFound === true,
-            networkHookActive: health?.networkHookActive === true,
-            lastRequestAt: health?.lastRequestAt || null,
-            lastStreamAt: health?.lastStreamAt || null,
-            lastDiagnostic: health?.lastDiagnostic || null,
-          }),
+          body: JSON.stringify(extensionStatus),
         }).catch(() => {});
       } catch { /* non-critical */ }
 
@@ -340,6 +428,8 @@ let activeChatTabId  = null;   // Chat tab used for the current conversation
 let lastProcessedSeq = 0;
 let lastProcessedAttempt = 0;
 let activePort       = null;   // current port connection to content script
+let activePipelineSeq = 0;
+let activePipelineAttempt = 0;
 
 // Persist critical state to chrome.storage.session so it survives SW restarts
 function persistState() {
@@ -474,7 +564,11 @@ async function waitForChatReadyInTab(tabId, expectedChatUrl = null, timeoutMs = 
     timeoutMs,
   });
   if (!response?.ok) {
-    throw new Error(response?.error || "Chat did not become ready.");
+    const error = new Error(
+      response?.error || "Chat did not become ready.",
+    );
+    error.diagnostic = response?.diagnostic || null;
+    throw error;
   }
   return response;
 }
@@ -664,6 +758,7 @@ setInterval(() => {
 chrome.alarms.create("pollAlarm", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "pollAlarm") {
+    heartbeat();
     pollForQuery();
     pollForCommand();
   }
@@ -694,11 +789,25 @@ async function pollForStop() {
   if (!zoteroConnected) return;
   try {
     const data = await relayFetch(`${SERVER}/poll_stop`).then(r => r.json());
-    if (data.stop && activeChatTabId !== null) {
+    const stopMatchesActiveAttempt =
+      Number(data.seq || 0) === activePipelineSeq &&
+      (
+        Number(data.attempt || 0) === 0 ||
+        Number(data.attempt || 0) === activePipelineAttempt
+      );
+    if (data.stop && stopMatchesActiveAttempt && activeChatTabId !== null) {
       // Tell content script to click the stop button
-      chrome.tabs.sendMessage(activeChatTabId, { type: "STOP" }, () => {
-        void chrome.runtime.lastError;
-      });
+      chrome.tabs.sendMessage(
+        activeChatTabId,
+        {
+          type: "STOP",
+          seq: activePipelineSeq,
+          attempt: activePipelineAttempt,
+        },
+        () => {
+          void chrome.runtime.lastError;
+        },
+      );
     }
   } catch (_) {}
 }
@@ -1009,6 +1118,8 @@ async function runPipeline(query) {
   pipelineRunning  = true;
   const seq        = query.seq;
   const attempt    = query.attempt || 0;
+  activePipelineSeq = seq;
+  activePipelineAttempt = attempt;
   const startsFresh = query.force_new_chat === true;
   const isFollowup = !startsFresh;
 
@@ -1077,7 +1188,10 @@ async function runPipeline(query) {
 
     // ── Ensure content script is ready ────────────────────────────
     await ensureTabReady(tab.id);
-    await ensureContentScript(tab.id);
+    await ensureContentScript(
+      tab.id,
+      query.delivery_contract_version,
+    );
     activeChatTabId = tab.id;
 
     const readyState = await publishReadyConversationState(
@@ -1124,6 +1238,7 @@ async function runPipeline(query) {
       prompt:       query.prompt,
       images:       query.images || null,
       chatgptMode:  query.chatgpt_mode || null,
+      deliveryContractVersion: query.delivery_contract_version,
       seq,
       attempt,
     });
@@ -1204,7 +1319,9 @@ async function runPipeline(query) {
       }
     }
 
-    await submitError(seq, err.message, attempt, err.diagnostic || null);
+    if (err?.name !== "RelayAttemptEnded") {
+      await submitError(seq, err.message, attempt, err.diagnostic || null);
+    }
 
     const msg = err.message.includes("Failed to fetch")
       ? "Cannot reach local server. Is gui.py running?"
@@ -1212,6 +1329,13 @@ async function runPipeline(query) {
     broadcastStatus("error", msg);
 
   } finally {
+    if (
+      activePipelineSeq === seq &&
+      activePipelineAttempt === attempt
+    ) {
+      activePipelineSeq = 0;
+      activePipelineAttempt = 0;
+    }
     pipelineRunning = false;
   }
 }
@@ -1307,6 +1431,10 @@ function streamPipeline(tabId, payload) {
     let streamingAcked = false;
     let relayPostFailureCount = 0;
     let timeoutId = null;
+    let relayWatchdogId = null;
+    let relayWatchdogInFlight = false;
+    let relayWatchdogFailureCount = 0;
+    let terminating = false;
 
     const disconnectPort = () => {
       if (activePort === port) activePort = null;
@@ -1317,18 +1445,39 @@ function streamPipeline(tabId, payload) {
       if (resolved) return;
       resolved = true;
       if (timeoutId !== null) clearTimeout(timeoutId);
+      if (relayWatchdogId !== null) clearInterval(relayWatchdogId);
       disconnectPort();
       callback(value);
     };
 
-    const handleRelayUpdateError = (err, context, diagnostic = null) => {
+    const requestProviderStop = () =>
+      shared.stopSubmittedProviderAttempt({
+        submitted,
+        seq: payload.seq,
+        attempt: payload.attempt,
+        sendStop: (message, complete) => {
+          chrome.tabs.sendMessage(tabId, message, (response) => {
+            const sendError = chrome.runtime.lastError;
+            complete(sendError ? { ok: false } : response);
+          });
+        },
+      });
+
+    const failPipeline = async (error) => {
+      if (resolved || terminating) return;
+      terminating = true;
+      await requestProviderStop();
+      finish(reject, error);
+    };
+
+    const handleRelayUpdateError = async (err, context, diagnostic = null) => {
       const reason = err?.message || String(err);
       relayPostFailureCount += 1;
       const isContractMismatch = /(?:^|\b)(seq_mismatch|attempt_mismatch)(?:\b|$)/i.test(reason);
       if (isContractMismatch || relayPostFailureCount >= 3) {
         const error = new Error(`Relay update failed during ${context}: ${reason}`);
         error.diagnostic = diagnostic || null;
-        finish(reject, error);
+        await failPipeline(error);
         return false;
       }
       console.warn(`[sync-zotero] Relay update failed during ${context}: ${reason}`);
@@ -1336,19 +1485,58 @@ function streamPipeline(tabId, payload) {
     };
 
     const postRelayUpdate = async (context, diagnostic, fn) => {
-      if (resolved) return false;
+      if (resolved || terminating) return false;
       try {
         await fn();
         relayPostFailureCount = 0;
         return true;
       } catch (err) {
-        return handleRelayUpdateError(err, context, diagnostic);
+        return await handleRelayUpdateError(err, context, diagnostic);
       }
     };
 
     timeoutId = setTimeout(() => {
-      finish(reject, new Error("Pipeline timed out after 60 minutes"));
+      void failPipeline(new Error("Pipeline timed out after 60 minutes"));
     }, PIPELINE_TIMEOUT_MS);
+
+    const checkRelayAttempt = async () => {
+      if (resolved || terminating || relayWatchdogInFlight) return;
+      relayWatchdogInFlight = true;
+      try {
+        const state = await serverGet("/poll_response?since=0");
+        relayWatchdogFailureCount = 0;
+        const attemptState = shared.classifyRelayAttemptState(state, {
+          seq: payload.seq,
+          attempt: payload.attempt,
+        });
+        if (!attemptState.active) {
+          const error = new Error(
+            attemptState.error ||
+              `Relay ended WebChat attempt (${attemptState.reason}).`,
+          );
+          error.name = "RelayAttemptEnded";
+          await failPipeline(error);
+        }
+      } catch (err) {
+        relayWatchdogFailureCount += 1;
+        if (
+          relayWatchdogFailureCount >=
+          RELAY_ATTEMPT_WATCHDOG_FAILURE_LIMIT
+        ) {
+          await failPipeline(
+            new Error(
+              `Lost contact with the Zotero relay during the active WebChat attempt: ${err?.message || String(err)}`,
+            ),
+          );
+        }
+      } finally {
+        relayWatchdogInFlight = false;
+      }
+    };
+    relayWatchdogId = setInterval(
+      () => void checkRelayAttempt(),
+      RELAY_ATTEMPT_WATCHDOG_INTERVAL_MS,
+    );
 
     port.onMessage.addListener(async (msg) => {
       if (msg.seq !== undefined && msg.seq !== payload.seq) return;
@@ -1385,7 +1573,7 @@ function streamPipeline(tabId, payload) {
               `Relay update failed during phase:${msg.phase}: ${reason}`,
             );
             error.diagnostic = msg.diagnostic || null;
-            finish(reject, error);
+            await failPipeline(error);
           }
           return;
         }
@@ -1487,7 +1675,7 @@ function streamPipeline(tabId, payload) {
       } else if (msg.type === "error") {
         const error = new Error(formatDiagnosticError(msg.error, msg.diagnostic || null));
         error.diagnostic = msg.diagnostic || null;
-        finish(reject, error);
+        await failPipeline(error);
       }
     });
 
@@ -1495,11 +1683,10 @@ function streamPipeline(tabId, payload) {
       if (activePort === port) activePort = null;
       if (!resolved) {
         if (timeoutId !== null) clearTimeout(timeoutId);
-        resolved = true;
         const err = chrome.runtime.lastError;
         const error = new Error("Port disconnected unexpectedly" + (err ? ": " + err.message : ""));
         error.name = submitted ? "PipelineDisconnect" : "PreSubmitDisconnect";
-        reject(error);
+        void failPipeline(error);
       }
     });
 
@@ -1605,26 +1792,46 @@ async function reloadTab(tabId) {
   });
 }
 
-async function ensureContentScript(tabId) {
+async function ensureContentScript(tabId, requiredDeliveryContractVersion) {
+  const pingContentScript = () =>
+    new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
+        resolve(chrome.runtime.lastError ? null : (res || null));
+      });
+    });
+  const hasRequiredContract = (health) =>
+    shared.contentScriptMeetsDeliveryContractRequirement(
+      health,
+      requiredDeliveryContractVersion,
+    );
+  const injectMainWorld = async () => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files:  ["injected.js"],
+        world:  "MAIN",
+      });
+    } catch (_) {}
+  };
+
   // Always inject the MAIN world script (SSE interceptor).
   // It has its own __syncZoteroFetchPatched guard to avoid double-patching,
   // but after full page reloads the guard resets and re-injection is needed.
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files:  ["injected.js"],
-      world:  "MAIN",
-    });
-  } catch (_) {}
+  await injectMainWorld();
 
   // Try pinging the content script
-  const alive = await new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
-      resolve(!chrome.runtime.lastError && res?.pong === true);
-    });
-  });
+  let health = await pingContentScript();
 
-  if (alive) return;
+  if (hasRequiredContract(health)) return health;
+  if (health?.pong === true) {
+    // A responsive but incompatible script can otherwise perform the
+    // irreversible click during an extension hot-upgrade race.
+    await reloadTab(tabId);
+    await waitForTabLoad(tabId, CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS);
+    await injectMainWorld();
+    health = await pingContentScript();
+    if (hasRequiredContract(health)) return health;
+  }
 
   // Content script not responsive — inject the shared helpers and listener in
   // manifest order. This also repairs tabs whose old extension context became
@@ -1636,19 +1843,19 @@ async function ensureContentScript(tabId) {
 
   // Poll briefly instead of always paying a fixed 1s delay after injection.
   for (let attempt = 0; attempt < 10; attempt++) {
-    const ready = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
-        resolve(!chrome.runtime.lastError && res?.pong === true);
-      });
-    });
-    if (ready) return;
+    health = await pingContentScript();
+    if (hasRequiredContract(health)) return health;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   const error = new Error(
-    "Content script did not respond after reinjection.",
+    `Content script did not advertise WebChat delivery contract ${String(
+      requiredDeliveryContractVersion,
+    )} after recovery.`,
   );
-  error.code = "content_script_unresponsive";
+  error.code = Number(requiredDeliveryContractVersion) > 0
+    ? "delivery_contract_unsupported"
+    : "content_script_unresponsive";
   throw error;
 }
 

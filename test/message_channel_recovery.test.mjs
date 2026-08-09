@@ -51,6 +51,257 @@ test("does not misclassify ordinary readiness or network failures", () => {
   }
 });
 
+test("tracks an active relay attempt and rejects terminal or superseded leases", () => {
+  assert.deepEqual(
+    shared.classifyRelayAttemptState(
+      {
+        status: "running",
+        current_seq: 17,
+        current_attempt: 3,
+        responses: [],
+      },
+      { seq: 17, attempt: 3 },
+    ),
+    {
+      active: true,
+      reason: null,
+      error: null,
+      completionReason: null,
+    },
+  );
+
+  assert.deepEqual(
+    shared.classifyRelayAttemptState(
+      {
+        status: "error",
+        current_seq: 17,
+        current_attempt: 3,
+        responses: [
+          {
+            seq: 17,
+            attempt: 3,
+            error: "provider timed out",
+            completion_reason: "timeout",
+          },
+        ],
+      },
+      { seq: 17, attempt: 3 },
+    ),
+    {
+      active: false,
+      reason: "terminal_response",
+      error: "provider timed out",
+      completionReason: "timeout",
+    },
+  );
+
+  assert.equal(
+    shared.classifyRelayAttemptState(
+      {
+        status: "running",
+        current_seq: 18,
+        current_attempt: 1,
+        responses: [],
+      },
+      { seq: 17, attempt: 3 },
+    ).reason,
+    "seq_mismatch",
+  );
+  assert.equal(
+    shared.classifyRelayAttemptState(
+      {
+        status: "running",
+        current_seq: 17,
+        current_attempt: 4,
+        responses: [],
+      },
+      { seq: 17, attempt: 3 },
+    ).reason,
+    "attempt_mismatch",
+  );
+});
+
+test("requires terminal evidence before DeepSeek quiescence can finish a turn", () => {
+  const candidate = {
+    siteId: "deepseek",
+    activeRun: false,
+    stopControlVisible: false,
+    busyComposer: false,
+    hasRequestContext: true,
+    hasAssistantTurn: true,
+    attachmentContractVerified: true,
+    quietSinceMs: 20_000,
+    quietThresholdMs: 1_500,
+    completionPhase: "candidate_done",
+  };
+
+  assert.equal(
+    shared.canUseDeepSeekQuiescentCompletion({
+      ...candidate,
+      terminalEvidence: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shared.canUseDeepSeekQuiescentCompletion({
+      ...candidate,
+      terminalEvidence: true,
+    }),
+    true,
+  );
+});
+
+test("stops the exact submitted attempt before a local pipeline abort", async () => {
+  const messages = [];
+  const stopped = await shared.stopSubmittedProviderAttempt({
+    submitted: true,
+    seq: 41,
+    attempt: 3,
+    sendStop: (message, complete) => {
+      messages.push(message);
+      complete({ ok: true });
+    },
+  });
+
+  assert.deepEqual(messages, [{ type: "STOP", seq: 41, attempt: 3 }]);
+  assert.deepEqual(stopped, { requested: true, acknowledged: true });
+
+  let preSubmitStopCount = 0;
+  const skipped = await shared.stopSubmittedProviderAttempt({
+    submitted: false,
+    seq: 42,
+    attempt: 1,
+    sendStop: () => {
+      preSubmitStopCount += 1;
+    },
+  });
+  assert.equal(preSubmitStopCount, 0);
+  assert.deepEqual(skipped, { requested: false, acknowledged: false });
+});
+
+test("stops the matching provider attempt after a submitted port disconnect", async () => {
+  const attemptToken = shared.attemptToken(41, 3);
+  let currentAttemptToken = attemptToken;
+  let nowMs = 0;
+  let stopControlVisible = false;
+  let clickCount = 0;
+
+  const stopped = await shared.stopDisconnectedProviderAttempt({
+    attemptToken,
+    isAttemptCurrent: (token) => currentAttemptToken === token,
+    findStopControl: () => stopControlVisible ? { attemptToken } : null,
+    clickStopControl: (control) => {
+      assert.equal(control.attemptToken, attemptToken);
+      clickCount += 1;
+      currentAttemptToken = null;
+    },
+    wait: async (ms) => {
+      nowMs += ms;
+      stopControlVisible = nowMs >= 200;
+    },
+    now: () => nowMs,
+    timeoutMs: 1000,
+    pollIntervalMs: 100,
+  });
+
+  assert.deepEqual(stopped, {
+    requested: true,
+    acknowledged: true,
+    attempts: 3,
+  });
+  assert.equal(clickCount, 1);
+
+  const disconnectStart = contentScriptSource.indexOf(
+    "port.onDisconnect.addListener(() => {",
+    contentScriptSource.indexOf('port.name !== "sync-zotero"'),
+  );
+  const disconnectEnd = contentScriptSource.indexOf(
+    "port.onMessage.addListener(async (msg) => {",
+    disconnectStart,
+  );
+  const disconnectSource = contentScriptSource.slice(
+    disconnectStart,
+    disconnectEnd,
+  );
+  assert.match(
+    disconnectSource,
+    /portProviderMayBeRunning && !portTerminalPosted/,
+  );
+  assert.match(
+    disconnectSource,
+    /stopDisconnectedSyncZoteroAttempt\(portAttemptToken\)/,
+  );
+
+  const terminalEmitterStart = contentScriptSource.indexOf(
+    "const emitTerminal = (payload) => {",
+  );
+  const terminalEmitterEnd = contentScriptSource.indexOf(
+    "};",
+    terminalEmitterStart,
+  );
+  const terminalEmitterSource = contentScriptSource.slice(
+    terminalEmitterStart,
+    terminalEmitterEnd,
+  );
+  assert.ok(
+    terminalEmitterSource.indexOf("onTerminalPosted()") <
+      terminalEmitterSource.indexOf("postTerminal(port, payload)"),
+  );
+});
+
+test("does not stop a superseding provider attempt", async () => {
+  const disconnectedToken = shared.attemptToken(41, 3);
+  const supersedingToken = shared.attemptToken(42, 1);
+  const currentAttemptToken = supersedingToken;
+  let nowMs = 0;
+  let clickCount = 0;
+
+  const staleStop = await shared.stopDisconnectedProviderAttempt({
+    attemptToken: disconnectedToken,
+    isAttemptCurrent: (token) => currentAttemptToken === token,
+    findStopControl: () => ({ attemptToken: currentAttemptToken }),
+    clickStopControl: () => {
+      clickCount += 1;
+    },
+    wait: async (ms) => {
+      nowMs += ms;
+    },
+    now: () => nowMs,
+    timeoutMs: 1000,
+  });
+  assert.deepEqual(staleStop, {
+    requested: true,
+    acknowledged: false,
+    attempts: 0,
+  });
+  assert.equal(clickCount, 0);
+});
+
+test("bounds disconnected-attempt stop polling", async () => {
+  const attemptToken = shared.attemptToken(43, 1);
+  let nowMs = 0;
+
+  const stopped = await shared.stopDisconnectedProviderAttempt({
+    attemptToken,
+    isAttemptCurrent: (token) => token === attemptToken,
+    findStopControl: () => null,
+    clickStopControl: () => assert.fail("no stop control should be clicked"),
+    wait: async (ms) => {
+      nowMs += ms;
+    },
+    now: () => nowMs,
+    timeoutMs: 250,
+    pollIntervalMs: 100,
+  });
+
+  assert.equal(nowMs, 250);
+  assert.deepEqual(stopped, {
+    requested: true,
+    acknowledged: false,
+    attempts: 4,
+  });
+});
+
 test("treats a closed tab as terminal for that tab identity", () => {
   assert.deepEqual(
     shared.classifyContentScriptMessageError(
@@ -163,7 +414,7 @@ test("orders the durable submit handshake before the send side effect", () => {
     'phase: "submit_started"',
   );
   const sendSideEffectIndex = pipelineSource.indexOf(
-    "const submission = await submitMessageAndVerify(msg.prompt)",
+    "const submission = await submitMessageAndVerify(",
   );
 
   assert.ok(pipelineStart >= 0);
@@ -410,6 +661,105 @@ test("uses a short verification window only for combined terminal signals", () =
   );
 });
 
+test("requires ChatGPT's rendered terminal controls before declaring success", () => {
+  const base = {
+    siteId: "chatgpt",
+    activeConversationStreamCount: 0,
+    stopButtonVisible: false,
+    busyComposer: false,
+  };
+
+  assert.equal(
+    shared.hasVerifiedTerminalEvidence({
+      ...base,
+      sseDone: true,
+      actionBarVisible: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shared.hasVerifiedTerminalEvidence({
+      ...base,
+      sseDone: true,
+      actionBarVisible: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shared.hasVerifiedTerminalEvidence({
+      ...base,
+      sseDone: true,
+      actionBarVisible: true,
+      stopButtonVisible: true,
+    }),
+    false,
+  );
+});
+
+test("keeps a stable answer prefix active without terminal UI evidence", () => {
+  const tracker = shared.createTurnCompletionTracker(0);
+  const result = shared.advanceTurnCompletionTracker(tracker, {
+    nowMs: 60_000,
+    answerVisible: true,
+    activeRun: false,
+    answerRevision: 1,
+    transcriptRevision: 1,
+    hasUserTurn: true,
+    hasAssistantTurn: true,
+    terminalEvidence: false,
+    quietWindowMs: 500,
+    reboundWindowMs: 250,
+  });
+
+  assert.equal(result.phase, "active");
+  assert.equal(result.runState, "active");
+  assert.equal(result.emitDone, false);
+});
+
+test("only settles a stable answer after terminal UI evidence", () => {
+  let tracker = shared.createTurnCompletionTracker(0);
+  tracker = shared.advanceTurnCompletionTracker(tracker, {
+    nowMs: 1_000,
+    answerVisible: true,
+    activeRun: false,
+    answerRevision: 1,
+    transcriptRevision: 1,
+    hasUserTurn: true,
+    hasAssistantTurn: true,
+    terminalEvidence: true,
+    quietWindowMs: 500,
+    reboundWindowMs: 250,
+  }).tracker;
+  tracker = shared.advanceTurnCompletionTracker(tracker, {
+    nowMs: 1_600,
+    answerVisible: true,
+    activeRun: false,
+    answerRevision: 1,
+    transcriptRevision: 1,
+    hasUserTurn: true,
+    hasAssistantTurn: true,
+    terminalEvidence: true,
+    quietWindowMs: 500,
+    reboundWindowMs: 250,
+  }).tracker;
+  const result = shared.advanceTurnCompletionTracker(tracker, {
+    nowMs: 1_900,
+    answerVisible: true,
+    activeRun: false,
+    answerRevision: 1,
+    transcriptRevision: 1,
+    hasUserTurn: true,
+    hasAssistantTurn: true,
+    terminalEvidence: true,
+    quietWindowMs: 500,
+    reboundWindowMs: 250,
+  });
+
+  assert.equal(result.phase, "verified_done");
+  assert.equal(result.runState, "done");
+  assert.equal(result.emitDone, true);
+});
+
 test("rejects a growing answer prefix as a stable terminal snapshot", () => {
   assert.equal(
     shared.terminalAnswerSnapshotIsStable(
@@ -436,5 +786,93 @@ test("rejects a growing answer prefix as a stable terminal snapshot", () => {
       },
     ),
     true,
+  );
+});
+
+test("never auto-cancels a quiet active provider response", () => {
+  const streamStart = contentScriptSource.indexOf(
+    "async function streamResponseSnapshots(",
+  );
+  const streamEnd = contentScriptSource.indexOf(
+    "// ---------------------------------------------------------------------------\n// Step 5:",
+    streamStart,
+  );
+  const streamSource = contentScriptSource.slice(streamStart, streamEnd);
+
+  assert.ok(streamStart >= 0);
+  assert.ok(streamEnd > streamStart);
+  assert.doesNotMatch(streamSource, /stopBtn\?\.click\?\.\(\)/);
+  assert.doesNotMatch(streamSource, /forced_cancel_attempt/);
+  assert.match(
+    streamSource,
+    /never click Stop from\s*\/\/ an inactivity heuristic/,
+  );
+});
+
+test("ends stale content work when the relay attempt or port ends", () => {
+  assert.match(
+    backgroundSource,
+    /classifyRelayAttemptState\(state, \{[\s\S]*seq: payload\.seq,[\s\S]*attempt: payload\.attempt/,
+  );
+  assert.match(
+    backgroundSource,
+    /error\.name = "RelayAttemptEnded";[\s\S]*await failPipeline\(error\)/,
+  );
+  assert.match(
+    backgroundSource,
+    /relayWatchdogFailureCount >=[\s\S]*await failPipeline/,
+  );
+  assert.match(
+    backgroundSource,
+    /relayPostFailureCount >= 3[\s\S]*await failPipeline/,
+  );
+  assert.match(
+    contentScriptSource,
+    /const isPipelineCurrent = \(\) =>[\s\S]*_syncZoteroAttemptToken === portAttemptToken/,
+  );
+  assert.match(
+    contentScriptSource,
+    /while \(Date\.now\(\) < deadline\) \{\s*assertPipelineCurrent\(isPipelineCurrent\)/,
+  );
+  assert.match(
+    contentScriptSource,
+    /if \(err\?\.name === "PipelineCancelled"\) return;/,
+  );
+});
+
+test("extracts only visible turns and preserves live answer content", () => {
+  const assistantNodesStart = contentScriptSource.indexOf(
+    "function getAssistantMessageNodes()",
+  );
+  const assistantNodesEnd = contentScriptSource.indexOf(
+    "function getUserMessageCount()",
+    assistantNodesStart,
+  );
+  const transcriptNodesStart = contentScriptSource.indexOf(
+    "function getConversationMessageNodes()",
+  );
+  const transcriptNodesEnd = contentScriptSource.indexOf(
+    "function buildTranscriptMessageKey(",
+    transcriptNodesStart,
+  );
+  const pruneStart = contentScriptSource.indexOf(
+    "function pruneAssistantStatusNodes(",
+  );
+  const pruneEnd = contentScriptSource.indexOf(
+    "function extractAssistantThinkingText(",
+    pruneStart,
+  );
+
+  assert.match(
+    contentScriptSource.slice(assistantNodesStart, assistantNodesEnd),
+    /!isVisibleElement\(node\)/,
+  );
+  assert.match(
+    contentScriptSource.slice(transcriptNodesStart, transcriptNodesEnd),
+    /!isVisibleElement\(node\)/,
+  );
+  assert.doesNotMatch(
+    contentScriptSource.slice(pruneStart, pruneEnd),
+    /\[aria-live\]/,
   );
 });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const require = createRequire(import.meta.url);
@@ -72,6 +73,18 @@ test("does not mistake prompt prose mentioning a PDF for a file card", () => {
   );
 });
 
+test("detects a generic PDF composer card without exposing its filename", () => {
+  assert.equal(shared.hasPendingPdfEvidence(["PDF 1.95MB"]), true);
+  assert.equal(
+    shared.hasPendingPdfEvidence(["Remove file PDF"], true),
+    true,
+  );
+  assert.equal(
+    shared.hasPendingPdfEvidence(["Please compare the PDF methods"], false),
+    false,
+  );
+});
+
 test("does not accept unrelated or partial filename evidence", () => {
   assert.equal(
     shared.attachmentEvidenceMatchesFilename("Other paper.pdf", filename),
@@ -83,6 +96,38 @@ test("does not accept unrelated or partial filename evidence", () => {
       filename,
     ),
     false,
+  );
+});
+
+test("does not read failure words from an elided filename as upload status", () => {
+  const statusWordFilename =
+    "Error correction methods for reliable scientific inference and robust systems.pdf";
+  const readyEvidence = "Error correction methods… PDF 1.95MB";
+
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(
+      readyEvidence,
+      statusWordFilename,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.attachmentEvidenceHasFailure(
+      readyEvidence,
+      statusWordFilename,
+    ),
+    false,
+  );
+  assert.equal(
+    shared.attachmentEvidenceIsReady(readyEvidence, statusWordFilename),
+    true,
+  );
+  assert.equal(
+    shared.attachmentEvidenceHasFailure(
+      "Error correction methods… Upload failed",
+      statusWordFilename,
+    ),
+    true,
   );
 });
 
@@ -141,6 +186,37 @@ test("does not treat an elided filename as ready while it is parsing", () => {
       filename,
     ),
     false,
+  );
+});
+
+test("does not mistake status words inside an exact filename for upload state", () => {
+  for (const statusFilename of [
+    "Error correction methods.pdf",
+    "Unsupported claims in prior work.pdf",
+    "Parsing algorithms for documents.pdf",
+    "File too large effects in microscopy.pdf",
+  ]) {
+    assert.equal(
+      shared.attachmentEvidenceHasFailure(statusFilename, statusFilename),
+      false,
+      statusFilename,
+    );
+    assert.equal(
+      shared.attachmentEvidenceIsReady(
+        `${statusFilename}\nPDF 1.95MB`,
+        statusFilename,
+      ),
+      true,
+      statusFilename,
+    );
+  }
+  const failureFilename = "Error correction methods.pdf";
+  assert.equal(
+    shared.attachmentEvidenceHasFailure(
+      `${failureFilename}\nUpload failed`,
+      failureFilename,
+    ),
+    true,
   );
 });
 
@@ -304,35 +380,80 @@ test("confirms an attachment the website marks ready", async () => {
   assert.equal(result.evidence, card);
 });
 
-test("keeps an accepted attachment that never reports ready", async () => {
+test("fails closed when an accepted attachment never reports ready", async () => {
   const card = `${filename}\nParsing...`;
-  const result = await confirmWithFakeClock({
-    evidence: [card],
-    newCards: [card],
-  });
-
-  assert.equal(result.readyConfirmed, false);
-  assert.equal(result.filenameConfirmed, true);
-  assert.equal(result.evidence, card);
+  await assert.rejects(
+    confirmWithFakeClock({
+      evidence: [card],
+      newCards: [card],
+    }),
+    /did not confirm that .* was ready/,
+  );
 });
 
-test("accepts a new file card the expected filename cannot be read from", async () => {
+test("rejects a new card when the requested filename cannot be identified", async () => {
   const card = "Aerie — mission planning\nPDF";
-  const result = await confirmWithFakeClock({ evidence: [], newCards: [card] });
-
-  assert.equal(result.filenameConfirmed, false);
-  assert.equal(result.readyConfirmed, true);
-  assert.equal(result.evidence, card);
+  await assert.rejects(
+    confirmWithFakeClock({ evidence: [], newCards: [card] }),
+    /did not confirm attachment/,
+  );
 });
 
-test("waits for an unreadable file card to stop uploading", async () => {
-  const result = await confirmWithFakeClock({
-    evidence: [],
-    newCards: ["Aerie — mission planning\nUploading…"],
+test("does not accept an unreadable card after it stops uploading", async () => {
+  let reads = 0;
+  await assert.rejects(
+    confirmWithFakeClock(() => {
+      reads += 1;
+      return {
+        evidence: [],
+        newCards: [
+          reads < 3
+            ? "Aerie — mission planning\nUploading…"
+            : "Aerie — mission planning\nPDF",
+        ],
+      };
+    }),
+    /did not confirm attachment/,
+  );
+});
+
+test("requires ready evidence to remain stable for the quiet window", async () => {
+  let nowMs = 0;
+  let reads = 0;
+  const card = `${filename}\nReady`;
+  const result = await shared.confirmAttachmentAcceptedThenReady({
+    baselineEvidence: [],
+    expectedFilename: filename,
+    readState: () => {
+      reads += 1;
+      if (reads === 3) {
+        return { evidence: [`${filename}\nUploading…`], newCards: [] };
+      }
+      return { evidence: [card], newCards: [] };
+    },
+    wait: async (ms) => {
+      nowMs += ms;
+    },
+    now: () => nowMs,
+    acceptTimeoutMs: 1000,
+    readyTimeoutMs: 2000,
+    readyQuietWindowMs: 300,
+    pollIntervalMs: 100,
   });
 
-  assert.equal(result.filenameConfirmed, false);
-  assert.equal(result.readyConfirmed, false);
+  assert.equal(result.readyConfirmed, true);
+  assert.ok(reads >= 6);
+  assert.ok(result.elapsedMs >= 400);
+});
+
+test("fails immediately when the website reports an upload error", async () => {
+  await assert.rejects(
+    confirmWithFakeClock({
+      evidence: [`${filename}\nUpload failed`],
+      newCards: [],
+    }),
+    /reported that .* failed to upload/,
+  );
 });
 
 test("fails when no new file card appears at all", async () => {
@@ -361,6 +482,261 @@ test("treats a byte-sized file card as a real attachment card", () => {
   assert.equal(
     shared.attachmentEvidenceHasFileCardSignal(`${filename}\nPDF 607B`, false),
     true,
+  );
+});
+
+test("verifies the exact submitted PDF contract", () => {
+  assert.deepEqual(
+    shared.classifySubmittedPdfContract(
+      ["image", `${filename}\nPDF 1.95MB`],
+      filename,
+    ),
+    {
+      attachmentRequested: true,
+      attachmentCount: 2,
+      pdfAttachmentCount: 1,
+      filenameMatched: true,
+      contractVerified: true,
+    },
+  );
+});
+
+test("rejects an unrelated submitted PDF even though a file is present", () => {
+  assert.deepEqual(
+    shared.classifySubmittedPdfContract(["Other paper.pdf"], filename),
+    {
+      attachmentRequested: true,
+      attachmentCount: 1,
+      pdfAttachmentCount: 1,
+      filenameMatched: false,
+      contractVerified: false,
+    },
+  );
+});
+
+test("rejects an extra PDF beside the exact requested PDF", () => {
+  const contract = shared.classifySubmittedPdfContract(
+    [`${filename}\nPDF 1.95MB`, "Other paper.pdf\nPDF 2MB"],
+    filename,
+  );
+
+  assert.equal(contract.filenameMatched, true);
+  assert.equal(contract.pdfAttachmentCount, 2);
+  assert.equal(contract.contractVerified, false);
+});
+
+test("rejects duplicate cards for the requested PDF", () => {
+  const contract = shared.classifySubmittedPdfContract(
+    [`${filename}\nPDF 1.95MB`, `${filename}\nPDF 1.95MB`],
+    filename,
+  );
+
+  assert.equal(contract.pdfAttachmentCount, 2);
+  assert.equal(contract.contractVerified, false);
+});
+
+test("verifies prompt-only turns only when no PDF is present", () => {
+  assert.equal(
+    shared.classifySubmittedPdfContract(["image"], "").contractVerified,
+    true,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["Unexpected.pdf"], "")
+      .contractVerified,
+    false,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["PDF 1.95MB"], "")
+      .contractVerified,
+    false,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["Unidentified document 1.95MB"], "")
+      .contractVerified,
+    false,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["image"], "").contractVerified,
+    true,
+  );
+});
+
+test("preflights a clean composer for both PDF and prompt-only sends", () => {
+  const contentScript = readFileSync(
+    new URL("../extension/content_script.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    contentScript,
+    /const pendingPdfEvidence = collectVisibleComposerPdfCardEvidence\(\);\s*if \(pendingPdfEvidence\.length > 0\)/,
+  );
+  assert.match(
+    contentScript,
+    /This preflight must remain inside the composer ancestry/,
+  );
+  assert.doesNotMatch(
+    contentScript,
+    /if \(!msg\.pdfBase64\) \{\s*const pendingPdfEvidence/,
+  );
+});
+
+test("advertises the strict delivery contract from the active content script", () => {
+  const contentScript = readFileSync(
+    new URL("../extension/content_script.js", import.meta.url),
+    "utf8",
+  );
+  const background = readFileSync(
+    new URL("../extension/background.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    contentScript,
+    /supportedDeliveryContracts:\s*\[\.\.\.SUPPORTED_DELIVERY_CONTRACTS\]/,
+  );
+  assert.equal(shared.supportsDeliveryContract([1], 1), true);
+  assert.equal(shared.supportsDeliveryContract([], 1), false);
+  assert.equal(shared.supportsDeliveryContract([0], 1), false);
+  assert.equal(
+    shared.contentScriptMeetsDeliveryContractRequirement(
+      { pong: true, supportedDeliveryContracts: [1] },
+      undefined,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.contentScriptMeetsDeliveryContractRequirement(
+      { pong: true, supportedDeliveryContracts: [] },
+      1,
+    ),
+    false,
+  );
+  assert.equal(
+    shared.contentScriptMeetsDeliveryContractRequirement(
+      { pong: true, supportedDeliveryContracts: [1] },
+      1,
+    ),
+    true,
+  );
+  assert.match(
+    background,
+    /supportedDeliveryContracts:\s*Array\.isArray/,
+  );
+  assert.match(
+    background,
+    /deliveryContractVersion:\s*query\.delivery_contract_version/,
+  );
+  assert.match(
+    background,
+    /error\.diagnostic = response\?\.diagnostic \|\| null/,
+  );
+  const startHandler = contentScript.slice(
+    contentScript.indexOf('if (msg.type !== "START") return;'),
+    contentScript.indexOf(
+      "const baselineTranscript",
+      contentScript.indexOf('if (msg.type !== "START") return;'),
+    ),
+  );
+  assert.match(startHandler, /supportsDeliveryContract/);
+});
+
+test("keeps a synchronous contract probe authoritative when rich health fails", () => {
+  const report = shared.buildExtensionStatusReport({
+    chatTabAlive: true,
+    chatUrl: "https://chatgpt.com/c/example",
+    targetSiteId: "chatgpt",
+    capabilityProbe: {
+      pong: true,
+      supportedDeliveryContracts: [1],
+    },
+    health: {
+      contentScriptAlive: true,
+      supportedDeliveryContracts: [],
+      lastDiagnostic: {
+        reasonCode: "health_check_failed",
+      },
+    },
+  });
+
+  assert.equal(report.chatTabAlive, true);
+  assert.equal(report.contentScriptAlive, true);
+  assert.deepEqual(report.supportedDeliveryContracts, [1]);
+  assert.equal(report.lastDiagnostic.reasonCode, "health_check_failed");
+});
+
+test("classifies visible pre-submit chat blockers without false positives", () => {
+  const rateLimited = shared.classifyChatReadinessBlocker({
+    siteId: "chatgpt",
+    composerReady: false,
+    visibleText:
+      "Too many requests. You are making requests too quickly. We have temporarily limited access.",
+  });
+  assert.equal(rateLimited.reasonCode, "site_rate_limited");
+  assert.match(rateLimited.message, /no prompt or PDF was sent/i);
+
+  const mountedComposerBlocker = shared.classifyChatReadinessBlocker({
+    siteId: "chatgpt",
+    composerReady: true,
+    visibleText:
+      "Too many requests. You are making requests too quickly. We have temporarily limited access.",
+  });
+  assert.equal(mountedComposerBlocker.reasonCode, "site_rate_limited");
+
+  assert.equal(shared.classifyChatReadinessBlocker({
+    siteId: "chatgpt",
+    visibleText: "Uploading papers can sometimes be rate limited.",
+  }), null);
+
+  assert.equal(
+    shared.classifyChatReadinessBlocker({
+      composerReady: false,
+      visibleText: "Log in Sign up",
+    }).reasonCode,
+    "authentication_required",
+  );
+});
+
+test("requires a usable composer before declaring a chat ready", () => {
+  assert.equal(shared.hasUsableChatReadinessSignals({
+    urlMatches: true,
+    composerReady: false,
+    activeRun: false,
+    domSettled: true,
+    bodyReady: true,
+    mainReady: true,
+  }), false);
+
+  assert.equal(shared.hasUsableChatReadinessSignals({
+    urlMatches: true,
+    composerReady: true,
+    activeRun: false,
+    domSettled: true,
+    bodyReady: true,
+    mainReady: true,
+  }), true);
+});
+
+test("reports the exact readiness condition that prevented submission", () => {
+  assert.equal(
+    shared.classifyChatReadinessTimeout({
+      urlMatches: false,
+      composerReady: false,
+    }).reasonCode,
+    "conversation_url_mismatch",
+  );
+  assert.equal(
+    shared.classifyChatReadinessTimeout({
+      urlMatches: true,
+      composerReady: false,
+    }).reasonCode,
+    "composer_not_ready",
+  );
+  assert.equal(
+    shared.classifyChatReadinessTimeout({
+      urlMatches: true,
+      composerReady: true,
+      activeRun: true,
+    }).reasonCode,
+    "prior_turn_still_running",
   );
 });
 

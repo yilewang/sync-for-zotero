@@ -18,11 +18,33 @@
 // Utility helpers
 // ---------------------------------------------------------------------------
 
+const SUPPORTED_DELIVERY_CONTRACTS = Object.freeze([1]);
+
 const shared = globalThis.SyncZoteroShared || {
   TURN_COMPLETION_QUIET_WINDOW_MS: 7000,
   TURN_COMPLETION_REBOUND_WINDOW_MS: 1500,
   attemptToken: (seq, attempt) => `${Number(seq) || 0}:${Number(attempt) || 0}`,
   composerTextMatchesPrompt: (promptText, composerText) => String(promptText || "").trim() === String(composerText || "").trim(),
+  composerBridgeAllowsSynchronousFallback: (result) => Boolean(
+    result?.handled === true &&
+      result?.applied !== true &&
+      result?.pasteAccepted !== true,
+  ),
+  composerBridgeWriteTransition: (result) => {
+    const allowSynchronousFallback = Boolean(
+      result?.handled === true &&
+        result?.applied !== true &&
+        result?.pasteAccepted !== true,
+    );
+    return {
+      allowSynchronousFallback,
+      pendingBridgeCommit: !allowSynchronousFallback,
+    };
+  },
+  composerPromptVerificationPolicy: (pendingBridgeCommit) => ({
+    matchTimeoutMs: pendingBridgeCommit === true ? 10000 : 300,
+    allowRetry: pendingBridgeCommit !== true,
+  }),
   createTurnCompletionTracker: (nowMs) => {
     const ts = Number.isFinite(nowMs) ? Number(nowMs) : 0;
     return {
@@ -79,6 +101,7 @@ const shared = globalThis.SyncZoteroShared || {
     const activeRun = sample?.activeRun === true;
     const hasUserTurn = sample?.hasUserTurn === true;
     const hasAssistantTurn = sample?.hasAssistantTurn === true;
+    const terminalEvidence = sample?.terminalEvidence === true;
     const forceIncomplete = sample?.forceIncomplete === true;
 
     if (answerRevision !== tracker.lastAnswerRevision) {
@@ -111,7 +134,7 @@ const shared = globalThis.SyncZoteroShared || {
       tracker.phase = "incomplete";
       tracker.candidateSince = null;
       tracker.verificationStartedAt = null;
-    } else if (answerVisible && !activeRun) {
+    } else if (answerVisible && !activeRun && terminalEvidence) {
       tracker.phase = "candidate_done";
       if (previousPhase !== "candidate_done") {
         tracker.candidateSince = nowMs;
@@ -237,6 +260,19 @@ const shared = globalThis.SyncZoteroShared || {
     signals.actionBarVisible === true &&
     signals.stopButtonVisible !== true &&
     signals.busyComposer !== true,
+  hasVerifiedTerminalEvidence: (signals = {}) => {
+    if (
+      Number(signals.activeConversationStreamCount || 0) > 0 ||
+      signals.stopButtonVisible === true ||
+      signals.busyComposer === true
+    ) {
+      return false;
+    }
+    if (String(signals.siteId || "").toLowerCase() === "chatgpt") {
+      return signals.actionBarVisible === true;
+    }
+    return signals.actionBarVisible === true || signals.sseDone === true;
+  },
   isPlaceholderAssistantText: (text) => {
     const normalized = String(text || "").trim().toLowerCase();
     return !normalized || normalized === "thinking" || normalized === "quick answer";
@@ -303,11 +339,51 @@ const shared = globalThis.SyncZoteroShared || {
       "i",
     ).test(normalizedEvidence);
   },
+  attachmentStatusEvidence: (evidence, expectedFilename = "") => {
+    const normalize = (value) =>
+      String(value || "")
+        .normalize("NFC")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    let normalizedEvidence = normalize(evidence);
+    const normalizedFilename = normalize(expectedFilename);
+    if (!normalizedFilename) return normalizedEvidence;
+    normalizedEvidence = normalizedEvidence
+      .split(normalizedFilename)
+      .join(" ");
+    const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
+    if (pdfMatch) {
+      const escapeRegExp = (value) =>
+        value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      normalizedEvidence = normalizedEvidence.replace(
+        new RegExp(
+          `${escapeRegExp(pdfMatch[1])}\\s*\\(\\d+\\)${escapeRegExp(pdfMatch[2])}(?:\\b|$)`,
+          "gi",
+        ),
+        " ",
+      );
+    }
+    return normalizedEvidence.replace(/\s+/g, " ").trim();
+  },
+  attachmentEvidenceHasFailure: (evidence, expectedFilename = "") =>
+    (!expectedFilename ||
+      shared.attachmentEvidenceMatchesFilename(evidence, expectedFilename)) &&
+    (/\b(?:upload\s+failed|failed\s+to\s+upload|could\s+not\s+upload|couldn't\s+upload|unsupported|file\s+too\s+large|error)\b/i.test(
+      shared.attachmentStatusEvidence(evidence, expectedFilename),
+    ) ||
+      /(?:上传失败|无法上传|不支持|文件过大|错误)/.test(
+        shared.attachmentStatusEvidence(evidence, expectedFilename),
+      )),
   attachmentEvidenceIsReady: (evidence, expectedFilename) =>
     shared.attachmentEvidenceMatchesFilename(evidence, expectedFilename) &&
     !/\b(?:parsing|uploading|processing|scanning|reading)\b/i.test(
-      String(evidence || ""),
-    ),
+      shared.attachmentStatusEvidence(evidence, expectedFilename),
+    ) &&
+    !/(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
+      shared.attachmentStatusEvidence(evidence, expectedFilename),
+    ) &&
+    !shared.attachmentEvidenceHasFailure(evidence, expectedFilename),
   attachmentEvidenceHasFileCardSignal: (
     evidence,
     hasExplicitFileControl = false,
@@ -317,10 +393,169 @@ const shared = globalThis.SyncZoteroShared || {
       String(evidence || ""),
     ) ||
     (hasExplicitFileControl && /\bPDF\b/i.test(String(evidence || ""))),
-  hasPendingPdfEvidence: (evidenceList) =>
-    (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) =>
-      /\.pdf(?:\b|$)/i.test(String(evidence || "")),
+  hasPendingPdfEvidence: (
+    evidenceList,
+    hasExplicitFileControl = false,
+  ) =>
+    (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) => {
+      const text = String(evidence || "");
+      return (
+        /\.pdf(?:\b|$)/i.test(text) ||
+        (/\bpdf\b/i.test(text) &&
+          shared.attachmentEvidenceHasFileCardSignal(
+            text,
+            hasExplicitFileControl,
+          ))
+      );
+    }),
+  supportsDeliveryContract: (supportedVersions, requiredVersion) =>
+    Number(requiredVersion) > 0 &&
+    (Array.isArray(supportedVersions) ? supportedVersions : []).some(
+      (version) => Number(version) === Number(requiredVersion),
     ),
+  canUseDeepSeekQuiescentCompletion: (input) => Boolean(
+    input?.siteId === "deepseek" &&
+      input?.activeRun !== true &&
+      input?.stopControlVisible !== true &&
+      input?.busyComposer !== true &&
+      (input?.hasRequestContext === true || input?.hasAssistantTurn === true) &&
+      input?.attachmentContractVerified === true &&
+      input?.terminalEvidence === true &&
+      Number(input?.quietSinceMs) >= Number(input?.quietThresholdMs) &&
+      input?.completionPhase !== "verified_done",
+  ),
+  stopDisconnectedProviderAttempt: async ({
+    attemptToken,
+    isAttemptCurrent,
+    findStopControl,
+    clickStopControl,
+    wait,
+    now = () => Date.now(),
+    timeoutMs = 5000,
+    pollIntervalMs = 100,
+  }) => {
+    if (
+      !attemptToken ||
+      typeof isAttemptCurrent !== "function" ||
+      typeof findStopControl !== "function" ||
+      typeof clickStopControl !== "function" ||
+      typeof wait !== "function"
+    ) {
+      return { requested: false, acknowledged: false, attempts: 0 };
+    }
+    const deadline = now() + Math.max(1, Number(timeoutMs) || 5000);
+    const intervalMs = Math.max(1, Number(pollIntervalMs) || 100);
+    let attempts = 0;
+    while (isAttemptCurrent(attemptToken) && now() <= deadline) {
+      attempts += 1;
+      const stopControl = findStopControl();
+      if (stopControl) {
+        clickStopControl(stopControl);
+        return { requested: true, acknowledged: true, attempts };
+      }
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) break;
+      await wait(Math.min(intervalMs, remainingMs));
+    }
+    return { requested: true, acknowledged: false, attempts };
+  },
+  classifyChatReadinessBlocker: ({
+    siteId = null,
+    visibleText = "",
+  } = {}) => {
+    const normalized = String(visibleText || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    const siteLabel = String(siteId || "").toLowerCase() === "chatgpt"
+      ? "ChatGPT"
+      : "The chat site";
+    if (
+      /too many requests/.test(normalized) &&
+      /(?:requests too quickly|temporarily limited|rate.?limit)/.test(
+        normalized,
+      )
+    ) {
+      return {
+        reasonCode: "site_rate_limited",
+        message: `${siteLabel} is temporarily rate-limited; no prompt or PDF was sent.`,
+      };
+    }
+    if (
+      /(?:verify (?:that )?you are human|checking your browser|captcha)/.test(
+        normalized,
+      )
+    ) {
+      return {
+        reasonCode: "human_verification_required",
+        message: `${siteLabel} requires human verification; no prompt or PDF was sent.`,
+      };
+    }
+    if (/\blog in\b/.test(normalized) && /\bsign up\b/.test(normalized)) {
+      return {
+        reasonCode: "authentication_required",
+        message: `${siteLabel} requires sign-in; no prompt or PDF was sent.`,
+      };
+    }
+    return null;
+  },
+  hasUsableChatReadinessSignals: ({
+    urlMatches = true,
+    composerReady = false,
+    activeRun = false,
+    domSettled = false,
+    bodyReady = true,
+    mainReady = true,
+  } = {}) => Boolean(
+    urlMatches &&
+      composerReady &&
+      !activeRun &&
+      domSettled &&
+      bodyReady &&
+      mainReady
+  ),
+  classifyChatReadinessTimeout: ({
+    urlMatches = true,
+    composerReady = false,
+    activeRun = false,
+    domSettled = false,
+    transcriptStable = false,
+  } = {}) => {
+    if (!urlMatches) {
+      return {
+        reasonCode: "conversation_url_mismatch",
+        message: "The chat tab did not reach the requested conversation; no prompt or PDF was sent.",
+      };
+    }
+    if (!composerReady) {
+      return {
+        reasonCode: "composer_not_ready",
+        message: "The chat composer did not become available; no prompt or PDF was sent.",
+      };
+    }
+    if (activeRun) {
+      return {
+        reasonCode: "prior_turn_still_running",
+        message: "The previous chat turn is still running; no new prompt or PDF was sent.",
+      };
+    }
+    if (!domSettled) {
+      return {
+        reasonCode: "chat_dom_unstable",
+        message: "The chat page did not finish rendering; no prompt or PDF was sent.",
+      };
+    }
+    if (!transcriptStable) {
+      return {
+        reasonCode: "transcript_unstable",
+        message: "The chat transcript did not stabilize; no prompt or PDF was sent.",
+      };
+    }
+    return {
+      reasonCode: "conversation_not_ready",
+      message: "The conversation did not become ready; no prompt or PDF was sent.",
+    };
+  },
   attachmentListContainsExpectedFilename: (
     attachments,
     expectedFilename,
@@ -331,6 +566,63 @@ const shared = globalThis.SyncZoteroShared || {
         expectedFilename,
       ),
     ),
+  classifySubmittedPdfContract: (attachments, expectedFilename = "") => {
+    const normalizedAttachments = (Array.isArray(attachments)
+      ? attachments
+      : [])
+      .map((attachment) => String(attachment || "").trim())
+      .filter(Boolean);
+    const attachmentRequested = Boolean(String(expectedFilename || "").trim());
+    const normalize = (value) =>
+      String(value || "")
+        .normalize("NFC")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    const isPdfAttachment = (attachment) =>
+      /\.pdf(?:\b|$)/i.test(normalize(attachment)) ||
+      /\bpdf\b/i.test(normalize(attachment)) ||
+      (attachmentRequested &&
+        shared.attachmentEvidenceMatchesFilename(
+          attachment,
+          expectedFilename,
+        ));
+    const isImageAttachment = (attachment) =>
+      /^(?:image(?:_\d+)?|.+\.(?:png|jpe?g|gif|webp|heic))$/i.test(
+        normalize(attachment),
+      );
+    const pdfAttachments = normalizedAttachments.filter(isPdfAttachment);
+    const unidentifiedAttachments = normalizedAttachments.filter(
+      (attachment) =>
+        !isPdfAttachment(attachment) && !isImageAttachment(attachment),
+    );
+    const filenameMatched = attachmentRequested
+      ? shared.attachmentListContainsExpectedFilename(
+        pdfAttachments,
+        expectedFilename,
+      )
+      : null;
+    const matchedPdfCount = attachmentRequested
+      ? pdfAttachments.filter((attachment) =>
+        shared.attachmentEvidenceMatchesFilename(
+          attachment,
+          expectedFilename,
+        )).length
+      : 0;
+    return {
+      attachmentRequested,
+      attachmentCount: normalizedAttachments.length,
+      pdfAttachmentCount: pdfAttachments.length,
+      filenameMatched,
+      contractVerified: attachmentRequested
+        ? filenameMatched === true &&
+          matchedPdfCount === 1 &&
+          pdfAttachments.length === 1 &&
+          unidentifiedAttachments.length === 0
+        : pdfAttachments.length === 0 &&
+          unidentifiedAttachments.length === 0,
+    };
+  },
   hasNewExpectedAttachmentEvidence: ({
     baselineEvidence = [],
     currentEvidence = [],
@@ -407,13 +699,27 @@ const shared = globalThis.SyncZoteroShared || {
     acceptTimeoutMs = 15000,
     readyTimeoutMs = 30000,
     pollIntervalMs = 100,
+    readyQuietWindowMs = 750,
   } = {}) => {
+    if (!String(expectedFilename || "").trim()) {
+      throw new TypeError("expectedFilename is required");
+    }
     const startedAt = Date.now();
     const poll = async (deadline, isSatisfied) => {
       while (true) {
         const state = (await readState()) || {};
+        const evidence = state.evidence || [];
+        if (
+          evidence.some((entry) =>
+            shared.attachmentEvidenceHasFailure(entry, expectedFilename),
+          )
+        ) {
+          throw new Error(
+            `The website reported that "${expectedFilename}" failed to upload.`,
+          );
+        }
         const satisfied = isSatisfied(
-          state.evidence || [],
+          evidence,
           state.newCards || [],
         );
         if (satisfied) return satisfied;
@@ -444,12 +750,7 @@ const shared = globalThis.SyncZoteroShared || {
             filenameConfirmed: true,
           };
         }
-        return newCards.length > 0
-          ? {
-            evidence: newCards[newCards.length - 1] || expectedFilename,
-            filenameConfirmed: false,
-          }
-          : null;
+        return null;
       },
     );
     if (!acceptance) {
@@ -458,30 +759,45 @@ const shared = globalThis.SyncZoteroShared || {
       );
     }
 
+    let readySince = null;
+    const quietWindowMs = Math.max(0, Number(readyQuietWindowMs) || 0);
     const readiness = await poll(
       Date.now() + readyTimeoutMs,
-      (evidence, newCards) => {
-        if (acceptance.filenameConfirmed) {
-          return shared.hasNewExpectedAttachmentEvidence({
-            baselineEvidence,
-            currentEvidence: evidence,
-            expectedFilename,
-            requireReady: true,
-          })
-            ? { evidence: acceptance.evidence }
-            : null;
+      (evidence) => {
+        const ready = shared.hasNewExpectedAttachmentEvidence({
+          baselineEvidence,
+          currentEvidence: evidence,
+          expectedFilename,
+          requireReady: true,
+        });
+        if (!ready) {
+          readySince = null;
+          return null;
         }
-        return newCards.length > 0 &&
-            newCards.every(shared.attachmentCardIsSettled)
-          ? { evidence: acceptance.evidence }
-          : null;
+        if (readySince === null) readySince = Date.now();
+        if (Date.now() - readySince < quietWindowMs) return null;
+        return {
+          evidence:
+            evidence.find((entry) =>
+              shared.attachmentEvidenceIsReady(
+                entry,
+                expectedFilename,
+              ),
+            ) || acceptance.evidence,
+        };
       },
     );
 
+    if (!readiness) {
+      throw new Error(
+        `The website did not confirm that "${expectedFilename}" was ready.`,
+      );
+    }
+
     return {
-      evidence: acceptance.evidence,
-      filenameConfirmed: acceptance.filenameConfirmed,
-      readyConfirmed: Boolean(readiness),
+      evidence: readiness.evidence || acceptance.evidence,
+      filenameConfirmed: true,
+      readyConfirmed: true,
       elapsedMs: Date.now() - startedAt,
     };
   },
@@ -965,7 +1281,7 @@ function dispatchComposerInput(composer, inputType, data) {
 
 let composerTextBridgeSerial = 0;
 
-function setMainWorldChatGPTComposerText(promptText, timeoutMs = 1000) {
+function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
   const requestId = [
     Date.now(),
     ++composerTextBridgeSerial,
@@ -986,32 +1302,47 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 1000) {
       if (
         !payload ||
         payload.source !== "sync-zotero-page" ||
-        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT" ||
+        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V2" ||
         payload.requestId !== requestId
       ) {
         return;
       }
-      finish(payload.ok === true);
+      finish({
+        handled: true,
+        applied: payload.ok === true,
+        pasteAccepted: payload.pasteAccepted === true,
+        error: payload.error || null,
+      });
     };
-    const timer = setTimeout(() => finish(false), timeoutMs);
+    const timer = setTimeout(() => finish({
+      handled: false,
+      applied: false,
+      pasteAccepted: false,
+      timedOut: true,
+    }), timeoutMs);
 
     window.addEventListener("message", onMessage);
     window.postMessage({
       source: "sync-zotero-content",
-      type: "SYNC_ZOTERO_SET_COMPOSER_TEXT",
+      type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_V2",
       requestId,
       text: String(promptText || ""),
     }, "*");
   });
 }
 
-async function setContentEditableText(composer, promptText) {
+function selectComposerContents(composer) {
   composer.focus();
   const selection = window.getSelection();
   const range = document.createRange();
   range.selectNodeContents(composer);
   selection?.removeAllRanges();
   selection?.addRange(range);
+  return { range, selection };
+}
+
+async function setContentEditableText(composer, promptText) {
+  selectComposerContents(composer);
 
   // ChatGPT's composer is ProseMirror-backed. Its paste handler applies a real
   // editor transaction (including replacement with an empty string), whereas
@@ -1019,8 +1350,8 @@ async function setContentEditableText(composer, promptText) {
   // the editor state that controls Send.
   if (SITE_ADAPTER?.siteId === "chatgpt") {
     try {
-      const updated = await setMainWorldChatGPTComposerText(promptText);
-      if (updated &&
+      const bridgeResult = await setMainWorldChatGPTComposerText(promptText);
+      if (bridgeResult.applied &&
         shared.composerTextMatchesPrompt(
           shared.normalizeComposerText(promptText),
           shared.normalizeComposerText(
@@ -1028,27 +1359,43 @@ async function setContentEditableText(composer, promptText) {
           ),
         )
       ) {
-        return;
+        return { pendingBridgeCommit: false };
+      }
+      const transition = shared.composerBridgeWriteTransition(bridgeResult);
+      if (!transition.allowSynchronousFallback) {
+        // A canceled paste event was accepted by ProseMirror even if its DOM
+        // commit is still pending. Retrying or falling back can race that
+        // transaction and duplicate or overwrite the prompt.
+        return { pendingBridgeCommit: transition.pendingBridgeCommit };
       }
     } catch (_) {
-      // Fall through to generic contenteditable insertion.
+      // An interrupted bridge may still have dispatched the paste. Fail safe
+      // without a second insertion whose ordering cannot be known.
+      return { pendingBridgeCommit: true };
     }
   }
+
+  // The main-world bridge is asynchronous and may have changed the editor DOM
+  // even when it could not confirm the final text. Never reuse a Range created
+  // before that attempt; a detached range can append instead of replacing and
+  // duplicate the prompt.
+  composer = findComposerNow() || composer;
+  const { range, selection } = selectComposerContents(composer);
 
   // execCommand is retained for other contenteditable composers and as a
   // compatibility fallback when a site does not handle synthetic paste.
   let insertedByEditor = false;
   try {
     if (typeof document.execCommand === "function") {
-      document.execCommand("delete", false);
-      insertedByEditor = !promptText ||
-        document.execCommand("insertText", false, promptText);
+      insertedByEditor = promptText
+        ? document.execCommand("insertText", false, promptText)
+        : document.execCommand("delete", false);
     }
   } catch (_) {
     insertedByEditor = false;
   }
 
-  if (insertedByEditor) return;
+  if (insertedByEditor) return { pendingBridgeCommit: false };
 
   range.selectNodeContents(composer);
   range.deleteContents();
@@ -1058,7 +1405,7 @@ async function setContentEditableText(composer, promptText) {
     selection?.removeAllRanges();
     selection?.addRange(range);
     dispatchComposerInput(composer, "deleteContentBackward", "");
-    return;
+    return { pendingBridgeCommit: false };
   }
 
   const textNode = document.createTextNode(promptText);
@@ -1068,6 +1415,27 @@ async function setContentEditableText(composer, promptText) {
   selection?.removeAllRanges();
   selection?.addRange(range);
   dispatchComposerInput(composer, "insertText", promptText);
+  return { pendingBridgeCommit: false };
+}
+
+async function waitForComposerPromptMatch(
+  expectedText,
+  composer,
+  timeoutMs,
+) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  while (true) {
+    const currentComposer = findComposerNow() || composer;
+    const actualText = shared.normalizeComposerText(
+      readComposerText(currentComposer),
+    );
+    if (shared.composerTextMatchesPrompt(expectedText, actualText)) {
+      return currentComposer;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await sleep(Math.min(50, remaining));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +1484,7 @@ async function attachImages(imageDataUrls) {
 const PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS = 15000;
 const PDF_ATTACHMENT_READY_TIMEOUT_MS = 30000;
 const PDF_ATTACHMENT_POLL_INTERVAL_MS = 100;
-const SUBMITTED_PDF_VERIFY_TIMEOUT_MS = 3000;
+const SUBMITTED_ATTACHMENT_CONTRACT_TIMEOUT_MS = 3000;
 
 function readAttachmentEvidenceText(element) {
   if (!element) return "";
@@ -1152,7 +1520,7 @@ function hasExplicitComposerFileControl(region, expectedFilename) {
           controlText,
           expectedFilename,
         )
-        : shared.hasPendingPdfEvidence([controlText]);
+        : true;
     }),
   );
 }
@@ -1185,7 +1553,7 @@ function collectComposerRegionAttachmentEvidence(
       );
     const matchesExpected = expectedFilename
       ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
-      : shared.hasPendingPdfEvidence([text]);
+      : shared.hasPendingPdfEvidence([text], hasExplicitFileControl);
     if (matchesExpected && hasAttachmentMetadata) {
       if (!expectedFilename) {
         return [text];
@@ -1267,14 +1635,18 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
         break;
       }
       const text = readAttachmentEvidenceText(evidenceNode);
+      const hasExplicitFileControl = hasExplicitComposerFileControl(
+        evidenceNode,
+        expectedFilename,
+      );
       const hasAttachmentMetadata =
         shared.attachmentEvidenceHasFileCardSignal(
           text,
-          hasExplicitComposerFileControl(evidenceNode, expectedFilename),
+          hasExplicitFileControl,
         );
       const matchesExpected = expectedFilename
         ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
-        : shared.hasPendingPdfEvidence([text]);
+        : shared.hasPendingPdfEvidence([text], hasExplicitFileControl);
       if (matchesExpected && hasAttachmentMetadata) {
         if (!seenEvidenceNodes.has(evidenceNode)) {
           seenEvidenceNodes.add(evidenceNode);
@@ -1332,6 +1704,20 @@ function collectComposerFileCardNodes() {
   return candidates.filter(
     (node) =>
       !candidates.some((other) => other !== node && node.contains(other)),
+  );
+}
+
+function collectVisibleComposerPdfCardEvidence() {
+  const messageSelector =
+    SITE_ADAPTER?.conversationMessageSelector ||
+    "[data-message-author-role]";
+  // This preflight must remain inside the composer ancestry. A document-wide
+  // fallback sees PDF cards in already-submitted user turns and falsely blocks
+  // the next prompt-only send.
+  return Array.from(
+    new Set(
+      collectComposerRegionAttachmentEvidence("", messageSelector) || [],
+    ),
   );
 }
 
@@ -1414,19 +1800,9 @@ async function attachPDF(pdfBase64, pdfFilename) {
       baselineCardNodes,
       pdfFilename,
     });
-  } catch (_) {
+  } catch (error) {
     throw new Error(
-      `PDF attachment failed: no file appeared in the composer after the drag-and-drop attempt for "${pdfFilename}".`,
-    );
-  }
-  if (!confirmation.filenameConfirmed) {
-    console.warn(
-      `[sync-zotero] A file card appeared for "${pdfFilename}" but the site renders a name we cannot match — accepting it.`,
-    );
-  }
-  if (!confirmation.readyConfirmed) {
-    console.warn(
-      `[sync-zotero] "${pdfFilename}" was attached but the site never reported it as ready — sending anyway.`,
+      `PDF attachment failed for "${pdfFilename}": ${error?.message || String(error)}`,
     );
   }
   return {
@@ -1610,28 +1986,35 @@ async function typePromptAndVerify(
   for (let attempt = 0; attempt < 2; attempt++) {
     const composer = await getComposerElement();
     composer.focus();
+    let pendingBridgeCommit = false;
 
     if (composer.tagName === "TEXTAREA") {
       setNativeValue(composer, "");
       setNativeValue(composer, promptText);
     } else {
-      await setContentEditableText(composer, "");
-      await setContentEditableText(composer, promptText);
+      // setContentEditableText selects the full editor contents and replaces
+      // them atomically. A separate asynchronous clear transaction can race
+      // the insertion and was the source of duplicated ChatGPT prompts.
+      const writeResult = await setContentEditableText(composer, promptText);
+      pendingBridgeCommit = writeResult?.pendingBridgeCommit === true;
     }
 
-    await sleep(300);
-
-    const currentComposer = findComposerNow() || composer;
-    const actualText = shared.normalizeComposerText(
-      readComposerText(currentComposer),
+    const verificationPolicy = shared.composerPromptVerificationPolicy(
+      pendingBridgeCommit,
     );
-    if (shared.composerTextMatchesPrompt(expectedText, actualText)) {
+    const currentComposer = await waitForComposerPromptMatch(
+      expectedText,
+      composer,
+      verificationPolicy.matchTimeoutMs,
+    );
+    if (currentComposer) {
       promptTextMatched = true;
       if (!requireEnabledSendControl) return currentComposer;
 
       const sendBtn = await waitForSendButtonEnabled(1500);
       if (isEnabledButton(sendBtn)) return currentComposer;
     }
+    if (!verificationPolicy.allowRetry) break;
   }
 
   if (promptTextMatched && requireEnabledSendControl) {
@@ -1808,9 +2191,36 @@ function buildDiagnostic(overrides = {}) {
       typeof overrides.attachmentPreviewVerified === "boolean"
         ? overrides.attachmentPreviewVerified
         : null,
+    attachmentRequested:
+      typeof overrides.attachmentRequested === "boolean"
+        ? overrides.attachmentRequested
+        : null,
+    attachmentFilenameConfirmed:
+      typeof overrides.attachmentFilenameConfirmed === "boolean"
+        ? overrides.attachmentFilenameConfirmed
+        : null,
+    attachmentReadyVerified:
+      typeof overrides.attachmentReadyVerified === "boolean"
+        ? overrides.attachmentReadyVerified
+        : null,
     submittedAttachmentVerified:
       typeof overrides.submittedAttachmentVerified === "boolean"
         ? overrides.submittedAttachmentVerified
+        : null,
+    submittedAttachmentCount:
+      Number.isFinite(Number(overrides.submittedAttachmentCount))
+        ? Math.max(
+          0,
+          Math.floor(Number(overrides.submittedAttachmentCount)),
+        )
+        : null,
+    submittedPdfCount:
+      Number.isFinite(Number(overrides.submittedPdfCount))
+        ? Math.max(0, Math.floor(Number(overrides.submittedPdfCount)))
+        : null,
+    attachmentContractVerified:
+      typeof overrides.attachmentContractVerified === "boolean"
+        ? overrides.attachmentContractVerified
         : null,
     completionDetectionMs:
       overrides.completionDetectionMs == null
@@ -1962,12 +2372,25 @@ async function waitForSubmissionSignal(
   };
 }
 
-async function submitMessageAndVerify(promptText) {
+function assertPipelineCurrent(isPipelineCurrent) {
+  if (typeof isPipelineCurrent !== "function" || isPipelineCurrent()) return;
+  const error = new Error(
+    "WebChat pipeline was cancelled because its relay attempt ended.",
+  );
+  error.name = "PipelineCancelled";
+  throw error;
+}
+
+async function submitMessageAndVerify(
+  promptText,
+  isPipelineCurrent = () => true,
+) {
   if (SITE_ADAPTER?.siteId === "deepseek") {
-    return submitDeepSeekMessageAndVerify(promptText);
+    return submitDeepSeekMessageAndVerify(promptText, isPipelineCurrent);
   }
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    assertPipelineCurrent(isPipelineCurrent);
     let clickAttempts = 0;
     const submitStrategies = [
       async (composer) => {
@@ -1982,6 +2405,7 @@ async function submitMessageAndVerify(promptText) {
     ];
 
     for (const submit of submitStrategies) {
+      assertPipelineCurrent(isPipelineCurrent);
       const composer = await getComposerElement();
       const sendBtn = await waitForSendButton(4000);
       if (!sendBtn && attempt === 0) {
@@ -1992,6 +2416,7 @@ async function submitMessageAndVerify(promptText) {
       const baselineUserMessageCount = getUserMessageCount();
       const baselineOutboundRequestSerial = outboundRequestSerial;
 
+      assertPipelineCurrent(isPipelineCurrent);
       const submitStarted = await submit(composer, sendBtn);
       if (submitStarted === false) {
         continue;
@@ -2003,6 +2428,7 @@ async function submitMessageAndVerify(promptText) {
         baselineUserMessageCount,
         baselineTranscriptCount,
       );
+      assertPipelineCurrent(isPipelineCurrent);
       if (delivered.delivered || delivered.requestObserved) {
         return {
           baselineOutboundRequestSerial,
@@ -2026,11 +2452,15 @@ async function submitMessageAndVerify(promptText) {
   throw new Error("Prompt delivery failed: chat did not accept the prompt after 2 attempts.");
 }
 
-async function submitDeepSeekMessageAndVerify(promptText) {
+async function submitDeepSeekMessageAndVerify(
+  promptText,
+  isPipelineCurrent = () => true,
+) {
   let totalClickAttempts = 0;
   let lastSubmitControl = "not_checked";
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    assertPipelineCurrent(isPipelineCurrent);
     const composer = await getComposerElement();
     const baselineTranscriptCount = extractConversationTranscript().count;
     const baselineUserMessageCount = getUserMessageCount();
@@ -2040,6 +2470,7 @@ async function submitDeepSeekMessageAndVerify(promptText) {
     let lastClickAt = 0;
 
     while (Date.now() < deadline) {
+      assertPipelineCurrent(isPipelineCurrent);
       const remaining = Math.max(0, deadline - Date.now());
       const delivery = await waitForSubmissionSignal(
         promptText,
@@ -2071,6 +2502,7 @@ async function submitDeepSeekMessageAndVerify(promptText) {
       lastSubmitControl = describeSubmitControl(sendBtn);
       const now = Date.now();
       if (isEnabledButton(sendBtn) && now - lastClickAt >= 350) {
+        assertPipelineCurrent(isPipelineCurrent);
         lastClickAt = now;
         totalClickAttempts++;
         dispatchPointerClick(sendBtn);
@@ -2437,13 +2869,9 @@ function isConversationStillRunning(
  * Returns true if the action bar is visible on the last assistant message.
  */
 function hasResponseActionBar() {
-  // Get the last assistant message container
-  const assistantSelectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
-  let assistantMessages = [];
-  for (const sel of assistantSelectors) {
-    assistantMessages = Array.from(document.querySelectorAll(sel));
-    if (assistantMessages.length > 0) break;
-  }
+  // Get the last visible assistant message container. ChatGPT can leave stale
+  // conversation trees mounted while rendering a new-chat shell.
+  const assistantMessages = getAssistantMessageNodes();
   if (!assistantMessages.length) return false;
   const lastMsg = assistantMessages[assistantMessages.length - 1];
 
@@ -2487,6 +2915,7 @@ function getAssistantMessageNodes() {
   const selectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
   for (const selector of selectors) {
     const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => {
+      if (!isVisibleElement(node)) return false;
       const role =
         SITE_ADAPTER?.getMessageRole?.(node) ||
         node.getAttribute?.("data-message-author-role");
@@ -2504,6 +2933,7 @@ function getUserMessageCount() {
     SITE_ADAPTER?.userMessageSelector ||
     "[data-message-author-role]";
   return Array.from(document.querySelectorAll(selector)).filter((node) => {
+    if (!isVisibleElement(node)) return false;
     const role =
       SITE_ADAPTER?.getMessageRole?.(node) ||
       node.getAttribute?.("data-message-author-role");
@@ -2647,6 +3077,8 @@ async function streamResponseSnapshots(
   attachmentFingerprint = "",
   submissionMeta = null,
   timeoutMs = RESPONSE_TIMEOUT_MS,
+  isPipelineCurrent = () => true,
+  onTerminalPosted = () => {},
 ) {
   sseText = "";
   sseThinking = null;
@@ -2674,10 +3106,12 @@ async function streamResponseSnapshots(
   let lastUserTurnKey = null;
   let lastAssistantTurnKey = null;
   let lastAnyProgressAt = Date.now();
-  let cancelAttempted = false;
-  let cancelRequestedAt = 0;
   const deadline = Date.now() + timeoutMs;
   const userTurnDeadline = Date.now() + 30_000;
+  const emitTerminal = (payload) => {
+    onTerminalPosted();
+    postTerminal(port, payload);
+  };
   let reportedUserTurn = false;
   let reportedAssistantTurn = false;
   let reportedDeepSeekRequestCorrelation = false;
@@ -2690,8 +3124,12 @@ async function streamResponseSnapshots(
   const expectedPdfFilename = String(attachmentFingerprint || "")
     .split("|", 1)[0]
     .trim();
-  let submittedPdfVerified = !expectedPdfFilename;
-  let submittedPdfMismatchObservedAt = 0;
+  const attachmentRequested = Boolean(expectedPdfFilename);
+  let submittedAttachmentVerified = null;
+  let submittedAttachmentCount = null;
+  let submittedPdfCount = null;
+  let attachmentContractVerified = false;
+  let attachmentContractMismatchObservedAt = 0;
   const baselineOutboundRequestSerial =
     Number(submissionMeta?.baselineOutboundRequestSerial) || 0;
   let requestContext = submissionMeta?.requestContext || null;
@@ -2708,6 +3146,9 @@ async function streamResponseSnapshots(
   };
   const makeTurnDiagnostic = (phase, overrides = {}) => buildDiagnostic({
     phase,
+    composerTextMatched: submissionMeta?.composerTextMatched === true,
+    uploadDetected: submissionMeta?.uploadDetected === true,
+    clickAttempts: Number(submissionMeta?.clickAttempts) || 0,
     requestObserved: Boolean(requestContext),
     streamObserved:
       activeConversationStreamCount > 0 ||
@@ -2723,7 +3164,17 @@ async function streamResponseSnapshots(
     attachmentPreviewVerified: expectedPdfFilename
       ? Boolean(submissionMeta?.pdfAttachmentReceipt)
       : null,
-    submittedAttachmentVerified: submittedPdfVerified,
+    attachmentRequested,
+    attachmentFilenameConfirmed: expectedPdfFilename
+      ? submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true
+      : null,
+    attachmentReadyVerified: expectedPdfFilename
+      ? submissionMeta?.pdfAttachmentReceipt?.readyConfirmed === true
+      : null,
+    submittedAttachmentVerified,
+    submittedAttachmentCount,
+    submittedPdfCount,
+    attachmentContractVerified,
     completionDetectionMs: getCompletionDetectionMs(),
     ...overrides,
   });
@@ -2753,6 +3204,7 @@ async function streamResponseSnapshots(
   });
 
   while (Date.now() < deadline) {
+    assertPipelineCurrent(isPipelineCurrent);
     const nowMs = Date.now();
     const stopBtn = findStopButton();
     const busyComposer = hasBusyComposerHint();
@@ -2771,6 +3223,14 @@ async function streamResponseSnapshots(
     const activeRun = isConversationStillRunning(stopBtn, {
       busyComposer,
       strongTransportCompletion,
+    });
+    const terminalEvidence = shared.hasVerifiedTerminalEvidence({
+      siteId: SITE_ADAPTER?.siteId,
+      sseDone,
+      activeConversationStreamCount,
+      actionBarVisible,
+      stopButtonVisible: Boolean(stopBtn),
+      busyComposer,
     });
     if (SITE_ADAPTER?.siteId === "deepseek" && !requestContext) {
       requestContext = findObservedDeepSeekRequestContext(
@@ -2826,8 +3286,8 @@ async function streamResponseSnapshots(
       });
     }
 
-    const matchedUserTurn =
-      !userTurnKey || !submittedPdfVerified
+    let matchedUserTurn =
+      !userTurnKey || !attachmentContractVerified
         ? findMatchingUserTurn(
           transcript,
           baselineTranscriptCount,
@@ -2876,8 +3336,9 @@ async function streamResponseSnapshots(
             baselineTranscriptCount,
           )
             .filter((m) => m.role === "user");
-          if (fallbackCandidates.length > 0) {
+          if (fallbackCandidates.length > 0 && deepseekRequestObserved) {
             const fallback = fallbackCandidates[fallbackCandidates.length - 1];
+            matchedUserTurn = fallback;
             userTurnKey = fallback.messageKey;
             console.warn("[sync-zotero] User turn text match failed — using position-based fallback");
             recordTurnDebug("user_turn_fallback", { seq, attempt, userTurnKey });
@@ -2901,97 +3362,68 @@ async function streamResponseSnapshots(
                 remoteChatId,
               });
             }
-          } else if (shared.hasMeaningfulAssistantText(sseText)) {
-            // Nuclear fallback: SSE captured the response but DOM scraping failed.
-            // Emit the SSE text directly as the terminal response.
-            console.warn("[sync-zotero] User turn not found — using SSE response fallback");
-            recordTurnDebug("sse_fallback", { seq, attempt, sseTextLen: sseText.length });
-            port.postMessage({
-              type: "terminal",
-              seq,
-              attempt,
-              text: sseText,
-              thinking: sseThinking || null,
-              answerAnchorId: null,
-              answerRevision: 0,
-              thinkingRevision: 0,
-              runState: "done",
-              completionReason: "settled",
-              finalTranscriptHash: transcript.hash,
-              verifiedAt: Date.now(),
-              remoteChatUrl,
-              remoteChatId,
-              userTurnKey: null,
-              assistantTurnKey: null,
-              baselineTranscriptCount,
-              baselineTranscriptHash,
-              turnStatus: "done",
-              diagnostic: makeTurnDiagnostic("done", {
-                reasonCode: "sse_fallback_without_dom_user_turn",
-                streamObserved: true,
-              }),
-            });
-            return;
           } else {
-            throw new Error("Chat never created the submitted user turn in the conversation transcript.");
+            throw new Error(
+              "Chat never exposed a user turn matching the submitted prompt, so delivery could not be verified.",
+            );
           }
         }
       }
     }
 
-    if (expectedPdfFilename && matchedUserTurn && !submittedPdfVerified) {
+    if (matchedUserTurn && !attachmentContractVerified) {
       const attachments = Array.isArray(matchedUserTurn.attachments)
         ? matchedUserTurn.attachments
         : [];
-      const nameMatched = shared.attachmentListContainsExpectedFilename(
+      const contract = shared.classifySubmittedPdfContract(
         attachments,
         expectedPdfFilename,
       );
-      // A turn that carries a file is a sent PDF. Only a turn with no
-      // attachment at all is a real failure — the name the site renders is not
-      // something we can insist on without rejecting successful sends.
-      submittedPdfVerified = nameMatched || attachments.length > 0;
-      if (submittedPdfVerified && !nameMatched) {
-        console.warn(
-          `[sync-zotero] The submitted turn carries an attachment the site names differently from "${expectedPdfFilename}" — accepting it.`,
-        );
-        recordTurnDebug("submitted_pdf_name_unmatched", {
-          seq,
-          attempt,
-          userTurnKey: matchedUserTurn.messageKey,
-          expectedPdfFilename,
-          attachments,
-        });
-      }
-      if (submittedPdfVerified) {
+      submittedAttachmentVerified = attachmentRequested
+        ? contract.filenameMatched === true
+        : null;
+      submittedAttachmentCount = contract.attachmentCount;
+      submittedPdfCount = contract.pdfAttachmentCount;
+      attachmentContractVerified = contract.contractVerified === true;
+      if (attachmentContractVerified) {
         userTurnKey = matchedUserTurn.messageKey;
-        recordTurnDebug("submitted_pdf_verified", {
+        recordTurnDebug("submitted_attachment_contract_verified", {
           seq,
           attempt,
           userTurnKey,
           expectedPdfFilename,
           attachments,
+          attachmentRequested,
+          submittedAttachmentCount,
+          submittedPdfCount,
         });
-      } else if (!submittedPdfMismatchObservedAt) {
-        submittedPdfMismatchObservedAt = nowMs;
-        recordTurnDebug("submitted_pdf_missing", {
+      } else if (!attachmentContractMismatchObservedAt) {
+        attachmentContractMismatchObservedAt = nowMs;
+        recordTurnDebug("submitted_attachment_contract_mismatch", {
           seq,
           attempt,
           userTurnKey: matchedUserTurn.messageKey,
           expectedPdfFilename,
           attachments,
+          attachmentRequested,
+          submittedAttachmentCount,
+          submittedPdfCount,
         });
       }
     }
     if (
-      expectedPdfFilename &&
-      !submittedPdfVerified &&
-      submittedPdfMismatchObservedAt &&
-      nowMs - submittedPdfMismatchObservedAt >=
-        SUBMITTED_PDF_VERIFY_TIMEOUT_MS
+      !attachmentContractVerified &&
+      attachmentContractMismatchObservedAt &&
+      nowMs - attachmentContractMismatchObservedAt >=
+        SUBMITTED_ATTACHMENT_CONTRACT_TIMEOUT_MS
     ) {
+      if (attachmentRequested) {
+        throw new Error(
+          `The submitted user turn did not contain the requested PDF "${expectedPdfFilename}".`,
+        );
+      }
       throw new Error(
-        `The submitted user turn carried no attachment; "${expectedPdfFilename}" did not reach the chat.`,
+        "The prompt-only user turn unexpectedly contained a PDF attachment.",
       );
     }
 
@@ -3170,6 +3602,7 @@ async function streamResponseSnapshots(
       transcriptRevision,
       hasUserTurn: Boolean(userTurnKey),
       hasAssistantTurn: Boolean(assistantTurnKey),
+      terminalEvidence,
       quietWindowMs,
       reboundWindowMs,
     });
@@ -3237,7 +3670,7 @@ async function streamResponseSnapshots(
       lastAssistantTurnKey = assistantTurnKey;
     }
 
-    if (completion.emitDone && submittedPdfVerified) {
+    if (completion.emitDone && attachmentContractVerified) {
       // Re-read the bound assistant turn after a final rebound delay. ChatGPT
       // can expose a prefix in the DOM long enough to satisfy visual completion
       // heuristics, especially after a discarded-tab reload.
@@ -3282,7 +3715,7 @@ async function streamResponseSnapshots(
         answerRevision,
         thinkingRevision,
       });
-      postTerminal(port, {
+      emitTerminal({
         seq,
         attempt,
         text: confirmedAnswerText,
@@ -3322,7 +3755,8 @@ async function streamResponseSnapshots(
       shared.hasMeaningfulAssistantText(sseText) &&
       !stopBtn &&
       !hasBusyComposerHint() &&
-      submittedPdfVerified &&
+      terminalEvidence &&
+      attachmentContractVerified &&
       completion.phase !== "verified_done"
     ) {
       // Use DOM answer if available, otherwise SSE answer
@@ -3336,7 +3770,7 @@ async function streamResponseSnapshots(
         domAnswerLen: lastAnswerText.length,
         usedSse: finalText === sseText,
       });
-      postTerminal(port, {
+      emitTerminal({
         seq,
         attempt,
         text: finalText,
@@ -3368,16 +3802,19 @@ async function streamResponseSnapshots(
     // between agentic workflow phases.
     const deepseekQuietThresholdMs = toolUseDetected ? 20_000 : 1_500;
     const deepseekIncompleteThresholdMs = toolUseDetected ? 25_000 : 5_000;
-    if (
-      SITE_ADAPTER?.siteId === "deepseek" &&
-      !activeRun &&
-      !stopBtn &&
-      !hasBusyComposerHint() &&
-      (Boolean(requestContext) || Boolean(assistantTurnKey)) &&
-      submittedPdfVerified &&
-      quietSinceMs >= deepseekQuietThresholdMs &&
-      completion.phase !== "verified_done"
-    ) {
+    if (shared.canUseDeepSeekQuiescentCompletion({
+      siteId: SITE_ADAPTER?.siteId,
+      activeRun,
+      stopControlVisible: Boolean(stopBtn),
+      busyComposer: hasBusyComposerHint(),
+      hasRequestContext: Boolean(requestContext),
+      hasAssistantTurn: Boolean(assistantTurnKey),
+      attachmentContractVerified,
+      terminalEvidence,
+      quietSinceMs,
+      quietThresholdMs: deepseekQuietThresholdMs,
+      completionPhase: completion.phase,
+    })) {
       const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
         ? lastAnswerText
         : (shared.hasMeaningfulAssistantText(sseText) ? sseText : "");
@@ -3393,7 +3830,7 @@ async function streamResponseSnapshots(
           sseTextLen: (sseText || "").length,
           usedSse: finalText === sseText && finalText !== lastAnswerText,
         });
-        postTerminal(port, {
+        emitTerminal({
           seq,
           attempt,
           text: finalText,
@@ -3426,7 +3863,7 @@ async function streamResponseSnapshots(
           quietSinceMs,
           thinkingLen: (finalThinking || "").length,
         });
-        postTerminal(port, {
+        emitTerminal({
           seq,
           attempt,
           text: "",
@@ -3453,91 +3890,17 @@ async function streamResponseSnapshots(
       }
     }
 
-    if (
-      answerVisible &&
-      activeRun &&
-      !cancelAttempted &&
-      quietSinceMs >= 12_000
-    ) {
-      cancelAttempted = true;
-      cancelRequestedAt = Date.now();
-      try {
-        stopBtn?.click?.();
-      } catch (_) {}
-      recordTurnDebug("forced_cancel_attempt", {
-        seq,
-        attempt,
-        quietSinceMs,
-      });
-      postTurnState(port, {
-        seq,
-        attempt,
-        remoteChatUrl,
-        remoteChatId,
-        baselineTranscriptCount,
-        baselineTranscriptHash,
-        userTurnKey,
-        assistantTurnKey,
-        turnStatus: "assistant_settling",
-        diagnostic: makeTurnDiagnostic("assistant_settling", {
-          reasonCode: "forced_cancel_attempt",
-        }),
-      });
-      await workerSleep(1500);
-      continue;
-    }
-
-    if (
-      cancelAttempted &&
-      answerVisible &&
-      activeRun &&
-      nowMs - cancelRequestedAt >= 4_000
-    ) {
-      completionTracker = shared.advanceTurnCompletionTracker(completionTracker, {
-        nowMs,
-        answerVisible,
-        thinkingVisible,
-        activeRun,
-        answerRevision,
-        thinkingRevision,
-        transcriptRevision,
-        hasUserTurn: Boolean(userTurnKey),
-        hasAssistantTurn: Boolean(assistantTurnKey),
-        forceIncomplete: true,
-      }).tracker;
-      recordTurnDebug("forced_cancel_incomplete", {
-        seq,
-        attempt,
-      });
-      postTerminal(port, {
-        seq,
-        attempt,
-        text: lastAnswerText,
-        thinking: lastThinkingText || null,
-        answerAnchorId: assistantTurnKey,
-        answerRevision,
-        thinkingRevision,
-        runState: "incomplete",
-        completionReason: "forced_cancel",
-        finalTranscriptHash: transcript.hash,
-        remoteChatUrl,
-        remoteChatId,
-        userTurnKey,
-        assistantTurnKey,
-        baselineTranscriptCount,
-        baselineTranscriptHash,
-        turnStatus: "incomplete",
-        diagnostic: makeTurnDiagnostic("incomplete", {
-          reasonCode: "forced_cancel_incomplete",
-        }),
-      });
-      return;
-    }
+    // A visible stop control is authoritative evidence that the provider is
+    // still working. PDF analysis and tool use can legitimately pause without
+    // changing visible text for well over 12 seconds, so never click Stop from
+    // an inactivity heuristic. Keep polling until the provider exposes a
+    // verified terminal state or the outer response deadline is reached.
 
     await workerSleep(500);
   }
 
   // Use SSE text as fallback if DOM-based answer extraction failed
+  assertPipelineCurrent(isPipelineCurrent);
   const timeoutAnswerText = shared.hasMeaningfulAssistantText(lastAnswerText)
     ? lastAnswerText
     : (shared.hasMeaningfulAssistantText(sseText) ? sseText : lastAnswerText);
@@ -3563,7 +3926,7 @@ async function streamResponseSnapshots(
       thinkingRevision,
       usedSseFallback: timeoutAnswerText !== lastAnswerText,
     });
-    postTerminal(port, {
+    emitTerminal({
       seq,
       attempt,
       text: timeoutAnswerText,
@@ -3572,7 +3935,7 @@ async function streamResponseSnapshots(
       answerRevision,
       thinkingRevision,
       runState: "incomplete",
-      completionReason: cancelAttempted ? "forced_cancel" : "timeout",
+      completionReason: "timeout",
       finalTranscriptHash: lastTranscriptHash,
       remoteChatUrl,
       remoteChatId,
@@ -3851,7 +4214,6 @@ function pruneAssistantStatusNodes(root) {
     "[role='button']",
     ...thinkingPrune,
     "[role='status']",
-    "[aria-live]",
     "progress",
   ];
   for (const sel of selectors) {
@@ -4320,6 +4682,7 @@ function getConversationMessageNodes() {
   const selector = SITE_ADAPTER?.conversationMessageSelector || "[data-message-author-role]";
   const nodes = Array.from(document.querySelectorAll(selector));
   return nodes.filter((node) => {
+    if (!isVisibleElement(node)) return false;
     const role = SITE_ADAPTER?.getMessageRole?.(node) || node.getAttribute("data-message-author-role");
     return role === "user" || role === "assistant";
   });
@@ -4513,11 +4876,91 @@ function mapTranscriptToRelayMessages(transcript) {
   }));
 }
 
+function collectVisibleReadinessBlockerText() {
+  const evidence = new Set();
+  const addEvidence = (element) => {
+    if (!isVisibleElement(element)) return;
+    const text = String(element.innerText || element.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text) evidence.add(text.slice(0, 4000));
+  };
+
+  for (const element of document.querySelectorAll(
+    '[role="dialog"], [aria-modal="true"], [role="alert"]',
+  )) {
+    addEvidence(element);
+  }
+
+  for (const heading of document.querySelectorAll(
+    'h1, h2, h3, [role="heading"]',
+  )) {
+    const headingText = String(
+      heading.innerText || heading.textContent || "",
+    ).trim();
+    if (
+      !/(?:too many requests|verify (?:that )?you are human|checking your browser|captcha)/i.test(
+        headingText,
+      )
+    ) {
+      continue;
+    }
+    let container = heading;
+    for (let depth = 0; depth < 4 && container?.parentElement; depth++) {
+      container = container.parentElement;
+    }
+    addEvidence(container || heading);
+  }
+
+  const visibleAuthControls = Array.from(
+    document.querySelectorAll('button, a, [role="button"]'),
+  ).filter((element) => {
+    if (!isVisibleElement(element)) return false;
+    const text = String(element.innerText || element.textContent || "").trim();
+    return /^(?:log in|sign up)$/i.test(text);
+  });
+  if (visibleAuthControls.length > 0) {
+    evidence.add(
+      visibleAuthControls
+        .map((element) => element.innerText || element.textContent || "")
+        .join(" "),
+    );
+  }
+
+  return Array.from(evidence).join("\n");
+}
+
+function buildChatReadinessFailure(transcript, failure) {
+  const diagnostic = buildDiagnostic({
+    phase: "pre_submit_readiness",
+    reasonCode: failure.reasonCode,
+    message: failure.message,
+  });
+  return {
+    ok: false,
+    ready: false,
+    error: failure.message,
+    diagnostic,
+    chatUrl: transcript.chatUrl,
+    chatId: transcript.chatId,
+    transcriptHash: transcript.hash,
+    transcriptCount: transcript.count,
+    messages: mapTranscriptToRelayMessages(transcript),
+  };
+}
+
 async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   const normalizedExpected = normalizeUrl(expectedChatUrl);
   let lastSignature = "";
   let stableChecks = 0;
+  let lastReadinessSignals = {
+    urlMatches: !normalizedExpected,
+    composerReady: false,
+    activeRun: false,
+    domSettled: false,
+    transcriptStable: false,
+  };
 
   // MutationObserver tracks DOM activity so we don't falsely stabilize
   // during React hydration when the DOM is being actively rebuilt.
@@ -4550,8 +4993,34 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
           document.body,
         );
         const domSettled = (Date.now() - lastDomMutationAt) >= 400;
+        const composerReady = Boolean(findComposerNow());
+        const blocker = shared.classifyChatReadinessBlocker({
+          siteId: SITE_ADAPTER?.siteId,
+          composerReady,
+          visibleText: collectVisibleReadinessBlockerText(),
+        });
+        if (blocker) {
+          return buildChatReadinessFailure(transcript, blocker);
+        }
+        lastReadinessSignals = {
+          urlMatches,
+          composerReady,
+          activeRun: false,
+          domSettled,
+          transcriptStable: false,
+        };
 
-        if (urlMatches && bodyReady && mainReady && domSettled) {
+        // A blank composer normally keeps its submit control disabled. Its
+        // presence is the correct pre-typing readiness signal; submission is
+        // verified separately after the prompt is inserted.
+        if (shared.hasUsableChatReadinessSignals({
+          urlMatches,
+          composerReady,
+          activeRun: false,
+          domSettled,
+          bodyReady,
+          mainReady,
+        })) {
           debugLog("chat_ready", {
             site: "deepseek",
             chatUrl: transcript.chatUrl || currentUrl,
@@ -4583,8 +5052,21 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
       const activeRun = isConversationStillRunning();
       const domSettled = (Date.now() - lastDomMutationAt) >= DOM_SETTLE_MS;
       const signature = `${transcript.hash}:${transcript.count}`;
+      const blocker = shared.classifyChatReadinessBlocker({
+        siteId: SITE_ADAPTER?.siteId,
+        composerReady,
+        visibleText: collectVisibleReadinessBlockerText(),
+      });
+      if (blocker) {
+        return buildChatReadinessFailure(transcript, blocker);
+      }
 
-      if (urlMatches && composerReady && !activeRun && domSettled) {
+      if (shared.hasUsableChatReadinessSignals({
+        urlMatches,
+        composerReady,
+        activeRun,
+        domSettled,
+      })) {
         stableChecks = signature === lastSignature ? stableChecks + 1 : 1;
         lastSignature = signature;
         if (stableChecks >= 2) {
@@ -4608,6 +5090,13 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
         stableChecks = 0;
         lastSignature = signature;
       }
+      lastReadinessSignals = {
+        urlMatches,
+        composerReady,
+        activeRun,
+        domSettled,
+        transcriptStable: stableChecks >= 2,
+      };
 
       await workerSleep(400);
     }
@@ -4616,16 +5105,10 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
   }
 
   const transcript = extractConversationTranscript();
-  return {
-    ok: false,
-    ready: false,
-    error: "Timed out waiting for the conversation to become ready.",
-    chatUrl: transcript.chatUrl,
-    chatId: transcript.chatId,
-    transcriptHash: transcript.hash,
-    transcriptCount: transcript.count,
-    messages: mapTranscriptToRelayMessages(transcript),
-  };
+  return buildChatReadinessFailure(
+    transcript,
+    shared.classifyChatReadinessTimeout(lastReadinessSignals),
+  );
 }
 
 /** Word-level Jaccard similarity for fuzzy text matching. */
@@ -5090,6 +5573,7 @@ async function collectHealthStatus() {
     sendControlState: describeSubmitControl(sendBtn),
     uploadControlFound: Boolean(uploadControl),
     networkHookActive: networkHookActive || hookResponded,
+    supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
     lastRequestAt: lastRequestAt || null,
     lastStreamAt: lastStreamAt || null,
     lastDiagnostic,
@@ -5097,7 +5581,13 @@ async function collectHealthStatus() {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === "PING") { sendResponse({ pong: true }); return false; }
+  if (msg.type === "PING") {
+    sendResponse({
+      pong: true,
+      supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
+    });
+    return false;
+  }
 
   if (msg.type === "HEALTH_CHECK") {
     collectHealthStatus()
@@ -5108,6 +5598,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           contentScriptAlive: true,
           siteId: SITE_ADAPTER?.siteId || null,
           url: window.location.href,
+          supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
           lastDiagnostic: buildDiagnostic({
             phase: "health_check",
             reasonCode: "health_check_failed",
@@ -5146,9 +5637,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   // [webchat] Stop ChatGPT generation by clicking the stop button
   if (msg.type === "STOP") {
+    const requestedAttemptToken = shared.attemptToken(msg.seq, msg.attempt);
+    if (
+      !_syncZoteroAttemptToken ||
+      requestedAttemptToken !== _syncZoteroAttemptToken
+    ) {
+      sendResponse({ ok: false, error: "Stale WebChat stop request ignored" });
+      return false;
+    }
     const stopBtn = findStopButton();
     if (stopBtn) {
       stopBtn.click();
+      clearSyncZoteroAttemptToken(requestedAttemptToken);
       sendResponse({ ok: true });
     } else {
       sendResponse({ ok: false, error: "Stop button not found" });
@@ -5217,6 +5717,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // If the content script is re-injected, the old context's listener is orphaned
 // and cannot receive new connections, but this prevents same-context duplication.
 let _syncZoteroPort = null;
+let _syncZoteroAttemptToken = null;
+
+function clearSyncZoteroAttemptToken(attemptToken) {
+  if (_syncZoteroAttemptToken === attemptToken) {
+    _syncZoteroAttemptToken = null;
+  }
+}
+
+async function stopDisconnectedSyncZoteroAttempt(attemptToken) {
+  try {
+    return await shared.stopDisconnectedProviderAttempt({
+      attemptToken,
+      isAttemptCurrent: (token) =>
+        _syncZoteroAttemptToken === token,
+      findStopControl: () => findStopButton(),
+      clickStopControl: (stopControl) => stopControl.click(),
+      wait: workerSleep,
+    });
+  } finally {
+    clearSyncZoteroAttemptToken(attemptToken);
+  }
+}
 
 if (!window.__syncZoteroListenerRegistered) {
   window.__syncZoteroListenerRegistered = true;
@@ -5229,9 +5751,25 @@ if (!window.__syncZoteroListenerRegistered) {
       try { _syncZoteroPort.disconnect(); } catch (_) {}
     }
     _syncZoteroPort = port;
+    let portDisconnected = false;
+    let portAttemptToken = null;
+    let portProviderMayBeRunning = false;
+    let portTerminalPosted = false;
+    const isPipelineCurrent = () =>
+      !portDisconnected &&
+      _syncZoteroPort === port &&
+      _syncZoteroAttemptToken === portAttemptToken;
 
     port.onDisconnect.addListener(() => {
+      portDisconnected = true;
       if (_syncZoteroPort === port) _syncZoteroPort = null;
+      if (_syncZoteroAttemptToken === portAttemptToken) {
+        if (portProviderMayBeRunning && !portTerminalPosted) {
+          void stopDisconnectedSyncZoteroAttempt(portAttemptToken);
+        } else {
+          clearSyncZoteroAttemptToken(portAttemptToken);
+        }
+      }
     });
 
     port.onMessage.addListener(async (msg) => {
@@ -5239,29 +5777,42 @@ if (!window.__syncZoteroListenerRegistered) {
 
       const seq = msg.seq; // track seq for end-to-end validation
       const attempt = msg.attempt || 0;
+      const pipelineAttemptToken = shared.attemptToken(seq, attempt);
+      portAttemptToken = pipelineAttemptToken;
+      _syncZoteroAttemptToken = pipelineAttemptToken;
+      portProviderMayBeRunning = false;
+      portTerminalPosted = false;
       let uploadDetected = false;
       let pdfAttachmentReceipt = null;
       let composerTextMatched = false;
       let clickAttempts = 0;
 
       try {
+        if (
+          !shared.supportsDeliveryContract(
+            SUPPORTED_DELIVERY_CONTRACTS,
+            msg.deliveryContractVersion,
+          )
+        ) {
+          throw new Error(
+            `Unsupported WebChat delivery contract version: ${String(
+              msg.deliveryContractVersion ?? "missing",
+            )}`,
+          );
+        }
         const baselineTranscript = extractConversationTranscript();
         const attachmentFingerprint = [
           msg.pdfFilename || "",
           Array.isArray(msg.images) ? msg.images.length : 0,
         ].join("|");
 
-        if (
-          !msg.pdfBase64 &&
-          (!Array.isArray(msg.images) || msg.images.length === 0)
-        ) {
-          const pendingPdfEvidence =
-            collectVisibleComposerAttachmentEvidence("");
-          if (pendingPdfEvidence.length > 0) {
-            throw new Error(
-              "Prompt-only send blocked because the web composer still contains a PDF attachment. Remove it or reload the chat tab, then try again.",
-            );
-          }
+        const pendingPdfEvidence = collectVisibleComposerPdfCardEvidence();
+        if (pendingPdfEvidence.length > 0) {
+          throw new Error(
+            msg.pdfBase64
+              ? "PDF send blocked because the web composer already contains a PDF attachment. Remove it or reload the chat tab, then try again."
+              : "Prompt-only send blocked because the web composer still contains a PDF attachment. Remove it or reload the chat tab, then try again.",
+          );
         }
 
         // Attach PDF whenever provided — the plugin controls when to send via chip state
@@ -5272,6 +5823,7 @@ if (!window.__syncZoteroListenerRegistered) {
           );
           uploadDetected = true;
         }
+        assertPipelineCurrent(isPipelineCurrent);
         if (msg.images && msg.images.length > 0) {
           console.log(`[sync-zotero] Attaching ${msg.images.length} image(s)…`);
           try {
@@ -5284,8 +5836,9 @@ if (!window.__syncZoteroListenerRegistered) {
         // Mode switching disabled — users control thinking mode directly on chatgpt.com
         await typePromptAndVerify(msg.prompt, {
           requireEnabledSendControl:
-            SITE_ADAPTER?.siteId === "chatgpt" && !uploadDetected,
+            SITE_ADAPTER?.siteId === "chatgpt",
         });
+        assertPipelineCurrent(isPipelineCurrent);
         composerTextMatched = true;
         await shared.postPhaseAndWaitForAck(port, {
           seq,
@@ -5301,6 +5854,14 @@ if (!window.__syncZoteroListenerRegistered) {
             attachmentVerificationMs:
               pdfAttachmentReceipt?.totalElapsedMs ?? null,
             attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
+            attachmentRequested: Boolean(msg.pdfBase64),
+            attachmentFilenameConfirmed: msg.pdfBase64
+              ? pdfAttachmentReceipt?.filenameConfirmed === true
+              : null,
+            attachmentReadyVerified: msg.pdfBase64
+              ? pdfAttachmentReceipt?.readyConfirmed === true
+              : null,
+            attachmentContractVerified: false,
           }),
         });
         await shared.postPhaseAndWaitForAck(port, {
@@ -5317,10 +5878,26 @@ if (!window.__syncZoteroListenerRegistered) {
             attachmentVerificationMs:
               pdfAttachmentReceipt?.totalElapsedMs ?? null,
             attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
+            attachmentRequested: Boolean(msg.pdfBase64),
+            attachmentFilenameConfirmed: msg.pdfBase64
+              ? pdfAttachmentReceipt?.filenameConfirmed === true
+              : null,
+            attachmentReadyVerified: msg.pdfBase64
+              ? pdfAttachmentReceipt?.readyConfirmed === true
+              : null,
+            attachmentContractVerified: false,
           }),
         });
+        assertPipelineCurrent(isPipelineCurrent);
 
-        const submission = await submitMessageAndVerify(msg.prompt);
+        // The durable submit-start acknowledgement is the boundary after which
+        // the website may start generating. An unexpected disconnect must
+        // retain this exact attempt long enough to stop that provider run.
+        portProviderMayBeRunning = true;
+        const submission = await submitMessageAndVerify(
+          msg.prompt,
+          isPipelineCurrent,
+        );
         clickAttempts = Number(submission?.clickAttempts) || clickAttempts;
         port.postMessage({
           type: "phase",
@@ -5339,6 +5916,14 @@ if (!window.__syncZoteroListenerRegistered) {
             attachmentVerificationMs:
               pdfAttachmentReceipt?.totalElapsedMs ?? null,
             attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
+            attachmentRequested: Boolean(msg.pdfBase64),
+            attachmentFilenameConfirmed: msg.pdfBase64
+              ? pdfAttachmentReceipt?.filenameConfirmed === true
+              : null,
+            attachmentReadyVerified: msg.pdfBase64
+              ? pdfAttachmentReceipt?.readyConfirmed === true
+              : null,
+            attachmentContractVerified: false,
           }),
         });
 
@@ -5352,11 +5937,20 @@ if (!window.__syncZoteroListenerRegistered) {
           {
             ...submission,
             pdfAttachmentReceipt,
+            composerTextMatched,
+            uploadDetected,
+            clickAttempts,
           },
           RESPONSE_TIMEOUT_MS,
+          isPipelineCurrent,
+          () => {
+            portTerminalPosted = true;
+            portProviderMayBeRunning = false;
+          },
         );
 
       } catch (err) {
+        if (err?.name === "PipelineCancelled") return;
         try {
           port.postMessage({
             type: "error",
@@ -5375,6 +5969,14 @@ if (!window.__syncZoteroListenerRegistered) {
               attachmentVerificationMs:
                 pdfAttachmentReceipt?.totalElapsedMs ?? null,
               attachmentPreviewVerified: Boolean(pdfAttachmentReceipt),
+              attachmentRequested: Boolean(msg.pdfBase64),
+              attachmentFilenameConfirmed: msg.pdfBase64
+                ? pdfAttachmentReceipt?.filenameConfirmed === true
+                : null,
+              attachmentReadyVerified: msg.pdfBase64
+                ? pdfAttachmentReceipt?.readyConfirmed === true
+                : null,
+              attachmentContractVerified: false,
             }),
           });
         } catch (_) {}

@@ -13,24 +13,26 @@
 (function () {
   "use strict";
 
-  const COMPOSER_BRIDGE_VERSION = 1;
+  const COMPOSER_BRIDGE_VERSION = 2;
+  const COMPOSER_BRIDGE_SETTLE_TIMEOUT_MS = 750;
   if (
     (window.__syncZoteroComposerBridgeVersion || 0) <
     COMPOSER_BRIDGE_VERSION
   ) {
     window.__syncZoteroComposerBridgeVersion = COMPOSER_BRIDGE_VERSION;
-    window.addEventListener("message", (event) => {
+    window.addEventListener("message", async (event) => {
       const payload = event.data;
       if (
         !payload ||
         payload.source !== "sync-zotero-content" ||
-        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT" ||
+        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_V2" ||
         typeof payload.requestId !== "string"
       ) {
         return;
       }
 
       let ok = false;
+      let pasteAccepted = false;
       let actualText = "";
       let error = null;
       window.__syncZoteroLastComposerBridge = {
@@ -55,16 +57,28 @@
 
         const clipboardData = new DataTransfer();
         clipboardData.setData("text/plain", String(payload.text || ""));
-        composer.dispatchEvent(new ClipboardEvent("paste", {
+        const pasteEvent = new ClipboardEvent("paste", {
           bubbles: true,
           cancelable: true,
           composed: true,
           clipboardData,
-        }));
+        });
+        const dispatchResult = composer.dispatchEvent(pasteEvent);
+        pasteAccepted = pasteEvent.defaultPrevented || dispatchResult === false;
 
-        actualText = composer.innerText || composer.textContent || "";
-        ok = normalizeWhitespace(actualText) ===
-          normalizeWhitespace(payload.text || "");
+        // ChatGPT may apply the ProseMirror transaction after the paste event
+        // returns. Reporting failure immediately races that update: the
+        // content-script fallback then inserts the same prompt a second time.
+        // Wait briefly for the editor state and rendered DOM to agree before
+        // deciding whether a fallback is actually necessary.
+        const expectedText = normalizeWhitespace(payload.text || "");
+        const deadline = Date.now() + COMPOSER_BRIDGE_SETTLE_TIMEOUT_MS;
+        do {
+          actualText = composer.innerText || composer.textContent || "";
+          ok = composerTextMatchesPrompt(expectedText, actualText);
+          if (ok || Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } while (true);
       } catch (cause) {
         error = String(cause?.message || cause || "Composer update failed.");
       }
@@ -72,6 +86,7 @@
         ...window.__syncZoteroLastComposerBridge,
         completedAt: Date.now(),
         ok,
+        pasteAccepted,
         error,
       };
       window.__syncZoteroComposerBridgeHistory = [
@@ -83,9 +98,10 @@
 
       window.postMessage({
         source: "sync-zotero-page",
-        type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT",
+        type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V2",
         requestId: payload.requestId,
         ok,
+        pasteAccepted,
         actualText,
         error,
       }, "*");
@@ -126,6 +142,14 @@
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  function composerTextMatchesPrompt(promptText, composerText) {
+    const expected = normalizeWhitespace(promptText);
+    const actual = normalizeWhitespace(composerText);
+    if (expected === actual) return true;
+    const collapse = (text) => text.replace(/\s+/g, " ").trim();
+    return collapse(expected) === collapse(actual);
   }
 
   function normalizeAssistantText(text) {

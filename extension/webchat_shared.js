@@ -27,6 +27,31 @@
     return collapse(a) === collapse(b);
   }
 
+  function composerBridgeAllowsSynchronousFallback(result) {
+    return Boolean(
+      result?.handled === true &&
+        result?.applied !== true &&
+        result?.pasteAccepted !== true,
+    );
+  }
+
+  function composerBridgeWriteTransition(result) {
+    const allowSynchronousFallback =
+      composerBridgeAllowsSynchronousFallback(result);
+    return {
+      allowSynchronousFallback,
+      pendingBridgeCommit: !allowSynchronousFallback,
+    };
+  }
+
+  function composerPromptVerificationPolicy(pendingBridgeCommit) {
+    const pending = pendingBridgeCommit === true;
+    return {
+      matchTimeoutMs: pending ? 10000 : 300,
+      allowRetry: !pending,
+    };
+  }
+
   function normalizeAttachmentEvidence(text) {
     return String(text || "")
       .normalize("NFC")
@@ -68,6 +93,48 @@
     return false;
   }
 
+  function stripElidedFilenameEvidence(
+    normalizedEvidence,
+    normalizedFilename,
+  ) {
+    let remaining = normalizedEvidence;
+    if (normalizedFilename.length <= MIN_ELIDED_FILENAME_PREFIX_LENGTH) {
+      return remaining;
+    }
+
+    let searchFrom = 0;
+    for (;;) {
+      const elisions = /…|\.\.\./g;
+      elisions.lastIndex = searchFrom;
+      const match = elisions.exec(remaining);
+      if (!match) return remaining;
+      const beforeElision = remaining.slice(0, match.index);
+      let matchedPrefixLength = 0;
+      for (
+        let prefixLength = Math.min(
+          beforeElision.length,
+          normalizedFilename.length,
+        );
+        prefixLength >= MIN_ELIDED_FILENAME_PREFIX_LENGTH;
+        prefixLength--
+      ) {
+        if (beforeElision.endsWith(normalizedFilename.slice(0, prefixLength))) {
+          matchedPrefixLength = prefixLength;
+          break;
+        }
+      }
+      if (matchedPrefixLength === 0) {
+        searchFrom = match.index + match[0].length;
+        continue;
+      }
+      const filenameStart = match.index - matchedPrefixLength;
+      remaining = `${remaining.slice(0, filenameStart)} ${remaining.slice(
+        match.index + match[0].length,
+      )}`;
+      searchFrom = 0;
+    }
+  }
+
   function attachmentEvidenceMatchesFilename(evidence, expectedFilename) {
     const normalizedEvidence = normalizeAttachmentEvidence(evidence);
     const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
@@ -88,16 +155,68 @@
     return providerDuplicateName.test(normalizedEvidence);
   }
 
+  function attachmentStatusEvidence(evidence, expectedFilename = "") {
+    let normalizedEvidence = normalizeAttachmentEvidence(evidence);
+    const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
+    if (!normalizedFilename) return normalizedEvidence;
+
+    normalizedEvidence = normalizedEvidence
+      .split(normalizedFilename)
+      .join(" ");
+    const pdfMatch = normalizedFilename.match(/^(.*)(\.pdf)$/);
+    if (pdfMatch) {
+      const escapeRegExp = (value) =>
+        value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      normalizedEvidence = normalizedEvidence.replace(
+        new RegExp(
+          `${escapeRegExp(pdfMatch[1])}\\s*\\(\\d+\\)${escapeRegExp(pdfMatch[2])}(?:\\b|$)`,
+          "gi",
+        ),
+        " ",
+      );
+    }
+    normalizedEvidence = stripElidedFilenameEvidence(
+      normalizedEvidence,
+      normalizedFilename,
+    );
+    return normalizedEvidence.replace(/\s+/g, " ").trim();
+  }
+
   function attachmentEvidenceIsReady(evidence, expectedFilename) {
     if (!attachmentEvidenceMatchesFilename(evidence, expectedFilename)) {
       return false;
     }
-    const normalizedEvidence = normalizeAttachmentEvidence(evidence);
+    const normalizedEvidence = attachmentStatusEvidence(
+      evidence,
+      expectedFilename,
+    );
     return !(
       /\b(?:parsing|uploading|processing|scanning|reading)\b/.test(
         normalizedEvidence,
       ) ||
       /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
+        normalizedEvidence,
+      ) ||
+      attachmentEvidenceHasFailure(evidence, expectedFilename)
+    );
+  }
+
+  function attachmentEvidenceHasFailure(evidence, expectedFilename = "") {
+    if (
+      expectedFilename &&
+      !attachmentEvidenceMatchesFilename(evidence, expectedFilename)
+    ) {
+      return false;
+    }
+    const normalizedEvidence = attachmentStatusEvidence(
+      evidence,
+      expectedFilename,
+    );
+    return (
+      /\b(?:upload\s+failed|failed\s+to\s+upload|could\s+not\s+upload|couldn't\s+upload|unsupported|file\s+too\s+large|error)\b/.test(
+        normalizedEvidence,
+      ) ||
+      /(?:上传失败|无法上传|不支持|文件过大|错误)/.test(
         normalizedEvidence,
       )
     );
@@ -120,10 +239,275 @@
     );
   }
 
-  function hasPendingPdfEvidence(evidenceList) {
-    return (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) =>
-      /\.pdf(?:\b|$)/i.test(normalizeAttachmentEvidence(evidence)),
+  function hasPendingPdfEvidence(
+    evidenceList,
+    hasExplicitFileControl = false,
+  ) {
+    return (Array.isArray(evidenceList) ? evidenceList : []).some((evidence) => {
+      const normalizedEvidence = normalizeAttachmentEvidence(evidence);
+      if (/\.pdf(?:\b|$)/i.test(normalizedEvidence)) return true;
+      return Boolean(
+        /\bpdf\b/i.test(normalizedEvidence) &&
+          attachmentEvidenceHasFileCardSignal(
+            normalizedEvidence,
+            hasExplicitFileControl,
+          ),
+      );
+    });
+  }
+
+  function supportsDeliveryContract(supportedVersions, requiredVersion) {
+    const required = Number(requiredVersion);
+    if (!Number.isInteger(required) || required <= 0) return false;
+    return (Array.isArray(supportedVersions) ? supportedVersions : []).some(
+      (version) => Number(version) === required,
     );
+  }
+
+  function contentScriptMeetsDeliveryContractRequirement(
+    capabilityProbe,
+    requiredVersion,
+  ) {
+    if (capabilityProbe?.pong !== true) return false;
+    if (
+      requiredVersion === undefined ||
+      requiredVersion === null ||
+      Number(requiredVersion) === 0
+    ) {
+      return true;
+    }
+    return supportsDeliveryContract(
+      capabilityProbe.supportedDeliveryContracts,
+      requiredVersion,
+    );
+  }
+
+  function buildExtensionStatusReport({
+    chatTabAlive = false,
+    chatUrl = null,
+    targetSiteId = null,
+    capabilityProbe = null,
+    health = null,
+  } = {}) {
+    const probeAlive = capabilityProbe?.pong === true;
+    const healthAlive = health?.contentScriptAlive === true;
+    const supportedDeliveryContracts = probeAlive
+      ? capabilityProbe.supportedDeliveryContracts
+      : health?.supportedDeliveryContracts;
+    return {
+      chatTabAlive: Boolean(chatTabAlive),
+      chatUrl: chatUrl || null,
+      siteId: health?.siteId || targetSiteId || null,
+      url: health?.url || chatUrl || null,
+      contentScriptAlive: probeAlive || healthAlive,
+      mainWorldInjected: health?.mainWorldInjected === true,
+      composerFound: health?.composerFound === true,
+      sendControlState: health?.sendControlState || null,
+      uploadControlFound: health?.uploadControlFound === true,
+      networkHookActive: health?.networkHookActive === true,
+      supportedDeliveryContracts: Array.isArray(
+        supportedDeliveryContracts,
+      )
+        ? supportedDeliveryContracts
+        : [],
+      lastRequestAt: health?.lastRequestAt || null,
+      lastStreamAt: health?.lastStreamAt || null,
+      lastDiagnostic: health?.lastDiagnostic || null,
+    };
+  }
+
+  function classifyChatReadinessBlocker({
+    siteId = null,
+    visibleText = "",
+  } = {}) {
+    const normalized = String(visibleText || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    if (!normalized) return null;
+    const siteLabel = String(siteId || "chat site").toLowerCase() === "chatgpt"
+      ? "ChatGPT"
+      : "The chat site";
+    if (
+      /too many requests/.test(normalized) &&
+      /(?:requests too quickly|temporarily limited|rate.?limit)/.test(
+        normalized,
+      )
+    ) {
+      return {
+        reasonCode: "site_rate_limited",
+        message: `${siteLabel} is temporarily rate-limited; no prompt or PDF was sent.`,
+      };
+    }
+    if (
+      /(?:verify (?:that )?you are human|checking your browser|captcha)/.test(
+        normalized,
+      )
+    ) {
+      return {
+        reasonCode: "human_verification_required",
+        message: `${siteLabel} requires human verification; no prompt or PDF was sent.`,
+      };
+    }
+    if (
+      /\blog in\b/.test(normalized) &&
+      /\bsign up\b/.test(normalized)
+    ) {
+      return {
+        reasonCode: "authentication_required",
+        message: `${siteLabel} requires sign-in; no prompt or PDF was sent.`,
+      };
+    }
+    return null;
+  }
+
+  function hasUsableChatReadinessSignals({
+    urlMatches = true,
+    composerReady = false,
+    activeRun = false,
+    domSettled = false,
+    bodyReady = true,
+    mainReady = true,
+  } = {}) {
+    return Boolean(
+      urlMatches &&
+        composerReady &&
+        !activeRun &&
+        domSettled &&
+        bodyReady &&
+        mainReady
+    );
+  }
+
+  function classifyChatReadinessTimeout({
+    urlMatches = true,
+    composerReady = false,
+    activeRun = false,
+    domSettled = false,
+    transcriptStable = false,
+  } = {}) {
+    if (!urlMatches) {
+      return {
+        reasonCode: "conversation_url_mismatch",
+        message: "The chat tab did not reach the requested conversation; no prompt or PDF was sent.",
+      };
+    }
+    if (!composerReady) {
+      return {
+        reasonCode: "composer_not_ready",
+        message: "The chat composer did not become available; no prompt or PDF was sent.",
+      };
+    }
+    if (activeRun) {
+      return {
+        reasonCode: "prior_turn_still_running",
+        message: "The previous chat turn is still running; no new prompt or PDF was sent.",
+      };
+    }
+    if (!domSettled) {
+      return {
+        reasonCode: "chat_dom_unstable",
+        message: "The chat page did not finish rendering; no prompt or PDF was sent.",
+      };
+    }
+    if (!transcriptStable) {
+      return {
+        reasonCode: "transcript_unstable",
+        message: "The chat transcript did not stabilize; no prompt or PDF was sent.",
+      };
+    }
+    return {
+      reasonCode: "conversation_not_ready",
+      message: "The conversation did not become ready; no prompt or PDF was sent.",
+    };
+  }
+
+  function canUseDeepSeekQuiescentCompletion(input) {
+    return Boolean(
+      input?.siteId === "deepseek" &&
+        input?.activeRun !== true &&
+        input?.stopControlVisible !== true &&
+        input?.busyComposer !== true &&
+        (input?.hasRequestContext === true ||
+          input?.hasAssistantTurn === true) &&
+        input?.attachmentContractVerified === true &&
+        input?.terminalEvidence === true &&
+        Number(input?.quietSinceMs) >= Number(input?.quietThresholdMs) &&
+        input?.completionPhase !== "verified_done",
+    );
+  }
+
+  async function stopSubmittedProviderAttempt({
+    submitted,
+    seq,
+    attempt,
+    sendStop,
+    timeoutMs = 2000,
+  }) {
+    if (submitted !== true) {
+      return { requested: false, acknowledged: false };
+    }
+    const message = {
+      type: "STOP",
+      seq: Number(seq) || 0,
+      attempt: Number(attempt) || 0,
+    };
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeoutId = null;
+      const finish = (acknowledged) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        resolve({ requested: true, acknowledged: acknowledged === true });
+      };
+      timeoutId = setTimeout(
+        () => finish(false),
+        Math.max(1, Number(timeoutMs) || 2000),
+      );
+      try {
+        sendStop(message, (response) => finish(response?.ok === true));
+      } catch (_) {
+        finish(false);
+      }
+    });
+  }
+
+  async function stopDisconnectedProviderAttempt({
+    attemptToken,
+    isAttemptCurrent,
+    findStopControl,
+    clickStopControl,
+    wait,
+    now = () => Date.now(),
+    timeoutMs = 5000,
+    pollIntervalMs = 100,
+  }) {
+    if (
+      !attemptToken ||
+      typeof isAttemptCurrent !== "function" ||
+      typeof findStopControl !== "function" ||
+      typeof clickStopControl !== "function" ||
+      typeof wait !== "function"
+    ) {
+      return { requested: false, acknowledged: false, attempts: 0 };
+    }
+
+    const deadline = now() + Math.max(1, Number(timeoutMs) || 5000);
+    const intervalMs = Math.max(1, Number(pollIntervalMs) || 100);
+    let attempts = 0;
+    while (isAttemptCurrent(attemptToken) && now() <= deadline) {
+      attempts += 1;
+      const stopControl = findStopControl();
+      if (stopControl) {
+        clickStopControl(stopControl);
+        return { requested: true, acknowledged: true, attempts };
+      }
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) break;
+      await wait(Math.min(intervalMs, remainingMs));
+    }
+    return { requested: true, acknowledged: false, attempts };
   }
 
   function attachmentListContainsExpectedFilename(
@@ -133,6 +517,57 @@
     return (Array.isArray(attachments) ? attachments : []).some((attachment) =>
       attachmentEvidenceMatchesFilename(attachment, expectedFilename),
     );
+  }
+
+  function classifySubmittedPdfContract(
+    attachments,
+    expectedFilename = "",
+  ) {
+    const normalizedAttachments = (Array.isArray(attachments)
+      ? attachments
+      : [])
+      .map((attachment) => String(attachment || "").trim())
+      .filter(Boolean);
+    const attachmentRequested = Boolean(String(expectedFilename || "").trim());
+    const isPdfAttachment = (attachment) =>
+      /\.pdf(?:\b|$)/i.test(normalizeAttachmentEvidence(attachment)) ||
+      /\bpdf\b/i.test(normalizeAttachmentEvidence(attachment)) ||
+      (attachmentRequested &&
+        attachmentEvidenceMatchesFilename(attachment, expectedFilename));
+    const isImageAttachment = (attachment) =>
+      /^(?:image(?:_\d+)?|.+\.(?:png|jpe?g|gif|webp|heic))$/i.test(
+        normalizeAttachmentEvidence(attachment),
+      );
+    const pdfAttachments = normalizedAttachments.filter(isPdfAttachment);
+    const unidentifiedAttachments = normalizedAttachments.filter(
+      (attachment) =>
+        !isPdfAttachment(attachment) && !isImageAttachment(attachment),
+    );
+    const filenameMatched = attachmentRequested
+      ? attachmentListContainsExpectedFilename(
+        pdfAttachments,
+        expectedFilename,
+      )
+      : null;
+    const matchedPdfCount = attachmentRequested
+      ? pdfAttachments.filter((attachment) =>
+        attachmentEvidenceMatchesFilename(attachment, expectedFilename),
+      ).length
+      : 0;
+
+    return {
+      attachmentRequested,
+      attachmentCount: normalizedAttachments.length,
+      pdfAttachmentCount: pdfAttachments.length,
+      filenameMatched,
+      contractVerified: attachmentRequested
+        ? filenameMatched === true &&
+          matchedPdfCount === 1 &&
+          pdfAttachments.length === 1 &&
+          unidentifiedAttachments.length === 0
+        : pdfAttachments.length === 0 &&
+          unidentifiedAttachments.length === 0,
+    };
   }
 
   function conversationMessagesAfterBaseline(
@@ -251,20 +686,13 @@
   }
 
   /**
-   * Wait for the site to accept the attachment, then for it to report the file
-   * as ready.
+   * Confirm one specific attachment before submission.
    *
-   * We dropped exactly one file into a composer whose prior cards the caller
-   * captured, and readState reports only the cards that were not there before,
-   * so the question that matters is "did a new file card appear?", not "is it
-   * labelled the way we expect". Sites shorten, translate, and re-render file
-   * names, and every name check is a chance to reject an upload that worked.
-   * A new card therefore counts as acceptance on its own; matching the expected
-   * filename only upgrades the result to filenameConfirmed.
-   *
-   * Readiness is best-effort either way: a card that never reports itself ready
-   * downgrades to readyConfirmed: false rather than failing a send whose file is
-   * already on screen.
+   * A generic new card is intentionally insufficient: it could be an unrelated
+   * file, a stale UI replacement, or a failed optimistic preview. The expected
+   * filename must be identifiable (including the provider's supported elision
+   * and duplicate-name forms), free of failure/progress state, and continuously
+   * present for a quiet window. Ambiguous evidence fails closed.
    */
   async function confirmAttachmentAcceptedThenReady({
     baselineEvidence = [],
@@ -275,7 +703,11 @@
     acceptTimeoutMs = 15000,
     readyTimeoutMs = 30000,
     pollIntervalMs = 100,
+    readyQuietWindowMs = 750,
   } = {}) {
+    if (!String(expectedFilename || "").trim()) {
+      throw new TypeError("expectedFilename is required");
+    }
     if (typeof readState !== "function") {
       throw new TypeError("readState must be a function");
     }
@@ -291,6 +723,14 @@
         const state = (await readState()) || {};
         const evidence = Array.isArray(state.evidence) ? state.evidence : [];
         const newCards = Array.isArray(state.newCards) ? state.newCards : [];
+        const failedEvidence = evidence.find((entry) =>
+          attachmentEvidenceHasFailure(entry, expectedFilename),
+        );
+        if (failedEvidence) {
+          throw new Error(
+            `The website reported that "${expectedFilename}" failed to upload.`,
+          );
+        }
         const satisfied = isSatisfied(evidence, newCards);
         if (satisfied) return satisfied;
         const currentTime = now();
@@ -320,12 +760,6 @@
             filenameConfirmed: true,
           };
         }
-        if (newCards.length > 0) {
-          return {
-            evidence: newCards[newCards.length - 1] || expectedFilename,
-            filenameConfirmed: false,
-          };
-        }
         return null;
       },
     );
@@ -336,39 +770,42 @@
       );
     }
 
+    let readySince = null;
+    const quietWindowMs = Math.max(0, Number(readyQuietWindowMs) || 0);
     const readiness = await poll(
       now() + Math.max(0, Number(readyTimeoutMs) || 0),
-      (evidence, newCards) => {
-        if (acceptance.filenameConfirmed) {
-          if (
-            hasNewExpectedAttachmentEvidence({
-              baselineEvidence,
-              currentEvidence: evidence,
-              expectedFilename,
-              requireReady: true,
-            })
-          ) {
-            return {
-              evidence:
-                evidence.find((entry) =>
-                  attachmentEvidenceIsReady(entry, expectedFilename),
-                ) || acceptance.evidence,
-            };
-          }
+      (evidence) => {
+        const ready = hasNewExpectedAttachmentEvidence({
+          baselineEvidence,
+          currentEvidence: evidence,
+          expectedFilename,
+          requireReady: true,
+        });
+        if (!ready) {
+          readySince = null;
           return null;
         }
-        // Nothing here identifies the file, so the best available signal that
-        // the upload finished is that no card is still reporting progress.
-        return newCards.length > 0 && newCards.every(attachmentCardIsSettled)
-          ? { evidence: newCards[newCards.length - 1] || acceptance.evidence }
-          : null;
+        if (readySince === null) readySince = now();
+        if (now() - readySince < quietWindowMs) return null;
+        return {
+          evidence:
+            evidence.find((entry) =>
+              attachmentEvidenceIsReady(entry, expectedFilename),
+            ) || acceptance.evidence,
+        };
       },
     );
 
+    if (!readiness) {
+      throw new Error(
+        `The website did not confirm that "${expectedFilename}" was ready.`,
+      );
+    }
+
     return {
-      evidence: readiness?.evidence || acceptance.evidence,
-      filenameConfirmed: acceptance.filenameConfirmed,
-      readyConfirmed: Boolean(readiness),
+      evidence: readiness.evidence || acceptance.evidence,
+      filenameConfirmed: true,
+      readyConfirmed: true,
       elapsedMs: Math.max(0, now() - startedAt),
     };
   }
@@ -477,6 +914,26 @@
     );
   }
 
+  function hasVerifiedTerminalEvidence(signals = {}) {
+    if (
+      Number(signals.activeConversationStreamCount || 0) > 0 ||
+      signals.stopButtonVisible === true ||
+      signals.busyComposer === true
+    ) {
+      return false;
+    }
+
+    // ChatGPT's per-turn action bar belongs to the rendered assistant turn and
+    // appears only after generation finishes. Transport silence or an SSE
+    // terminator alone is insufficient because the app can navigate or
+    // re-render while a stale answer prefix remains in the DOM.
+    if (String(signals.siteId || "").toLowerCase() === "chatgpt") {
+      return signals.actionBarVisible === true;
+    }
+
+    return signals.actionBarVisible === true || signals.sseDone === true;
+  }
+
   function completionTimingForSignals(signals = {}) {
     if (signals.toolUseDetected === true) {
       return {
@@ -579,6 +1036,7 @@
     const activeRun = sample?.activeRun === true;
     const hasUserTurn = sample?.hasUserTurn === true;
     const hasAssistantTurn = sample?.hasAssistantTurn === true;
+    const terminalEvidence = sample?.terminalEvidence === true;
     const forceIncomplete = sample?.forceIncomplete === true;
 
     if (answerRevision !== tracker.lastAnswerRevision) {
@@ -611,7 +1069,7 @@
       tracker.phase = "incomplete";
       tracker.candidateSince = null;
       tracker.verificationStartedAt = null;
-    } else if (answerVisible && !activeRun) {
+    } else if (answerVisible && !activeRun && terminalEvidence) {
       tracker.phase = "candidate_done";
       if (previousPhase !== "candidate_done") {
         tracker.candidateSince = nowMs;
@@ -783,6 +1241,79 @@
     throw new Error("Content-script message retry exhausted unexpectedly.");
   }
 
+  function classifyRelayAttemptState(state, { seq, attempt } = {}) {
+    const expectedSeq = Math.max(0, Math.floor(Number(seq) || 0));
+    const expectedAttempt = Math.max(0, Math.floor(Number(attempt) || 0));
+    const currentSeq = Math.max(
+      0,
+      Math.floor(Number(state?.current_seq) || 0),
+    );
+    const currentAttempt = Math.max(
+      0,
+      Math.floor(Number(state?.current_attempt) || 0),
+    );
+    const matchingResponse = Array.isArray(state?.responses)
+      ? state.responses.find((response) => {
+          if (Number(response?.seq) !== expectedSeq) return false;
+          const responseAttempt = Math.max(
+            0,
+            Math.floor(Number(response?.attempt) || 0),
+          );
+          return (
+            expectedAttempt === 0 ||
+            responseAttempt === 0 ||
+            responseAttempt === expectedAttempt
+          );
+        }) || null
+      : null;
+
+    if (matchingResponse) {
+      return {
+        active: false,
+        reason: "terminal_response",
+        error:
+          typeof matchingResponse.error === "string"
+            ? matchingResponse.error
+            : null,
+        completionReason: matchingResponse.completion_reason || null,
+      };
+    }
+    if (currentSeq !== expectedSeq) {
+      return {
+        active: false,
+        reason: "seq_mismatch",
+        error: null,
+        completionReason: null,
+      };
+    }
+    if (
+      expectedAttempt > 0 &&
+      currentAttempt > 0 &&
+      currentAttempt !== expectedAttempt
+    ) {
+      return {
+        active: false,
+        reason: "attempt_mismatch",
+        error: null,
+        completionReason: null,
+      };
+    }
+    if (state?.status === "running") {
+      return {
+        active: true,
+        reason: null,
+        error: null,
+        completionReason: null,
+      };
+    }
+    return {
+      active: false,
+      reason: `relay_${String(state?.status || "unknown")}`,
+      error: null,
+      completionReason: state?.completion_reason || null,
+    };
+  }
+
   function postPhaseAndWaitForAck(
     port,
     {
@@ -875,13 +1406,25 @@
     attachmentListContainsExpectedFilename,
     attachmentEvidenceMatchesFilename,
     attachmentEvidenceHasFileCardSignal,
+    attachmentEvidenceHasFailure,
     attachmentEvidenceIsReady,
     attachmentCardIsSettled,
     attemptToken,
     canReuseReadyTranscriptForScrape,
+    buildExtensionStatusReport,
+    classifyChatReadinessBlocker,
+    hasUsableChatReadinessSignals,
+    classifyChatReadinessTimeout,
+    classifyRelayAttemptState,
     classifyContentScriptMessageError,
+    classifySubmittedPdfContract,
+    canUseDeepSeekQuiescentCompletion,
     completionTimingForSignals,
     composerTextMatchesPrompt,
+    composerBridgeAllowsSynchronousFallback,
+    composerBridgeWriteTransition,
+    composerPromptVerificationPolicy,
+    contentScriptMeetsDeliveryContractRequirement,
     conversationMessagesAfterBaseline,
     contentScriptMessageRetryDelayMs,
     conversationUrlsMatch,
@@ -891,6 +1434,7 @@
     hasPendingPdfEvidence,
     hasDeliverySignal,
     hasStrongTransportCompletionSignal,
+    hasVerifiedTerminalEvidence,
     isPlaceholderAssistantText,
     isRecoverableContentScriptMessageError,
     isRetrySafeContentScriptMessage,
@@ -898,6 +1442,9 @@
     normalizeConversationUrl,
     postPhaseAndWaitForAck,
     retryRecoverableContentScriptMessage,
+    stopDisconnectedProviderAttempt,
+    stopSubmittedProviderAttempt,
+    supportsDeliveryContract,
     tabNeedsActivation,
     tabNeedsLifecycleReload,
     terminalAnswerSnapshotIsStable,
