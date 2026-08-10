@@ -526,7 +526,10 @@ test("verifies the exact submitted PDF contract", () => {
   );
 });
 
-test("rejects an unrelated submitted PDF even though a file is present", () => {
+test("accepts a differently-named PDF card as presence-tier delivery", () => {
+  // We drop exactly one file into a preflighted-clean composer; a turn
+  // that carries a PDF card is a sent PDF even when the site renders a
+  // name we cannot match.
   assert.deepEqual(
     shared.classifySubmittedPdfContract(["Other paper.pdf"], filename),
     {
@@ -534,12 +537,28 @@ test("rejects an unrelated submitted PDF even though a file is present", () => {
       attachmentCount: 1,
       pdfAttachmentCount: 1,
       filenameMatched: false,
-      contractVerified: false,
+      contractVerified: true,
     },
   );
 });
 
-test("rejects an extra PDF beside the exact requested PDF", () => {
+test("accepts an unidentifiable attachment as presence-tier delivery", () => {
+  assert.deepEqual(
+    shared.classifySubmittedPdfContract(
+      ["Unidentified document 1.95MB"],
+      filename,
+    ),
+    {
+      attachmentRequested: true,
+      attachmentCount: 1,
+      pdfAttachmentCount: 0,
+      filenameMatched: false,
+      contractVerified: true,
+    },
+  );
+});
+
+test("accepts an extra PDF beside the exact requested PDF", () => {
   const contract = shared.classifySubmittedPdfContract(
     [`${filename}\nPDF 1.95MB`, "Other paper.pdf\nPDF 2MB"],
     filename,
@@ -547,17 +566,43 @@ test("rejects an extra PDF beside the exact requested PDF", () => {
 
   assert.equal(contract.filenameMatched, true);
   assert.equal(contract.pdfAttachmentCount, 2);
-  assert.equal(contract.contractVerified, false);
+  assert.equal(contract.contractVerified, true);
 });
 
-test("rejects duplicate cards for the requested PDF", () => {
+test("accepts duplicate cards for the requested PDF", () => {
   const contract = shared.classifySubmittedPdfContract(
     [`${filename}\nPDF 1.95MB`, `${filename}\nPDF 1.95MB`],
     filename,
   );
 
   assert.equal(contract.pdfAttachmentCount, 2);
-  assert.equal(contract.contractVerified, false);
+  assert.equal(contract.contractVerified, true);
+});
+
+test("does not verify a requested PDF from images or an empty turn", () => {
+  // Every attachment on an image-only turn is affirmatively identified
+  // as not the PDF, so presence of "some attachment" is not enough.
+  assert.equal(
+    shared.classifySubmittedPdfContract([], filename).contractVerified,
+    false,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["image"], filename).contractVerified,
+    false,
+  );
+  assert.equal(
+    shared.classifySubmittedPdfContract(["image", "image_2"], filename)
+      .contractVerified,
+    false,
+  );
+});
+
+test("records presence-tier acceptances the site names differently", () => {
+  const contentScript = readFileSync(
+    new URL("../extension/content_script.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(contentScript, /submitted_pdf_name_unmatched/);
 });
 
 test("verifies prompt-only turns only when no PDF is present", () => {

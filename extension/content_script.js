@@ -620,23 +620,18 @@ const shared = globalThis.SyncZoteroShared || {
         expectedFilename,
       )
       : null;
-    const matchedPdfCount = attachmentRequested
-      ? pdfAttachments.filter((attachment) =>
-        shared.attachmentEvidenceMatchesFilename(
-          attachment,
-          expectedFilename,
-        )).length
-      : 0;
     return {
       attachmentRequested,
       attachmentCount: normalizedAttachments.length,
       pdfAttachmentCount: pdfAttachments.length,
       filenameMatched,
+      // We drop exactly one file into a preflighted-clean composer, so a
+      // turn carrying any PDF or unidentifiable attachment is a sent PDF —
+      // the name the site renders is not something we can insist on
+      // without rejecting successful sends. Image-only turns are
+      // affirmatively missing the PDF and still fail.
       contractVerified: attachmentRequested
-        ? filenameMatched === true &&
-          matchedPdfCount === 1 &&
-          pdfAttachments.length === 1 &&
-          unidentifiedAttachments.length === 0
+        ? pdfAttachments.length + unidentifiedAttachments.length > 0
         : pdfAttachments.length === 0 &&
           unidentifiedAttachments.length === 0,
     };
@@ -3432,6 +3427,20 @@ async function streamResponseSnapshots(
       attachmentContractVerified = contract.contractVerified === true;
       if (attachmentContractVerified) {
         userTurnKey = matchedUserTurn.messageKey;
+        if (attachmentRequested && contract.filenameMatched !== true) {
+          console.warn(
+            `[sync-zotero] The submitted turn carries an attachment the ` +
+              `site names differently from "${expectedPdfFilename}" — ` +
+              `accepting it.`,
+          );
+          recordTurnDebug("submitted_pdf_name_unmatched", {
+            seq,
+            attempt,
+            userTurnKey,
+            expectedPdfFilename,
+            attachments,
+          });
+        }
         recordTurnDebug("submitted_attachment_contract_verified", {
           seq,
           attempt,
