@@ -409,10 +409,28 @@ const shared = globalThis.SyncZoteroShared || {
       );
     }),
   supportsDeliveryContract: (supportedVersions, requiredVersion) =>
+    Number.isInteger(Number(requiredVersion)) &&
     Number(requiredVersion) > 0 &&
     (Array.isArray(supportedVersions) ? supportedVersions : []).some(
       (version) => Number(version) === Number(requiredVersion),
     ),
+  WEBCHAT_PLUGIN_OUTDATED_MESSAGE:
+    "The installed LLM for Zotero plugin is too old for this version of " +
+    "the Sync for Zotero extension. Update the LLM for Zotero plugin in " +
+    "Zotero (Tools → Plugins and Themes), then try again. " +
+    "No prompt or PDF was sent.",
+  unsupportedDeliveryContractMessage: (requestedVersion, supportedVersions) => {
+    const supported = (Array.isArray(supportedVersions) ? supportedVersions : [])
+      .map((version) => Number(version))
+      .filter((version) => Number.isInteger(version) && version > 0);
+    return (
+      `This Zotero request uses WebChat delivery contract ` +
+      `${Number(requestedVersion)}, but the installed Sync for Zotero ` +
+      `extension only supports version ${supported.join(", ") || "none"}. ` +
+      "Update the Sync for Zotero browser extension, then try again. " +
+      "No prompt or PDF was sent."
+    );
+  },
   canUseDeepSeekQuiescentCompletion: (input) => Boolean(
     input?.siteId === "deepseek" &&
       input?.activeRun !== true &&
@@ -5788,16 +5806,28 @@ if (!window.__syncZoteroListenerRegistered) {
       let clickAttempts = 0;
 
       try {
+        // Defense in depth behind the background gate: a START that
+        // reaches a content script without a usable contract version
+        // still fails with the update remedy, never a cryptic error.
+        const requestedContract = msg.deliveryContractVersion;
+        if (
+          requestedContract === undefined ||
+          requestedContract === null ||
+          Number(requestedContract) === 0
+        ) {
+          throw new Error(shared.WEBCHAT_PLUGIN_OUTDATED_MESSAGE);
+        }
         if (
           !shared.supportsDeliveryContract(
             SUPPORTED_DELIVERY_CONTRACTS,
-            msg.deliveryContractVersion,
+            requestedContract,
           )
         ) {
           throw new Error(
-            `Unsupported WebChat delivery contract version: ${String(
-              msg.deliveryContractVersion ?? "missing",
-            )}`,
+            shared.unsupportedDeliveryContractMessage(
+              requestedContract,
+              SUPPORTED_DELIVERY_CONTRACTS,
+            ),
           );
         }
         const baselineTranscript = extractConversationTranscript();

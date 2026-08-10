@@ -264,6 +264,33 @@
     );
   }
 
+  // Mismatch errors must name the side to update: these strings travel to
+  // the Zotero chat surface via /submit_response, which every released
+  // plugin understands, so even the oldest pairing shows the remedy.
+  const WEBCHAT_PLUGIN_OUTDATED_MESSAGE =
+    "The installed LLM for Zotero plugin is too old for this version of " +
+    "the Sync for Zotero extension. Update the LLM for Zotero plugin in " +
+    "Zotero (Tools → Plugins and Themes), then try again. " +
+    "No prompt or PDF was sent.";
+
+  function unsupportedDeliveryContractMessage(
+    requestedVersion,
+    supportedVersions,
+  ) {
+    const supported = (
+      Array.isArray(supportedVersions) ? supportedVersions : []
+    )
+      .map((version) => Number(version))
+      .filter((version) => Number.isInteger(version) && version > 0);
+    return (
+      `This Zotero request uses WebChat delivery contract ` +
+      `${Number(requestedVersion)}, but the installed Sync for Zotero ` +
+      `extension only supports version ${supported.join(", ") || "none"}. ` +
+      "Update the Sync for Zotero browser extension, then try again. " +
+      "No prompt or PDF was sent."
+    );
+  }
+
   function contentScriptMeetsDeliveryContractRequirement(
     capabilityProbe,
     requiredVersion,
@@ -990,6 +1017,18 @@
     return `${Number(seq) || 0}:${Number(attempt) || 0}`;
   }
 
+  // A relay that predates per-attempt stop routing answers /poll_stop with
+  // a bare {stop} — missing or zero seq/attempt are wildcards so the click
+  // still reaches the active attempt instead of being silently dropped.
+  function stopSignalMatchesActiveAttempt(stopData, { seq, attempt } = {}) {
+    const stopSeq = Number(stopData?.seq) || 0;
+    const stopAttempt = Number(stopData?.attempt) || 0;
+    return (
+      (stopSeq === 0 || stopSeq === Number(seq)) &&
+      (stopAttempt === 0 || stopAttempt === Number(attempt))
+    );
+  }
+
   function createTurnCompletionTracker(nowMs) {
     const ts = Number.isFinite(nowMs) ? Number(nowMs) : 0;
     return {
@@ -1443,8 +1482,11 @@
     postPhaseAndWaitForAck,
     retryRecoverableContentScriptMessage,
     stopDisconnectedProviderAttempt,
+    stopSignalMatchesActiveAttempt,
     stopSubmittedProviderAttempt,
     supportsDeliveryContract,
+    unsupportedDeliveryContractMessage,
+    WEBCHAT_PLUGIN_OUTDATED_MESSAGE,
     tabNeedsActivation,
     tabNeedsLifecycleReload,
     terminalAnswerSnapshotIsStable,

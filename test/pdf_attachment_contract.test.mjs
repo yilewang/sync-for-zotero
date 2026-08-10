@@ -637,6 +637,53 @@ test("advertises the strict delivery contract from the active content script", (
     ),
   );
   assert.match(startHandler, /supportsDeliveryContract/);
+
+  // Version-mismatch failures must tell the user which side to update.
+  assert.match(
+    shared.WEBCHAT_PLUGIN_OUTDATED_MESSAGE,
+    /Update the LLM for Zotero plugin/,
+  );
+  assert.doesNotMatch(shared.WEBCHAT_PLUGIN_OUTDATED_MESSAGE, /Failed to fetch/);
+  assert.match(
+    shared.unsupportedDeliveryContractMessage(2, [1]),
+    /WebChat delivery contract 2/,
+  );
+  assert.match(
+    shared.unsupportedDeliveryContractMessage(2, [1]),
+    /only supports version 1/,
+  );
+  assert.match(
+    shared.unsupportedDeliveryContractMessage(2, [1]),
+    /Update the Sync for Zotero browser extension/,
+  );
+
+  // The background decides contract compatibility once, before any tab
+  // work, so the first delivery_contract_version reference in runPipeline
+  // must precede the content-script setup call.
+  const runPipelineBody = background.slice(
+    background.indexOf("async function runPipeline("),
+    background.indexOf("async function streamPipeline("),
+  );
+  const contractGateIndex = runPipelineBody.indexOf("delivery_contract_version");
+  assert.notEqual(contractGateIndex, -1);
+  assert.ok(
+    contractGateIndex < runPipelineBody.indexOf("ensureContentScript("),
+    "delivery-contract gate must run before content-script setup",
+  );
+  assert.match(runPipelineBody, /WEBCHAT_PLUGIN_OUTDATED_MESSAGE/);
+  assert.match(runPipelineBody, /unsupportedDeliveryContractMessage\(/);
+
+  // The content-script gate stays as defense in depth with the same
+  // actionable messages.
+  assert.match(startHandler, /WEBCHAT_PLUGIN_OUTDATED_MESSAGE/);
+  assert.match(startHandler, /unsupportedDeliveryContractMessage\(/);
+
+  // The content-script fallback shim must agree with the canonical guard.
+  const fallbackGuard = contentScript.slice(
+    contentScript.indexOf("supportsDeliveryContract: (supportedVersions"),
+    contentScript.indexOf("canUseDeepSeekQuiescentCompletion:"),
+  );
+  assert.match(fallbackGuard, /Number\.isInteger/);
 });
 
 test("keeps a synchronous contract probe authoritative when rich health fails", () => {

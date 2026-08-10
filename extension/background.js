@@ -60,6 +60,31 @@ const shared = globalThis.SyncZoteroShared || {
     (Array.isArray(supportedVersions) ? supportedVersions : []).some(
       (version) => Number(version) === Number(requiredVersion),
     ),
+  WEBCHAT_PLUGIN_OUTDATED_MESSAGE:
+    "The installed LLM for Zotero plugin is too old for this version of " +
+    "the Sync for Zotero extension. Update the LLM for Zotero plugin in " +
+    "Zotero (Tools → Plugins and Themes), then try again. " +
+    "No prompt or PDF was sent.",
+  unsupportedDeliveryContractMessage: (requestedVersion, supportedVersions) => {
+    const supported = (Array.isArray(supportedVersions) ? supportedVersions : [])
+      .map((version) => Number(version))
+      .filter((version) => Number.isInteger(version) && version > 0);
+    return (
+      `This Zotero request uses WebChat delivery contract ` +
+      `${Number(requestedVersion)}, but the installed Sync for Zotero ` +
+      `extension only supports version ${supported.join(", ") || "none"}. ` +
+      "Update the Sync for Zotero browser extension, then try again. " +
+      "No prompt or PDF was sent."
+    );
+  },
+  stopSignalMatchesActiveAttempt: (stopData, { seq, attempt } = {}) => {
+    const stopSeq = Number(stopData?.seq) || 0;
+    const stopAttempt = Number(stopData?.attempt) || 0;
+    return (
+      (stopSeq === 0 || stopSeq === Number(seq)) &&
+      (stopAttempt === 0 || stopAttempt === Number(attempt))
+    );
+  },
   contentScriptMeetsDeliveryContractRequirement: (
     capabilityProbe,
     requiredVersion,
@@ -136,6 +161,7 @@ const shared = globalThis.SyncZoteroShared || {
 };
 
 let SERVER = "http://127.0.0.1:23119/llm-for-zotero/webchat";
+const SUPPORTED_DELIVERY_CONTRACTS = Object.freeze([1]);
 const MAX_PRE_SUBMIT_RELEASES = 3;
 const MAX_CONTENT_SCRIPT_MESSAGE_ATTEMPTS = 3;
 const CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS = 30_000;
@@ -789,12 +815,10 @@ async function pollForStop() {
   if (!zoteroConnected) return;
   try {
     const data = await relayFetch(`${SERVER}/poll_stop`).then(r => r.json());
-    const stopMatchesActiveAttempt =
-      Number(data.seq || 0) === activePipelineSeq &&
-      (
-        Number(data.attempt || 0) === 0 ||
-        Number(data.attempt || 0) === activePipelineAttempt
-      );
+    const stopMatchesActiveAttempt = shared.stopSignalMatchesActiveAttempt(
+      data,
+      { seq: activePipelineSeq, attempt: activePipelineAttempt },
+    );
     if (data.stop && stopMatchesActiveAttempt && activeChatTabId !== null) {
       // Tell content script to click the stop button
       chrome.tabs.sendMessage(
@@ -1135,6 +1159,32 @@ async function runPipeline(query) {
   );
 
   try {
+    // ── Delivery-contract gate ─────────────────────────────────────
+    // Decided once here, before any tab work, so a mismatched
+    // extension/plugin pair fails with the update remedy instead of a
+    // cryptic error deep in the pipeline.
+    const requestedContract = query.delivery_contract_version;
+    if (
+      requestedContract === undefined ||
+      requestedContract === null ||
+      Number(requestedContract) === 0
+    ) {
+      throw new Error(shared.WEBCHAT_PLUGIN_OUTDATED_MESSAGE);
+    }
+    if (
+      !shared.supportsDeliveryContract(
+        SUPPORTED_DELIVERY_CONTRACTS,
+        requestedContract,
+      )
+    ) {
+      throw new Error(
+        shared.unsupportedDeliveryContractMessage(
+          requestedContract,
+          SUPPORTED_DELIVERY_CONTRACTS,
+        ),
+      );
+    }
+
     // ── Drain stale NEW_CHAT command ────────────────────────────────
     // If this query starts fresh, consume any pending NEW_CHAT command
     // so it doesn't fire after the pipeline and navigate away.

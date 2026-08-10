@@ -876,3 +876,57 @@ test("extracts only visible turns and preserves live answer content", () => {
     /\[aria-live\]/,
   );
 });
+
+test("matches relay stop signals with missing seq or attempt as wildcards", () => {
+  const active = { seq: 5, attempt: 2 };
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt({ stop: true }, active),
+    true,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt(
+      { stop: true, seq: 5, attempt: 2 },
+      active,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt(
+      { stop: true, seq: 5, attempt: 0 },
+      active,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt(
+      { stop: true, seq: 0, attempt: 0 },
+      active,
+    ),
+    true,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt({ stop: true, seq: "bogus" }, active),
+    true,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt({ stop: true, seq: 4 }, active),
+    false,
+  );
+  assert.equal(
+    shared.stopSignalMatchesActiveAttempt(
+      { stop: true, seq: 5, attempt: 1 },
+      active,
+    ),
+    false,
+  );
+});
+
+test("forwards relay stop clicks through the wildcard matcher", () => {
+  const pollForStopBody = backgroundSource.slice(
+    backgroundSource.indexOf("async function pollForStop("),
+    backgroundSource.indexOf("async function scrapeChatGPTHistory("),
+  );
+  assert.match(pollForStopBody, /shared\.stopSignalMatchesActiveAttempt\(/);
+  assert.match(pollForStopBody, /seq:\s*activePipelineSeq/);
+  assert.match(pollForStopBody, /attempt:\s*activePipelineAttempt/);
+});
