@@ -12,5 +12,8 @@
     "release:minor": "node scripts/release.mjs minor",
     "release:major": "node scripts/release.mjs major",
     "release:validate": "node scripts/release.mjs validate-tag"
+  },
+  "devDependencies": {
+    "linkedom": "^0.18.13"
   }
 }
