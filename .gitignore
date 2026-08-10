@@ -3,6 +3,9 @@ extension.pem
 *.crx
 .DS_Store
 
+# Node
+node_modules/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
