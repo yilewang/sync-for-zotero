@@ -5289,7 +5289,24 @@ function resolveLatestAssistantTurnAfterBaseline(
 function extractLatexFromKatex(el) {
   const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
   if (annotation) return annotation.textContent.trim();
+  // KaTeX rendered in html-only mode (current chatgpt.com) omits the MathML
+  // annotation; the LaTeX source then lives on an ancestor wrapper attribute.
+  const wrapper = el.closest?.("[data-math-source]");
+  const wrapperSource = wrapper?.getAttribute("data-math-source");
+  if (wrapperSource && wrapperSource.trim()) return wrapperSource.trim();
   return null;
+}
+
+/**
+ * Visible glyph text of a KaTeX element, used when no LaTeX source is
+ * recoverable — degraded plain text beats deleting the formula entirely.
+ */
+function katexVisibleText(el) {
+  const htmlPart = el.querySelector(".katex-html");
+  return ((htmlPart || el).textContent || "")
+    .replace(/​/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Very lightweight HTML → Markdown converter for ChatGPT's response format. */
@@ -5298,11 +5315,12 @@ function htmlToMarkdown(html) {
   const div = document.createElement("div");
   div.innerHTML = html;
 
-  function nodeToMd(node) {
+  function nodeToMd(node, indent = "") {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
 
     const tag = node.tagName?.toLowerCase();
-    const children = () => Array.from(node.childNodes).map(nodeToMd).join("");
+    const children = () =>
+      Array.from(node.childNodes).map((child) => nodeToMd(child, indent)).join("");
 
     // Handle KaTeX math elements before the main switch
     if (tag === "span") {
@@ -5312,17 +5330,39 @@ function htmlToMarkdown(html) {
       if (cls.includes("katex-display")) {
         const latex = extractLatexFromKatex(node);
         if (latex) return `\n$$${latex}$$\n`;
+        const visible = katexVisibleText(node);
+        if (visible) return `\n${visible}\n`;
       }
 
       // Inline math: <span class="katex"> (but not katex-display, katex-mathml, katex-html, etc.)
       if (/\bkatex\b/.test(cls) && !cls.includes("katex-")) {
         const latex = extractLatexFromKatex(node);
         if (latex) return `$${latex}$`;
+        const visible = katexVisibleText(node);
+        if (visible) return visible;
       }
 
       // Skip internal KaTeX sub-elements to avoid duplicating content
       if (cls.includes("katex-mathml") || cls.includes("katex-html")) return "";
     }
+
+    // Bare MathML (no KaTeX wrapper): prefer the annotation source over the
+    // presentation glyphs so the two don't get concatenated.
+    if (tag === "math") {
+      const annotation = node.querySelector('annotation[encoding="application/x-tex"]');
+      const latex = annotation ? annotation.textContent.trim() : "";
+      if (latex) {
+        const isDisplay = String(node.getAttribute("display") || "").toLowerCase() === "block";
+        return isDisplay ? `\n$$${latex}$$\n` : `$${latex}$`;
+      }
+    }
+
+    const listItemContent = (li, childIndent) =>
+      Array.from(li.childNodes)
+        .map((child) => nodeToMd(child, childIndent))
+        .join("")
+        .trim()
+        .replace(/\n{2,}/g, "\n");
 
     switch (tag) {
       case "h1": return `\n# ${children()}\n`;
@@ -5349,18 +5389,43 @@ function htmlToMarkdown(html) {
         return `\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
       }
       case "ul": {
-        const liContent = (li) => Array.from(li.childNodes).map(nodeToMd).join("").trim();
-        return "\n" + Array.from(node.children).map(li => `- ${liContent(li)}`).join("\n") + "\n";
+        // "- " marker → nested content aligns under two spaces
+        const childIndent = indent + "  ";
+        return "\n" + Array.from(node.children).map(li => `${indent}- ${listItemContent(li, childIndent)}`).join("\n") + "\n";
       }
       case "ol": {
-        const liContent = (li) => Array.from(li.childNodes).map(nodeToMd).join("").trim();
-        return "\n" + Array.from(node.children).map((li, i) => `${i + 1}. ${liContent(li)}`).join("\n") + "\n";
+        // "1. " marker → nested content aligns under three spaces
+        const childIndent = indent + "   ";
+        return "\n" + Array.from(node.children).map((li, i) => `${indent}${i + 1}. ${listItemContent(li, childIndent)}`).join("\n") + "\n";
       }
       case "li": return `\n- ${children()}`;
       case "a": return `[${children()}](${node.getAttribute("href") ?? ""})`;
       case "blockquote": return `\n> ${children().trim().replace(/\n/g, "\n> ")}\n`;
       case "hr": return "\n---\n";
       case "table": return `\n${tableToMd(node)}\n`;
+      case "input": {
+        // Task-list checkboxes (e.g. ChatGPT "contains-task-list" markup)
+        if (String(node.getAttribute("type") || "").toLowerCase() === "checkbox") {
+          const checked = node.hasAttribute("checked") || node.checked === true;
+          const marker = checked ? "[x]" : "[ ]";
+          const next = node.nextSibling;
+          const nextStartsWithSpace =
+            !!next && next.nodeType === Node.TEXT_NODE && /^\s/.test(next.textContent || "");
+          return nextStartsWithSpace ? marker : `${marker} `;
+        }
+        return "";
+      }
+      case "img": {
+        // Images are not synced; keep the author-provided alt text.
+        return (node.getAttribute("alt") || "").trim();
+      }
+      case "svg": {
+        // Labeled icons degrade to their label; decorative SVGs stay silent.
+        const label = (node.getAttribute("aria-label") || "").trim();
+        if (label) return label;
+        const title = node.querySelector("title");
+        return title ? (title.textContent || "").trim() : "";
+      }
       default: return children();
     }
   }
