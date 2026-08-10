@@ -727,19 +727,22 @@ const shared = globalThis.SyncZoteroShared || {
       while (true) {
         const state = (await readState()) || {};
         const evidence = state.evidence || [];
+        const newCards = state.newCards || [];
         if (
           evidence.some((entry) =>
             shared.attachmentEvidenceHasFailure(entry, expectedFilename),
+          ) ||
+          newCards.some((card) =>
+            shared.attachmentEvidenceHasFailure(
+              shared.attachmentStatusEvidence(card, expectedFilename),
+            ),
           )
         ) {
           throw new Error(
             `The website reported that "${expectedFilename}" failed to upload.`,
           );
         }
-        const satisfied = isSatisfied(
-          evidence,
-          state.newCards || [],
-        );
+        const satisfied = isSatisfied(evidence, newCards);
         if (satisfied) return satisfied;
         if (Date.now() >= deadline) return null;
         await wait(Math.min(pollIntervalMs, deadline - Date.now()));
@@ -768,6 +771,12 @@ const shared = globalThis.SyncZoteroShared || {
             filenameConfirmed: true,
           };
         }
+        if (newCards.length > 0) {
+          return {
+            evidence: newCards[newCards.length - 1] || expectedFilename,
+            filenameConfirmed: false,
+          };
+        }
         return null;
       },
     );
@@ -781,41 +790,59 @@ const shared = globalThis.SyncZoteroShared || {
     const quietWindowMs = Math.max(0, Number(readyQuietWindowMs) || 0);
     const readiness = await poll(
       Date.now() + readyTimeoutMs,
-      (evidence) => {
-        const ready = shared.hasNewExpectedAttachmentEvidence({
-          baselineEvidence,
-          currentEvidence: evidence,
-          expectedFilename,
-          requireReady: true,
-        });
-        if (!ready) {
-          readySince = null;
-          return null;
-        }
-        if (readySince === null) readySince = Date.now();
-        if (Date.now() - readySince < quietWindowMs) return null;
-        return {
-          evidence:
-            evidence.find((entry) =>
-              shared.attachmentEvidenceIsReady(
-                entry,
-                expectedFilename,
-              ),
-            ) || acceptance.evidence,
-        };
-      },
+      acceptance.filenameConfirmed
+        ? (evidence) => {
+            const ready = shared.hasNewExpectedAttachmentEvidence({
+              baselineEvidence,
+              currentEvidence: evidence,
+              expectedFilename,
+              requireReady: true,
+            });
+            if (!ready) {
+              readySince = null;
+              return null;
+            }
+            if (readySince === null) readySince = Date.now();
+            if (Date.now() - readySince < quietWindowMs) return null;
+            return {
+              evidence:
+                evidence.find((entry) =>
+                  shared.attachmentEvidenceIsReady(
+                    entry,
+                    expectedFilename,
+                  ),
+                ) || acceptance.evidence,
+            };
+          }
+        : (evidence, newCards) => {
+            // Nothing here identifies the file, so the best available
+            // signal that the upload finished is that no card is still
+            // reporting progress.
+            const settled =
+              newCards.length > 0 &&
+              newCards.every(shared.attachmentCardIsSettled);
+            if (!settled) {
+              readySince = null;
+              return null;
+            }
+            if (readySince === null) readySince = Date.now();
+            if (Date.now() - readySince < quietWindowMs) return null;
+            return {
+              evidence: newCards[newCards.length - 1] || acceptance.evidence,
+            };
+          },
     );
 
-    if (!readiness) {
+    if (!readiness && acceptance.filenameConfirmed) {
       throw new Error(
         `The website did not confirm that "${expectedFilename}" was ready.`,
       );
     }
 
     return {
-      evidence: readiness.evidence || acceptance.evidence,
-      filenameConfirmed: true,
-      readyConfirmed: true,
+      evidence: readiness?.evidence || acceptance.evidence,
+      filenameConfirmed: acceptance.filenameConfirmed,
+      readyConfirmed: Boolean(readiness),
       elapsedMs: Date.now() - startedAt,
     };
   },

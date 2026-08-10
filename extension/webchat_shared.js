@@ -713,13 +713,17 @@
   }
 
   /**
-   * Confirm one specific attachment before submission.
+   * Confirm one specific attachment before submission, by tiered evidence.
    *
-   * A generic new card is intentionally insufficient: it could be an unrelated
-   * file, a stale UI replacement, or a failed optimistic preview. The expected
-   * filename must be identifiable (including the provider's supported elision
-   * and duplicate-name forms), free of failure/progress state, and continuously
-   * present for a quiet window. Ambiguous evidence fails closed.
+   * The question that matters is "did the file reach the composer?", not
+   * "is it labelled the way we expect" — sites shorten, translate, and
+   * re-render file names. Evidence matching the expected filename (with
+   * elision and duplicate-name forms) upgrades the receipt to
+   * filenameConfirmed and must reach a sustained ready state; any new card
+   * since the pre-drop node-identity baseline is otherwise accepted on its
+   * own with the name unconfirmed and quiescence as best-effort readiness.
+   * Only affirmative contradictions fail: reported upload failure, a named
+   * card stuck mid-processing, or no new card at all.
    */
   async function confirmAttachmentAcceptedThenReady({
     baselineEvidence = [],
@@ -750,9 +754,15 @@
         const state = (await readState()) || {};
         const evidence = Array.isArray(state.evidence) ? state.evidence : [];
         const newCards = Array.isArray(state.newCards) ? state.newCards : [];
-        const failedEvidence = evidence.find((entry) =>
-          attachmentEvidenceHasFailure(entry, expectedFilename),
-        );
+        const failedEvidence =
+          evidence.find((entry) =>
+            attachmentEvidenceHasFailure(entry, expectedFilename),
+          ) ??
+          newCards.find((card) =>
+            attachmentEvidenceHasFailure(
+              attachmentStatusEvidence(card, expectedFilename),
+            ),
+          );
         if (failedEvidence) {
           throw new Error(
             `The website reported that "${expectedFilename}" failed to upload.`,
@@ -787,6 +797,12 @@
             filenameConfirmed: true,
           };
         }
+        if (newCards.length > 0) {
+          return {
+            evidence: newCards[newCards.length - 1] || expectedFilename,
+            filenameConfirmed: false,
+          };
+        }
         return null;
       },
     );
@@ -801,38 +817,55 @@
     const quietWindowMs = Math.max(0, Number(readyQuietWindowMs) || 0);
     const readiness = await poll(
       now() + Math.max(0, Number(readyTimeoutMs) || 0),
-      (evidence) => {
-        const ready = hasNewExpectedAttachmentEvidence({
-          baselineEvidence,
-          currentEvidence: evidence,
-          expectedFilename,
-          requireReady: true,
-        });
-        if (!ready) {
-          readySince = null;
-          return null;
-        }
-        if (readySince === null) readySince = now();
-        if (now() - readySince < quietWindowMs) return null;
-        return {
-          evidence:
-            evidence.find((entry) =>
-              attachmentEvidenceIsReady(entry, expectedFilename),
-            ) || acceptance.evidence,
-        };
-      },
+      acceptance.filenameConfirmed
+        ? (evidence) => {
+            const ready = hasNewExpectedAttachmentEvidence({
+              baselineEvidence,
+              currentEvidence: evidence,
+              expectedFilename,
+              requireReady: true,
+            });
+            if (!ready) {
+              readySince = null;
+              return null;
+            }
+            if (readySince === null) readySince = now();
+            if (now() - readySince < quietWindowMs) return null;
+            return {
+              evidence:
+                evidence.find((entry) =>
+                  attachmentEvidenceIsReady(entry, expectedFilename),
+                ) || acceptance.evidence,
+            };
+          }
+        : (evidence, newCards) => {
+            // Nothing here identifies the file, so the best available
+            // signal that the upload finished is that no card is still
+            // reporting progress.
+            const settled =
+              newCards.length > 0 && newCards.every(attachmentCardIsSettled);
+            if (!settled) {
+              readySince = null;
+              return null;
+            }
+            if (readySince === null) readySince = now();
+            if (now() - readySince < quietWindowMs) return null;
+            return {
+              evidence: newCards[newCards.length - 1] || acceptance.evidence,
+            };
+          },
     );
 
-    if (!readiness) {
+    if (!readiness && acceptance.filenameConfirmed) {
       throw new Error(
         `The website did not confirm that "${expectedFilename}" was ready.`,
       );
     }
 
     return {
-      evidence: readiness.evidence || acceptance.evidence,
-      filenameConfirmed: true,
-      readyConfirmed: true,
+      evidence: readiness?.evidence || acceptance.evidence,
+      filenameConfirmed: acceptance.filenameConfirmed,
+      readyConfirmed: Boolean(readiness),
       elapsedMs: Math.max(0, now() - startedAt),
     };
   }

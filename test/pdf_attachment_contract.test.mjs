@@ -391,29 +391,54 @@ test("fails closed when an accepted attachment never reports ready", async () =>
   );
 });
 
-test("rejects a new card when the requested filename cannot be identified", async () => {
+test("accepts a new card when the requested filename cannot be identified", async () => {
+  // Sites shorten, translate, and re-render file names; the node-identity
+  // diff against the pre-drop composer is the evidence that the upload
+  // happened, so an unreadable name downgrades the receipt instead of
+  // rejecting an upload that worked.
   const card = "Aerie — mission planning\nPDF";
-  await assert.rejects(
-    confirmWithFakeClock({ evidence: [], newCards: [card] }),
-    /did not confirm attachment/,
-  );
+  const result = await confirmWithFakeClock({ evidence: [], newCards: [card] });
+
+  assert.equal(result.filenameConfirmed, false);
+  assert.equal(result.readyConfirmed, true);
+  assert.equal(result.evidence, card);
 });
 
-test("does not accept an unreadable card after it stops uploading", async () => {
+test("accepts an unreadable card once it stops uploading", async () => {
   let reads = 0;
+  const result = await confirmWithFakeClock(() => {
+    reads += 1;
+    return {
+      evidence: [],
+      newCards: [
+        reads < 3
+          ? "Aerie — mission planning\nUploading…"
+          : "Aerie — mission planning\nPDF",
+      ],
+    };
+  });
+
+  assert.equal(result.filenameConfirmed, false);
+  assert.equal(result.readyConfirmed, true);
+});
+
+test("returns an unready receipt when an unreadable card never settles", async () => {
+  const result = await confirmWithFakeClock({
+    evidence: [],
+    newCards: ["Aerie — mission planning\nUploading…"],
+  });
+
+  assert.equal(result.filenameConfirmed, false);
+  assert.equal(result.readyConfirmed, false);
+});
+
+test("fails when an unreadable new card reports an upload error", async () => {
   await assert.rejects(
-    confirmWithFakeClock(() => {
-      reads += 1;
-      return {
-        evidence: [],
-        newCards: [
-          reads < 3
-            ? "Aerie — mission planning\nUploading…"
-            : "Aerie — mission planning\nPDF",
-        ],
-      };
+    confirmWithFakeClock({
+      evidence: [],
+      newCards: ["Aerie — mission planning\nUpload failed"],
     }),
-    /did not confirm attachment/,
+    /reported that .* failed to upload/,
   );
 });
 
