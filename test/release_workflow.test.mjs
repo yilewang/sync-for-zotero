@@ -190,6 +190,10 @@ test("release workflow validates, tests, packages, and uploads before publicatio
   assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /types:\s*\[published\]/);
   assert.match(workflow, /fetch-depth:\s*0/);
+  const installIndex = workflow.indexOf("run: npm ci");
+  const validateIndex = workflow.indexOf("run: npm run release:validate");
+  assert.ok(installIndex >= 0, "release workflow installs locked Node.js dependencies");
+  assert.ok(installIndex < validateIndex, "dependencies install before release validation");
   assert.match(workflow, /npm run release:validate/);
   assert.match(workflow, /npm test/);
   assert.match(workflow, /zip -r -X extension\.zip extension\//);

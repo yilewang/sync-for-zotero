@@ -34,6 +34,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Node.js dependencies
+        run: npm ci
+
       - name: Validate tag and manifest version
         run: npm run release:validate -- "$RELEASE_TAG"
 
