@@ -268,3 +268,14 @@ test("labeled svg icons degrade to their label; decorative svg stays silent", ()
   );
   assert.equal(convert('<p>前<svg><path d="M0 0"></path></svg>后</p>'), "前后");
 });
+
+
+test("portable images retain source and escape Markdown delimiters", () => {
+  assert.equal(convert('<img src="https://example.com/a(b).png" alt="plot [A]">'), '![plot \\[A\\]](https://example.com/a%28b%29.png)');
+  assert.equal(convert('<img src="data:image/png;base64,YQ==" alt="figure">'), '![figure](data:image/png;base64,YQ==)');
+  assert.equal(convert('<img src="javascript:alert(1)" alt="unsafe">'), 'unsafe');
+});
+
+test("fenced source preserves blank lines and embedded fences", () => {
+  assert.equal(convert('<pre><code class="language-html">&lt;p&gt;```&lt;/p&gt;\n\n\nlast</code></pre>'), '````html\n<p>```</p>\n\n\nlast\n````');
+});

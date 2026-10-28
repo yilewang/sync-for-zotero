@@ -2,7 +2,7 @@
 // here; the existing delivery/turn tracker owns sequencing and acknowledgements.
 (function (root) {
   root.SyncZoteroGemini = {
-    createAdapter({ document, isVisibleElement, htmlToMarkdown, shared }) {
+    createAdapter({ document, isVisibleElement, htmlToMarkdown, cloneAssistantOutput, shared }) {
       const composerSelector = '.ql-editor[role="textbox"][contenteditable="true"]';
       const inputRoot = () => document.querySelector(composerSelector)?.closest("input-container") || document.querySelector("input-container");
       const iconButton = (icon) => {
@@ -29,8 +29,52 @@
         if (turn.id) permanentTurnIdentities.set(turn.id, identity);
         return `${identity}:${role}`;
       };
+      // Source is relayed from Gemini's opaque sandbox, never read from its
+      // bootstrap srcdoc. Bind every message to an actual SVG frame in a turn.
+      const artifacts = new WeakMap();
+      const artifactFrames = (node) => Array.from(node.querySelectorAll('svg-code-block iframe'));
+      window.addEventListener('message', (event) => {
+        if (event.data?.type !== 'SYNC_ZOTERO_GEMINI_ARTIFACT' || typeof event.data.html !== 'string' || event.data.html.length > 1_000_000) return;
+        const frame = artifactFrames(document).find((candidate) => candidate.contentWindow === event.source);
+        if (!frame || !frame.closest('model-response')) return;
+        const source = event.data.html.trim();
+        // Gemini sends the generated SVG as genui-morph HTML. Require an SVG
+        // document here; ordinary provider bootstrap HTML is never an artifact.
+        if (!/^<svg[\s>]/i.test(source) || !/<\/svg>\s*$/i.test(source)) return;
+        const state = artifacts.get(frame) || {};
+        state.source = source;
+        artifacts.set(frame, state);
+        state.resolve?.();
+      });
+      const artifactState = (frame) => {
+        let state = artifacts.get(frame);
+        if (!state) {
+          state = { requestedAt: Date.now(), source: '' };
+          artifacts.set(frame, state);
+        }
+        if (!state.source) frame.contentWindow?.postMessage({ type: 'SYNC_ZOTERO_GEMINI_ARTIFACT_REQUEST' }, '*');
+        return state;
+      };
       const clean = (node) => {
-        const clone = node.cloneNode(true);
+        const clone = cloneAssistantOutput(node);
+        const frames = Array.from(node.querySelectorAll('svg-code-block'), (block) => block.querySelector('iframe'));
+        clone.querySelectorAll('svg-code-block').forEach((block, index) => {
+          const frame = frames[index];
+          if (!frame) return;
+          const state = artifactState(frame);
+          if (state.source) {
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.className = 'language-svg';
+            code.textContent = state.source;
+            pre.appendChild(code);
+            block.replaceWith(pre);
+          } else {
+            block.replaceWith(document.createTextNode(Date.now() - state.requestedAt >= 10000
+              ? '\nSVG source could not be transferred. Open the original web chat to view it.\n'
+              : '\nSVG source is being transferred.\n'));
+          }
+        });
         // Gemini's HTML-only KaTeX keeps the source on data-math; preserve it
         // before removing aria-hidden rendering trees. Work on the clone only.
         clone.querySelectorAll('[data-math]').forEach((el) => {
@@ -99,6 +143,17 @@
           return { node, filename: filename || (image ? "image" : (busy || closeButton ? "pending attachment" : "")), kind: image ? "image" : "file", ready: Boolean((filename || image) && closeButton && !closeButton.disabled && closeButton.getAttribute("aria-disabled") !== "true" && !busy && !failed) };
         }).filter((card) => card.filename);
       return {
+        async prepareRichOutput(node) {
+          await Promise.all(artifactFrames(node).map((frame) => {
+            const state = artifactState(frame);
+            if (state.source || Date.now() - state.requestedAt >= 10000) return;
+            if (!state.pending) state.pending = new Promise((resolve) => {
+              const timer = setTimeout(resolve, Math.max(0, 10000 - (Date.now() - state.requestedAt)));
+              state.resolve = () => { clearTimeout(timer); resolve(); };
+            });
+            return state.pending;
+          }));
+        },
         siteId: "gemini", homeUrl: "https://gemini.google.com/app", answerCapture: "dom",
         composerSelectors: [composerSelector],
         sendButtonSelectors: () => iconButton("arrow_upward"),
@@ -146,7 +201,10 @@
         isResponseComplete(assistantTurnKey) {
           if (!assistantTurnKey) return false;
           const node = Array.from(document.querySelectorAll(".conversation-container model-response")).find((candidate) => messageId(candidate) === assistantTurnKey);
-          return Boolean(node && isVisibleElement(node) && node.querySelector('message-content .markdown[aria-busy="false"]') && node.querySelector(".response-footer.complete"));
+          return Boolean(node && artifactFrames(node).every((frame) => {
+            const state = artifactState(frame);
+            return state.source || Date.now() - state.requestedAt >= 10000;
+          }) && isVisibleElement(node) && node.querySelector('message-content .markdown[aria-busy="false"]') && node.querySelector(".response-footer.complete"));
         },
         getComposerAttachments,
         classifySubmittedAttachments(attachments, expectedFilename, expectedImageCount = 0) {
