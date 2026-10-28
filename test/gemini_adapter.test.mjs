@@ -35,7 +35,8 @@ function content(html = "", url = chatUrl) {
   if (fs.existsSync(adapterPath)) vm.runInContext(fs.readFileSync(adapterPath, "utf8"), context);
   vm.runInContext(contentSource, context);
   const api = vm.runInContext(`({ adapter: SITE_ADAPTER, extractConversationTranscript,
-    findStopButton, collectHealthStatus, collectHistoryEntries, scrapeHistory,
+    prepareRichOutput: typeof prepareRichOutput === "function" ? prepareRichOutput : null,
+    extractFullConversationTranscript, findStopButton, collectHealthStatus, collectHistoryEntries, scrapeHistory,
     collectVisibleComposerPdfCardEvidence, resolveBoundAssistantTurn,
     findMatchingUserTurn, hasResponseActionBar, attachPDF, submitMessageAndVerify, streamResponseSnapshots, workerSleep,
     assertSubmissionConversation: typeof assertSubmissionConversation === "function" ? assertSubmissionConversation : null })`, context);
@@ -832,3 +833,116 @@ for (const scenario of [
     }), /did not confirm a ready attachment/);
   });
 }
+
+// Reduced from live Gemini (2026-10-27): code language is a header, images
+// live inside a button, and rendered SVG source arrives in a sandbox frame.
+const richTurn = (body) => `<div class="conversation-container" id="rich"><user-query><div class="query-text-line">draw a circle</div></user-query><model-response><message-content><div class="markdown" aria-busy="false">${body}</div></message-content><div class="response-footer complete"></div></model-response></div>`;
+const codeBlock = (language, source) => `<code-block><div class="code-block-decoration header-formatted"><span>${language}</span><button>Copy code</button></div><pre><code class="code-container formatted">${source}</code></pre></code-block>`;
+
+test("Gemini preserves HTML and Python code languages in answers and history", () => {
+  const page = content(richTurn(codeBlock("HTML", "&lt;h1&gt;Green Square&lt;/h1&gt;") + codeBlock("Python", "print(42)")));
+  assert.equal(page.extractConversationTranscript().messages.at(-1).text,
+    "```html\n<h1>Green Square</h1>\n```\n\n```python\nprint(42)\n```");
+});
+
+test("Gemini image-only response survives control pruning and materializes browser blobs", async () => {
+  const page = content(richTurn('<generated-image><button class="image-button"><img src="blob:https://gemini.google.com/circle" alt="Blue circle"></button><button>Download</button></generated-image>'));
+  page.context.fetch = async (url) => {
+    assert.equal(url, "blob:https://gemini.google.com/circle");
+    return { ok: true, blob: async () => new Blob(["circle"], { type: "image/png" }) };
+  };
+  page.context.btoa = btoa;
+  page.context.AbortSignal = AbortSignal;
+  await page.prepareRichOutput();
+  const result = page.extractConversationTranscript().messages.at(-1);
+  assert.equal(result.role, "assistant");
+  assert.equal(result.text, "![Blue circle](data:image/png;base64,Y2lyY2xl)");
+  assert.ok(page.adapter.isResponseComplete("rich:assistant"));
+  assert.match(page.document.querySelector("img").src, /^blob:/, "capture must not alter the page");
+});
+
+test("Gemini recovers source only from the matching artifact frame and waits for it", async () => {
+  const page = content(richTurn('<p>Diagram</p><svg-code-block><div class="svg-toolbar">SVG<button>Copy SVG</button></div><iframe srcdoc="provider bootstrap"></iframe></svg-code-block>'));
+  const frame = page.document.querySelector('iframe');
+  const frameWindow = { postMessage() {} };
+  Object.defineProperty(frame, "contentWindow", { value: frameWindow });
+  const deliver = (source, html) => {
+    const event = new page.context.window.Event('message');
+    Object.defineProperties(event, { source: { value: source }, data: { value: { type: 'SYNC_ZOTERO_GEMINI_ARTIFACT', html } } });
+    page.context.window.dispatchEvent(event);
+  };
+  assert.equal(page.adapter.isResponseComplete("rich:assistant"), false);
+  deliver({}, '<svg><text>WRONG TURN</text></svg>');
+  assert.ok(!page.adapter.extractAssistantAnswerText(page.document.querySelector('model-response')).includes('WRONG TURN'));
+  const source = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="30" fill="blue"/></svg>';
+  deliver(frameWindow, source);
+  assert.equal(page.extractConversationTranscript().messages.at(-1).text, `Diagram\n\n\`\`\`svg\n${source}\n\`\`\``);
+  assert.equal(page.adapter.isResponseComplete("rich:assistant"), true);
+  assert.equal(frame.getAttribute('srcdoc'), 'provider bootstrap');
+});
+
+
+test("Gemini history waits for late SVG source and preserves generated images", async () => {
+  const page = content(richTurn('<svg-code-block><iframe srcdoc="bootstrap"></iframe></svg-code-block><generated-image><button><img src="data:image/png;base64,YQ==" alt="Figure"></button></generated-image>'));
+  const frame = page.document.querySelector('iframe');
+  const frameWindow = { postMessage() {
+    queueMicrotask(() => {
+      const event = new page.context.window.Event('message');
+      Object.defineProperties(event, { source: { value: frameWindow }, data: { value: { type: 'SYNC_ZOTERO_GEMINI_ARTIFACT', html: '<svg><circle r="2"/></svg>' } } });
+      page.context.window.dispatchEvent(event);
+    });
+  } };
+  Object.defineProperty(frame, 'contentWindow', { value: frameWindow });
+  const result = await page.extractFullConversationTranscript();
+  assert.match(result.messages.at(-1).text, /```svg\n<svg><circle/);
+  assert.match(result.messages.at(-1).text, /!\[Figure\]\(data:image\/png;base64,YQ==\)/);
+  assert.ok(!result.messages.at(-1).text.includes('being transferred'));
+});
+
+for (const kind of ['failed', 'foreign', 'oversized', 'nonimage']) {
+  test(`Gemini reports ${kind} blob image transfer without losing the answer`, async () => {
+    const url = kind === 'foreign' ? 'blob:https://example.com/image' : 'blob:https://gemini.google.com/image';
+    const page = content(richTurn(`<p>Answer</p><button><img src="${url}" alt="Figure"></button>`));
+    page.context.AbortSignal = AbortSignal;
+    page.context.fetch = async () => {
+      if (kind === 'failed') throw new Error('unavailable');
+      if (kind === 'foreign') assert.fail('foreign blobs must not be fetched');
+      return { ok: true, blob: async () => ({ type: kind === 'nonimage' ? 'text/html' : 'image/png', size: kind === 'oversized' ? 6 * 1024 * 1024 : 1 }) };
+    };
+    await page.prepareRichOutput();
+    const text = page.extractConversationTranscript().messages.at(-1).text;
+    assert.match(text, /^Answer/);
+    assert.match(text, /Image could not be transferred/);
+    assert.ok(!text.includes('blob:'));
+  });
+}
+
+test("Gemini live tracker transfers an image-only reply before terminal acknowledgement", async () => {
+  const page = content();
+  const baseline = page.extractConversationTranscript();
+  page.document.body.innerHTML = richTurn('<generated-image><button><img src="blob:https://gemini.google.com/generated" alt="Circle"></button></generated-image>');
+  page.context.fetch = async () => ({ ok: true, blob: async () => new Blob(['circle'], { type: 'image/png' }) });
+  page.context.btoa = btoa;
+  page.context.AbortSignal = AbortSignal;
+  let now = Date.now();
+  page.context.Date = class extends Date { static now() { return now; } };
+  page.context.advanceTimer = async (ms) => { now += ms; };
+  vm.runInContext('workerSleep = advanceTimer', page.context);
+  const events = [];
+  await page.streamResponseSnapshots({ postMessage: (event) => events.push(event) }, 44, 1, baseline, 'draw a circle', '', { composerTextMatched: true }, 20000);
+  const terminal = events.find(event => event.type === 'terminal');
+  assert.equal(terminal?.text, '![Circle](data:image/png;base64,Y2lyY2xl)');
+  assert.equal(terminal?.assistantTurnKey, 'rich:assistant');
+  assert.equal(terminal?.diagnostic.attachmentContractVerified, true);
+});
+
+test('Gemini keeps source attached to its own SVG block while an earlier block is mounting', () => {
+  const page = content(richTurn('<svg-code-block></svg-code-block><p>Second drawing</p><svg-code-block><iframe></iframe></svg-code-block>'));
+  const frame = page.document.querySelector('iframe');
+  const frameWindow = { postMessage() {} };
+  Object.defineProperty(frame, 'contentWindow', { value: frameWindow });
+  const event = new page.context.window.Event('message');
+  Object.defineProperties(event, { source: { value: frameWindow }, data: { value: {type:'SYNC_ZOTERO_GEMINI_ARTIFACT',html:'<svg><circle/></svg>'} } });
+  page.context.window.dispatchEvent(event);
+  assert.equal(page.extractConversationTranscript().messages.at(-1).text, 'Second drawing\n\n```svg\n<svg><circle/></svg>\n```');
+});

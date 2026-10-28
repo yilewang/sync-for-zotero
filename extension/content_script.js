@@ -912,13 +912,14 @@ globalThis.__syncZoteroWebchatDebug = {
 
 const SITE_ADAPTERS = {
   "gemini.google.com": globalThis.SyncZoteroGemini?.createAdapter({
-    document, isVisibleElement, htmlToMarkdown, shared,
+    document, isVisibleElement, htmlToMarkdown, cloneAssistantOutput, shared,
   }),
   "chatgpt.com": {
     siteId: "chatgpt",
     homeUrl: "https://chatgpt.com/",
     composerSelectors: [
       "#prompt-textarea",
+      "[contenteditable='true'][data-composer-markdown]",
       "[data-testid='text-input']",
       "[role='textbox'][contenteditable='true']",
       "div[contenteditable='true']",
@@ -959,12 +960,14 @@ const SITE_ADAPTERS = {
       "[data-message-author-role='assistant']",
       "article[data-testid*='assistant']",
       "[data-chatgpt-search-unit-key$=':assistant']",
+      "[data-chatgpt-search-message-ids]:has([data-testid='generated-image-gallery'])",
     ],
     conversationMessageSelector:
-      "[data-message-author-role], [data-chatgpt-search-unit-key$=':user'], [data-chatgpt-search-unit-key$=':assistant']",
+      "[data-message-author-role], [data-chatgpt-search-unit-key$=':user'], [data-chatgpt-search-unit-key$=':assistant'], [data-chatgpt-search-message-ids]:has([data-testid='generated-image-gallery'])",
     getMessageRole(node) {
       return node.getAttribute("data-message-author-role") ||
-        node.getAttribute("data-chatgpt-search-unit-key")?.split(":").pop();
+        node.getAttribute("data-chatgpt-search-unit-key")?.split(":").pop() ||
+        (node.hasAttribute("data-chatgpt-search-message-ids") && node.querySelector('[data-testid="generated-image-gallery"]') ? "assistant" : null);
     },
     getMessageId(node) {
       return node.getAttribute("data-message-id") ||
@@ -1270,6 +1273,7 @@ function isVisibleElement(el) {
 function isUsableComposer(el) {
   if (!(el instanceof HTMLElement)) return false;
   if (!isVisibleElement(el)) return false;
+  if (SITE_ADAPTER?.siteId === "chatgpt" && el.closest('[data-code-block]')) return false;
   if (el.getAttribute("aria-hidden") === "true") return false;
   if (el instanceof HTMLTextAreaElement) {
     return !el.disabled && !el.readOnly;
@@ -3029,7 +3033,20 @@ function hasResponseActionBar(assistantTurnKey = null) {
   // conversation trees mounted while rendering a new-chat shell.
   const assistantMessages = getAssistantMessageNodes();
   if (!assistantMessages.length) return false;
-  const lastMsg = assistantMessages[assistantMessages.length - 1];
+  // Completion is bound with transcript keys. Providers without DOM IDs use
+  // a content-derived key, not the assistant-list anchor used for signatures.
+  const lastMsg = assistantTurnKey
+    ? getConversationMessageNodes().find((node, index) => {
+      const message = extractNormalizedMessage(node, index);
+      return message?.role === 'assistant' && message.messageKey === assistantTurnKey;
+    })
+    : assistantMessages[assistantMessages.length - 1];
+  if (!lastMsg) return false;
+  // Image-only ChatGPT turns have a gallery and turn state, but no copy row.
+  if (SITE_ADAPTER?.siteId === "chatgpt" && lastMsg.querySelector('[data-testid="generated-image-gallery"]')) {
+    const turn = lastMsg.closest('[data-talvt-turn-state]');
+    if (turn) return turn.getAttribute('data-talvt-turn-state') === 'complete';
+  }
 
   // Search within the conversation turn container (action bar can be a sibling
   // of the message node, not a child).
@@ -3079,18 +3096,16 @@ function hasResponseActionBar(assistantTurnKey = null) {
 
 function getAssistantMessageNodes() {
   const selectors = SITE_ADAPTER?.assistantMessageSelectors || ["[data-message-author-role='assistant']"];
-  for (const selector of selectors) {
-    const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => {
-      if (!isVisibleElement(node)) return false;
-      const role =
-        SITE_ADAPTER?.getMessageRole?.(node) ||
-        node.getAttribute?.("data-message-author-role");
-      if (role) return role === "assistant";
-      return /assistant/i.test(selector);
-    });
-    if (nodes.length > 0) return nodes;
-  }
-  return [];
+  const selector = selectors.join(', ');
+  return Array.from(document.querySelectorAll(selector)).filter((node) => {
+    if (!isVisibleElement(node)) return false;
+    if (node.parentElement?.closest(selector)) return false;
+    const role =
+      SITE_ADAPTER?.getMessageRole?.(node) ||
+      node.getAttribute?.("data-message-author-role");
+    if (role) return role === "assistant";
+    return selectors.some((candidate) => /assistant/i.test(candidate) && node.matches(candidate));
+  });
 }
 
 function getUserMessageCount() {
@@ -3119,7 +3134,7 @@ function buildAssistantAnchorId(node, index) {
 function getAssistantMessageInfo() {
   return getAssistantMessageNodes().map((node, index) => {
     const id = buildAssistantAnchorId(node, index);
-    const text = shared.normalizeComposerText(extractAssistantAnswerText(node));
+    const text = extractAssistantAnswerText(node).trim();
     return {
       node,
       id,
@@ -3452,6 +3467,7 @@ async function streamResponseSnapshots(
         promptText,
       );
     }
+    await prepareRichOutput();
     const transcript = extractConversationTranscript();
     assertTrackedConversation(transcript);
     remoteChatUrl = transcript.chatUrl || requestContext?.chatUrl || remoteChatUrl;
@@ -3984,6 +4000,7 @@ async function streamResponseSnapshots(
       // can expose a prefix in the DOM long enough to satisfy visual completion
       // heuristics, especially after a discarded-tab reload.
       await workerSleep(strongTransportCompletion ? 250 : 750);
+      await prepareRichOutput();
       const confirmedTranscript = extractConversationTranscript();
       assertTrackedConversation(confirmedTranscript);
       const confirmedAssistantTurn = resolveBoundAssistantTurn(
@@ -4329,20 +4346,21 @@ function isDeepSeekReasoningBlock(block) {
 
 function extractDeepSeekAssistantSections(node) {
   if (!node) return null;
-  const root = node.cloneNode(true);
+  const root = cloneAssistantOutput(node);
   root.querySelectorAll("button, [role='button']").forEach((el) => el.remove());
 
   const blocks = getDeepSeekTopLevelMarkdownBlocks(root)
     .map((el) => {
       const text = shared.normalizeComposerText(el.textContent || "");
-      if (!text) return null;
+      const markdown = htmlToMarkdown(el.innerHTML).trim() || text;
+      if (!markdown) return null;
       return {
         text,
-        markdown: htmlToMarkdown(el.innerHTML).trim() || text,
+        markdown,
         reasoningLike: isDeepSeekReasoningBlock(el),
       };
     })
-    .filter((block) => block && shared.hasMeaningfulAssistantText(block.text));
+    .filter((block) => block && shared.hasMeaningfulAssistantText(block.markdown));
 
   if (!blocks.length) return null;
 
@@ -4421,8 +4439,8 @@ function extractBestAssistantAnswerCandidate(prunedAssistant) {
         continue;
       }
       const text = shared.normalizeComposerText(el.textContent || "");
-      if (!shared.hasMeaningfulAssistantText(text)) continue;
       const markdown = htmlToMarkdown(el.innerHTML).trim();
+      if (!shared.hasMeaningfulAssistantText(markdown)) continue;
       const key = markdown || text;
       const prev = candidateMap.get(key);
       const score = text.length + (sel === ".markdown" || sel === ".prose" ? 1000 : 0);
@@ -4457,7 +4475,7 @@ function extractDeepSeekAssistantAnswerText(node) {
     return sections.answer;
   }
 
-  const root = node.cloneNode(true);
+  const root = cloneAssistantOutput(node);
   pruneAssistantStatusNodes(root);
 
   const deepSeekCandidates = [];
@@ -4477,9 +4495,9 @@ function extractDeepSeekAssistantAnswerText(node) {
       if (!(el instanceof Element)) return;
       if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") return;
       const text = shared.normalizeComposerText(el.textContent || "");
-      if (!shared.hasMeaningfulAssistantText(text)) return;
       if (isDeepSeekReasoningBlock(el)) return;
       const markdown = htmlToMarkdown(el.innerHTML).trim() || text;
+      if (!shared.hasMeaningfulAssistantText(markdown)) return;
       const key = `${selector}::${markdown}`;
       if (seenKeys.has(key)) return;
       seenKeys.add(key);
@@ -4503,8 +4521,15 @@ function extractAssistantAnswerText(node) {
   }
 
   if (!node) return "";
-  const prunedAssistant = node.cloneNode(true);
+  const prunedAssistant = cloneAssistantOutput(node);
   pruneAssistantStatusNodes(prunedAssistant);
+  if (SITE_ADAPTER?.siteId === "chatgpt") {
+    const selector = "[data-markdown-text-style='assistant-message'], .markdown, .prose, [data-testid='generated-image-gallery']";
+    const parts = Array.from(prunedAssistant.querySelectorAll(selector))
+      .filter((part) => !part.parentElement?.closest(selector))
+      .map((part) => htmlToMarkdown(part.innerHTML).trim()).filter(Boolean);
+    if (parts.length) return parts.join('\n\n');
+  }
   return extractBestAssistantAnswerCandidate(prunedAssistant);
 }
 
@@ -4519,6 +4544,61 @@ function extractResponseAfter(baselineCount = 0) {
 /** Extract the last assistant response (used for final extraction after streaming). */
 function extractResponse() {
   return extractResponseAfter(0);
+}
+
+// Browser object URLs cannot be used by Zotero. Materialize only same-origin
+// blob images already present in assistant output; ordinary web images keep URLs.
+const richImageCache = new WeakMap();
+const MAX_RICH_IMAGE_BYTES = 5 * 1024 * 1024;
+async function prepareRichOutput() {
+  const nodes = getConversationMessageNodes().filter((node) =>
+    (SITE_ADAPTER?.getMessageRole?.(node) || node.getAttribute("data-message-author-role")) === "assistant");
+  await Promise.all(nodes.map((node) => SITE_ADAPTER?.prepareRichOutput?.(node)));
+  await Promise.all(nodes.flatMap((node) => Array.from(node.querySelectorAll('img')).map(async (img) => {
+    const src = img.currentSrc || img.getAttribute('src') || '';
+    if (!src.startsWith('blob:')) return;
+    let entry = richImageCache.get(img);
+    if (entry?.src === src) return entry.pending;
+    entry = { src, data: '', error: '' };
+    richImageCache.set(img, entry);
+    entry.pending = (async () => {
+      try {
+        if (new URL(src).origin !== window.location.origin) throw new Error('foreign blob');
+        const response = await fetch(src, { signal: AbortSignal.timeout(10000) });
+        if (!response.ok) throw new Error('image read failed');
+        const blob = await response.blob();
+        if (!/^image\/(png|jpeg|gif|webp|avif)$/i.test(blob.type) || blob.size > MAX_RICH_IMAGE_BYTES) throw new Error('unsupported image');
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 32768) binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+        entry.data = `data:${blob.type};base64,${btoa(binary)}`;
+      } catch {
+        entry.error = 'Image could not be transferred. Open the original web chat to view it.';
+      }
+    })();
+    await entry.pending;
+  })));
+}
+
+function cloneAssistantOutput(node) {
+  const clone = node.cloneNode(true);
+  const originals = Array.from(node.querySelectorAll('img'));
+  const imagePairs = Array.from(clone.querySelectorAll('img'), (img, index) => [img, originals[index]]);
+  // Image buttons are content, unlike Copy/Download controls. Unwrap only the
+  // content image, keeping control labels and icons out of the transcript.
+  clone.querySelectorAll('button, [role="button"]').forEach((button) => {
+    const images = Array.from(button.querySelectorAll('img:not([aria-hidden="true"])'));
+    if (images.length) button.replaceWith(...images);
+  });
+  imagePairs.forEach(([img, original]) => {
+    if (!clone.contains(img)) return;
+    const src = original.currentSrc || original.getAttribute('src') || '';
+    if (!src.startsWith('blob:')) { img.setAttribute('src', src); return; }
+    const entry = richImageCache.get(original);
+    if (entry?.src === src && entry.data) img.setAttribute('src', entry.data);
+    else img.replaceWith(document.createTextNode(entry?.error || 'Image is being transferred.'));
+  });
+  return clone;
 }
 
 function pruneAssistantStatusNodes(root) {
@@ -5046,7 +5126,7 @@ function extractNormalizedMessage(node, index) {
       ? shared.normalizeComposerText(extractAssistantThinkingText(node) || "")
       : "";
   const text = role === "assistant"
-    ? shared.normalizeComposerText(extractAssistantAnswerText(node))
+    ? extractAssistantAnswerText(node).trim()
     : extractUserMessageText(node);
   const cleanedText =
     role === "assistant" && shared.isPlaceholderAssistantText(text) ? "" : text;
@@ -5141,6 +5221,7 @@ async function extractFullConversationTranscript(options = {}) {
 
   if (!scrollContainer) {
     // No virtual scrolling — single extraction is enough
+    await prepareRichOutput();
     return extractConversationTranscript();
   }
 
@@ -5159,7 +5240,8 @@ async function extractFullConversationTranscript(options = {}) {
   const collected = new Map(); // messageKey → message
   const scrollStep = Math.max(300, Math.floor(scrollContainer.clientHeight * 0.6));
 
-  const collectVisible = () => {
+  const collectVisible = async () => {
+    await prepareRichOutput();
     const nodes = getConversationMessageNodes();
     nodes.forEach((node, index) => {
       const message = extractNormalizedMessage(node, index);
@@ -5171,14 +5253,14 @@ async function extractFullConversationTranscript(options = {}) {
     });
   };
 
-  collectVisible(); // collect at top
+  await collectVisible(); // collect at top
 
   let lastScrollTop = -1;
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() - startedAt >= maxDurationMs) break;
     scrollContainer.scrollTop += scrollStep;
     await scrollSleep(stepWaitMs);
-    collectVisible();
+    await collectVisible();
     if (Math.abs(scrollContainer.scrollTop - lastScrollTop) < 5) break;
     lastScrollTop = scrollContainer.scrollTop;
   }
@@ -5315,6 +5397,7 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
 
     if (SITE_ADAPTER?.siteId === "deepseek") {
       while (Date.now() < deadline) {
+        await prepareRichOutput();
         const transcript = extractConversationTranscript();
         const currentUrl = normalizeUrl(transcript.chatUrl || getCurrentChatUrl());
         const urlMatches = !normalizedExpected || currentUrl === normalizedExpected;
@@ -5376,6 +5459,7 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
     }
 
     while (Date.now() < deadline) {
+      await prepareRichOutput();
       const transcript = extractConversationTranscript();
       const composerReady = Boolean(findComposerNow());
       const urlMatches =
@@ -5436,6 +5520,7 @@ async function waitForChatReady(expectedChatUrl = null, timeoutMs = 30000) {
     if (observer) observer.disconnect();
   }
 
+  await prepareRichOutput();
   const transcript = extractConversationTranscript();
   return buildChatReadinessFailure(
     transcript,
@@ -5592,6 +5677,19 @@ function htmlToMarkdown(html) {
   // Use a temporary DOM element
   const div = document.createElement("div");
   div.innerHTML = html;
+  // Keep code bytes out of prose whitespace normalization.
+  const codeBlocks = [];
+  let codeToken = "\u0000code";
+  while (html.includes(codeToken)) codeToken += "_";
+
+  function fencedCode(content, language = "") {
+    const lang = /^[a-z0-9_#+.-]+$/i.test(language) ? language.toLowerCase() : "";
+    const longest = Array.from(content.matchAll(/`+/g), (match) => match[0].length)
+      .reduce((maximum, length) => Math.max(maximum, length), 2);
+    const fence = "`".repeat(longest + 1);
+    codeBlocks.push(`${fence}${lang}\n${content}\n${fence}`);
+    return `\n${codeToken}${codeBlocks.length - 1}\u0000\n`;
+  }
 
   function nodeToMd(node, indent = "") {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
@@ -5599,6 +5697,21 @@ function htmlToMarkdown(html) {
     const tag = node.tagName?.toLowerCase();
     const children = () =>
       Array.from(node.childNodes).map((child) => nodeToMd(child, indent)).join("");
+
+    // Observed ChatGPT, DeepSeek, and Gemini code owners. Normalize
+    // these before walking children so toolbar labels and previews never
+    // duplicate source, and all callers receive the same typed fences.
+    if (node.hasAttribute?.("data-code-block") || tag === "code-block" || node.classList?.contains("md-code-block")) {
+      const code = node.querySelector("pre code, [data-code-block-source] code");
+      const editor = node.querySelector(".cm-content");
+      const language = editor?.getAttribute("data-language") ||
+        code?.className?.match(/language-([\w#+.-]+)/)?.[1] ||
+        node.querySelector('[data-markdown-copy="exclude"] > div, .code-block-decoration > span, .md-code-block-banner span')?.textContent.trim() || "";
+      const source = node.getAttribute("data-markdown-copy-text") ??
+        (editor ? Array.from(editor.querySelectorAll(".cm-line"), (line) => line.textContent).join("\n") : null) ??
+        code?.textContent ?? node.querySelector("pre")?.textContent;
+      if (source != null) return fencedCode(source, language);
+    }
 
     // Handle KaTeX math elements before the main switch
     if (tag === "span") {
@@ -5662,9 +5775,9 @@ function htmlToMarkdown(html) {
       }
       case "pre": {
         const codeEl = node.querySelector("code");
-        const lang = codeEl?.className?.match(/language-(\w+)/)?.[1] ?? "";
+        const lang = codeEl?.className?.match(/language-([\w#+.-]+)/)?.[1] ?? "";
         const content = codeEl ? codeEl.textContent : node.textContent;
-        return `\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
+        return fencedCode(content, lang);
       }
       case "ul": {
         // "- " marker → nested content aligns under two spaces
@@ -5694,8 +5807,12 @@ function htmlToMarkdown(html) {
         return "";
       }
       case "img": {
-        // Images are not synced; keep the author-provided alt text.
-        return (node.getAttribute("alt") || "").trim();
+        const alt = (node.getAttribute("alt") || "").trim();
+        const src = (node.getAttribute("src") || "").trim();
+        if (!/^https?:\/\/[^\s<>]+$/i.test(src) && !/^data:image\/(?:png|jpeg|gif|webp|avif);base64,[a-z0-9+/=]+$/i.test(src)) return alt;
+        const label = alt.replace(/[\\[\]]/g, "\\$&").replace(/\s+/g, " ");
+        const url = src.replace(/[()]/g, (c) => c === '(' ? '%28' : '%29');
+        return `![${label}](${url})`;
       }
       case "svg": {
         // Labeled icons degrade to their label; decorative SVGs stay silent.
@@ -5722,7 +5839,8 @@ function htmlToMarkdown(html) {
     return [header, sep, ...lines.slice(1)].join("\n");
   }
 
-  return nodeToMd(div).replace(/\n{3,}/g, "\n\n").trim();
+  const markdown = nodeToMd(div).replace(/\n{3,}/g, "\n\n").trim();
+  return markdown.replace(new RegExp(`${codeToken}(\\d+)\u0000`, "g"), (_, index) => codeBlocks[Number(index)]);
 }
 
 // ---------------------------------------------------------------------------
