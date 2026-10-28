@@ -16,21 +16,35 @@
     "https://chat.deepseek.com/*",
     "https://gemini.google.com/*",
     "http://localhost/*",
-    "http://127.0.0.1/*"
+    "http://127.0.0.1/*",
+    "https://images.openai.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
-      "js": ["injected.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "injected.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*", "https://gemini.google.com/*"],
-      "js": ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.deepseek.com/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "webchat_shared.js",
+        "gemini_adapter.js",
+        "content_script.js"
+      ],
       "run_at": "document_idle"
     }
   ],

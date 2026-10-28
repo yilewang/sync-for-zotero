@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Conversation snapshot visual fixture</title>
+    <style>
+      body {
+        font: 18px/1.6 system-ui;
+        margin: 32px auto;
+        max-width: 850px;
+        color: #202124;
+      }
+      aside {
+        display: none;
+      }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 18px;
+        padding: 24px;
+        text-align: center;
+      }
+      .stage {
+        background: #f3f4f6;
+        padding: 18px;
+        border-radius: 12px;
+        margin: 16px 0;
+      }
+      .badge {
+        display: inline-block;
+        color: #326cf9;
+        background: #e8efff;
+        border-radius: 24px;
+        padding: 2px 12px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+      }
+      td,
+      th {
+        padding: 10px;
+        border-bottom: 1px solid #ddd;
+        text-align: left;
+      }
+    </style>
+  </head>
+  <body>
+    <aside>Account metadata must not be exported</aside>
+    <div data-content-search-unit-key="fallback-turn-0:0:user">
+      <p>请介绍这篇示例论文的方法。</p>
+    </div>
+    <div data-content-search-unit-key="fallback-turn-0:2:assistant">
+      <h2>从评论识别到企业年度指标</h2>
+      <p>以下内容是用于验证快照排版的虚构示例。</p>
+      <div class="card">
+        <h3>原始评论</h3>
+        <p>“管理层说到做到，我信任公司的承诺。”</p>
+        <svg width="30" height="30" viewBox="0 0 30 30">
+          <path
+            d="M15 3v22m-8-8 8 8 8-8"
+            stroke="#666"
+            stroke-width="2"
+            fill="none"
+          />
+        </svg>
+        <div class="stage">
+          <h3>多标签分类</h3>
+          <span class="badge">可信度相关</span> <span>正面表达</span>
+        </div>
+        <p>↓</p>
+        <div class="stage">
+          <strong>企业—年份层面指标</strong>
+          <p>当年表达信任的评论占比</p>
+        </div>
+      </div>
+      <h3>结果对照</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>指标</th>
+            <th>示例结果</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>准确率</td>
+            <td>92%</td>
+          </tr>
+          <tr>
+            <td>评论数量</td>
+            <td>1,200</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        <strong>强调文本</strong>与公式
+        <math
+          ><msup><mi>x</mi><mn>2</mn></msup></math
+        >。
+      </p>
+    </div>
+    <script src="../../extension/conversation_snapshot.js"></script>
+    <script>
+      (async () => {
+        const result = await SyncZoteroSnapshot.capture(
+          "https://chatgpt.com/c/visual-fixture",
+          {
+            document,
+            window: {
+              location: { href: "https://chatgpt.com/c/visual-fixture" },
+            },
+            getComputedStyle: window.getComputedStyle.bind(window),
+          },
+        );
+        const output = document.createElement("iframe");
+        output.title = "Offline conversation snapshot";
+        output.style =
+          "position:fixed;inset:0;border:0;width:100vw;height:100vh;background:white";
+        output.srcdoc = result.html;
+        document.body.replaceChildren(output);
+      })();
+    </script>
+  </body>
+</html>
