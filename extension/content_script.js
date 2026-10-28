@@ -282,8 +282,8 @@ const shared = globalThis.SyncZoteroShared || {
     if (!raw) return "";
     try {
       const parsed = new URL(raw);
-      if (parsed.hostname.toLowerCase() === "chatgpt.com") {
-        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
+      if (parsed.origin === "https://chatgpt.com" && !parsed.username && !parsed.password) {
+        const match = parsed.pathname.match(/^\/(?:g\/g-p-[^/?#]+\/)?c\/([^/?#]+)\/?$/);
         if (match) return `${parsed.origin}/c/${match[1]}`;
       }
     } catch (_) {}
@@ -1008,8 +1008,9 @@ const SITE_ADAPTERS = {
       '[aria-label*="pdf"], [aria-label*="PDF"], [class*="FileIcon"]',
     getChatIdFromUrl(url) {
       try {
-        const parsed = new URL(url);
-        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
+        const parsed = new URL(shared.normalizeConversationUrl(url));
+        if (parsed.origin !== "https://chatgpt.com" || parsed.username || parsed.password) return null;
+        const match = parsed.pathname.match(/^\/c\/([^/?#]+)\/?$/);
         return match ? match[1] : null;
       } catch (_) {
         return null;

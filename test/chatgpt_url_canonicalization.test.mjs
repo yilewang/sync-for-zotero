@@ -4,6 +4,42 @@ import test from "node:test";
 
 const require = createRequire(import.meta.url);
 const shared = require("../extension/webchat_shared.js");
+const chatId = "6a3dadf5-c2d8-83ea-847e-54de494aefcc";
+const chatUrl = `https://chatgpt.com/c/${chatId}`;
+const projectUrl = `https://chatgpt.com/g/g-p-1234567890-research/c/${chatId}`;
+
+test("matches a Project chat to its original URL by conversation identity", () => {
+  assert.equal(shared.normalizeConversationUrl(`${projectUrl}/?model=auto#reply`), chatUrl);
+  assert.equal(shared.conversationUrlsMatch(projectUrl, chatUrl), true);
+  assert.equal(shared.conversationUrlsMatch(chatUrl, projectUrl), true);
+  assert.equal(shared.conversationUrlsMatch(projectUrl.replace("research", "renamed"), projectUrl), true);
+  assert.equal(shared.conversationUrlsMatch(projectUrl.replace(chatId, "other-id"), chatUrl), false);
+});
+
+test("resolves Project bindings while preserving the navigation route", () => {
+  assert.deepEqual(shared.resolveExpectedConversationBinding({
+    expected_chat_url: `${projectUrl}/?model=auto#reply`, expected_chat_id: chatId,
+  }, "chatgpt"), { chatUrl: projectUrl, chatId });
+  assert.deepEqual(shared.resolveExpectedConversationBinding({ expected_chat_id: chatId }, "chatgpt"), { chatUrl, chatId });
+  assert.throws(() => shared.resolveExpectedConversationBinding({
+    expected_chat_url: projectUrl, expected_chat_id: "other-id",
+  }, "chatgpt"), /ID does not match/);
+});
+
+test("Project matching rejects other origins, landing pages, and malformed conversation paths", () => {
+  for (const invalid of [
+    projectUrl.replace("https:", "http:"),
+    projectUrl.replace("chatgpt.com", "example.com"),
+    projectUrl.replace("chatgpt.com", "chatgpt.com.example.com"),
+    projectUrl.replace("https://", "https://user:password@"),
+    projectUrl.replace(`/c/${chatId}`, "/project"),
+    projectUrl.replace("/g/g-p-1234567890-research/", "/unrelated/"),
+    `${projectUrl}/extra`, `${chatUrl}/extra`,
+  ]) {
+    assert.equal(shared.conversationUrlsMatch(invalid, chatUrl), false, invalid);
+    assert.throws(() => shared.resolveExpectedConversationBinding({ expected_chat_url: invalid }, "chatgpt"), /Invalid.*URL/, invalid);
+  }
+});
 
 test("canonicalizes ChatGPT conversation URLs without transient query or hash", () => {
   const canonical = shared.normalizeConversationUrl(

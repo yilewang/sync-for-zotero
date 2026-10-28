@@ -3,6 +3,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import { createRequire } from "node:module";
 import test from "node:test";
+import { conversationFollowup } from "./helpers/conversation_workflow.mjs";
 
 const require = createRequire(import.meta.url);
 const { parseHTML } = require("linkedom");
@@ -68,6 +69,53 @@ function recorder(clock) {
   const events = [];
   return { events, port: { postMessage: (event) => events.push({ ...event, at: clock ? clock.elapsed() : 0 }) } };
 }
+
+const projectChatUrl = realChatUrl.replace("/c/", "/g/g-p-issue13/c/");
+const projectFollowup = (options = {}) => conversationFollowup({
+  target: "chatgpt", expectedUrl: realChatUrl,
+  initialUrl: projectChatUrl, redirectUrl: projectChatUrl, ...options,
+});
+
+test("moved ChatGPT conversation passes follow-up readiness and submission without renavigating", async () => {
+  const h = projectFollowup();
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.navigations, []);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.reports[0].remote_chat_url, projectChatUrl);
+  assert.equal(h.reports[0].remote_chat_id, realChatUrl.split("/").pop());
+});
+
+test("saved ChatGPT URL can redirect into a Project before a PDF follow-up", async () => {
+  const h = projectFollowup({ initialUrl: homeUrl });
+  await h.run({ pdf_base64: "synthetic-pdf", pdf_filename: "test.pdf" });
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.navigations, [realChatUrl]);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].pdfFilename, "test.pdf");
+});
+
+test("subsequent follow-up accepts the saved Project URL and conversation ID", async () => {
+  const h = projectFollowup({ initialUrl: homeUrl });
+  await h.run({ expected_chat_url: projectChatUrl });
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.navigations, [projectChatUrl]);
+  assert.equal(h.sent.length, 1);
+});
+
+test("Project support still blocks the wrong conversation before readiness or submission", async () => {
+  const wrongUrl = projectChatUrl.replace(realChatUrl.split("/").pop(), "other-chat");
+  for (const options of [
+    { initialUrl: wrongUrl, redirectUrl: wrongUrl },
+    { beforeSend: (page) => { page.window.location = new URL(wrongUrl); } },
+  ]) {
+    const h = projectFollowup(options);
+    await h.run({ pdf_base64: "synthetic-pdf", pdf_filename: "test.pdf" });
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.errors.length, 1);
+    assert.match(h.errors[0], /conversation/);
+  }
+});
 
 test("ChatGPT observed DOM yields the bound user and assistant turns", () => {
   const page = content(fixture, realChatUrl);

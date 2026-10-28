@@ -908,73 +908,80 @@
     return normalized.length > 1 && !isPlaceholderAssistantText(normalized);
   }
 
-  function normalizeConversationUrl(url) {
-    const raw = String(url || "").trim();
-    if (!raw) return "";
+  // Provider routes define both accepted navigation URLs and stable identities.
+  // A ChatGPT Project changes the navigation path, but keeps the conversation ID.
+  const CONVERSATION_ROUTES = {
+    chatgpt: {
+      origin: "https://chatgpt.com", prefix: "/c/",
+      path: /^\/(?:g\/g-p-[^/?#]+\/)?c\/([^/?#]+)\/?$/,
+      id: /^[^/?#\s]+$/,
+    },
+    deepseek: {
+      origin: "https://chat.deepseek.com", prefix: "/a/chat/s/",
+      path: /^\/a\/chat\/s\/([^/?#]+)\/?$/,
+      id: /^[^/?#\s]+$/,
+    },
+    gemini: {
+      origin: "https://gemini.google.com", prefix: "/app/",
+      path: /^\/app\/([a-f0-9]{16})\/?$/,
+      id: /^[a-f0-9]{16}$/,
+    },
+  };
 
+  function parseConversationUrl(url, target = null) {
+    if (typeof url !== "string") return null;
     try {
-      const parsed = new URL(raw);
-      const geminiUrl = normalizeGeminiConversationUrl(raw);
-      if (geminiUrl) return geminiUrl;
-      if (parsed.hostname.toLowerCase() === "chatgpt.com") {
-        const match = parsed.pathname.match(/^\/c\/([^/?#]+)/);
-        if (match) return `${parsed.origin}/c/${match[1]}`;
+      const parsed = new URL(url);
+      if (parsed.username || parsed.password) return null;
+      for (const [siteId, route] of Object.entries(CONVERSATION_ROUTES)) {
+        if ((target !== null && siteId !== target) || parsed.origin !== route.origin) continue;
+        const match = parsed.pathname.match(route.path);
+        if (!match) return null;
+        return {
+          siteId,
+          chatId: match[1],
+          // Keep the provider's route for navigation, stripping transient suffixes.
+          chatUrl: `${route.origin}${parsed.pathname.replace(/\/$/, "")}`,
+          canonicalUrl: `${route.origin}${route.prefix}${match[1]}`,
+        };
       }
     } catch (_) {}
+    return null;
+  }
 
-    return raw.replace(/\/+$/, "");
+  function normalizeConversationUrl(url) {
+    const raw = String(url || "").trim();
+    const conversation = parseConversationUrl(raw);
+    return conversation ? conversation.canonicalUrl : raw.replace(/\/+$/, "");
   }
 
   function normalizeGeminiConversationUrl(url) {
-    try {
-      const parsed = new URL(String(url || ""));
-      if (parsed.origin !== "https://gemini.google.com" || parsed.username || parsed.password) return null;
-      const match = parsed.pathname.match(/^\/app\/([a-f0-9]{16})\/?$/);
-      return match ? `https://gemini.google.com/app/${match[1]}` : null;
-    } catch (_) { return null; }
+    return parseConversationUrl(String(url || ""), "gemini")?.chatUrl || null;
   }
 
   function resolveExpectedConversationBinding(query, target) {
+    if (!Object.hasOwn(CONVERSATION_ROUTES, target)) {
+      throw new Error(`Unsupported WebChat target: ${target}`);
+    }
+    const route = CONVERSATION_ROUTES[target];
+    const providerLabel = target === "gemini" ? " Gemini" : "";
     const rawUrl = query.expected_chat_url;
     const rawId = query.expected_chat_id;
     const hasUrl = rawUrl !== undefined && rawUrl !== null;
     const hasId = rawId !== undefined && rawId !== null;
     let chatUrl = null;
     let chatId = null;
-    if (target === "gemini") {
-      if (hasUrl) {
-        chatUrl = typeof rawUrl === "string" ? normalizeGeminiConversationUrl(rawUrl) : null;
-        if (!chatUrl) throw new Error("Invalid expected Gemini conversation binding URL.");
-        chatId = chatUrl.split("/").pop();
+    if (hasUrl) {
+      const conversation = parseConversationUrl(rawUrl, target);
+      if (!conversation) throw new Error(`Invalid expected${providerLabel} conversation binding URL.`);
+      ({ chatUrl, chatId } = conversation);
+    }
+    if (hasId) {
+      if (typeof rawId !== "string" || !route.id.test(rawId) || (chatId && chatId !== rawId)) {
+        throw new Error(`Expected${providerLabel} conversation binding ID does not match.`);
       }
-      if (hasId) {
-        if (typeof rawId !== "string" || !/^[a-f0-9]{16}$/.test(rawId) || (chatId && chatId !== rawId)) {
-          throw new Error("Expected Gemini conversation binding ID does not match.");
-        }
-        chatId = rawId;
-        chatUrl = `https://gemini.google.com/app/${chatId}`;
-      }
-    } else if (hasUrl || hasId) {
-      const config = target === "chatgpt"
-        ? { origin: "https://chatgpt.com", path: /^\/c\/([^/?#]+)\/?$/ }
-        : { origin: "https://chat.deepseek.com", path: /^\/a\/chat\/s\/([^/?#]+)\/?$/ };
-      if (hasUrl) {
-        let parsed;
-        try { parsed = new URL(rawUrl); } catch (_) {}
-        const match = parsed?.pathname.match(config.path);
-        if (typeof rawUrl !== "string" || parsed?.origin !== config.origin || !match || parsed.username || parsed.password) {
-          throw new Error("Invalid expected conversation binding URL.");
-        }
-        chatUrl = `${config.origin}${parsed.pathname.replace(/\/$/, "")}`;
-        chatId = match[1];
-      }
-      if (hasId && (typeof rawId !== "string" || !rawId || /[/?#\s]/.test(rawId) || (chatId && rawId !== chatId))) {
-        throw new Error("Expected conversation binding ID does not match.");
-      }
-      if (hasId && !chatId) {
-        chatId = rawId;
-        chatUrl = `${config.origin}${target === "chatgpt" ? "/c/" : "/a/chat/s/"}${chatId}`;
-      }
+      chatId = rawId;
+      if (!chatUrl) chatUrl = `${route.origin}${route.prefix}${chatId}`;
     }
     return query.force_new_chat === true ? { chatUrl: null, chatId: null } : { chatUrl, chatId };
   }
