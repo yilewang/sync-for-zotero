@@ -855,6 +855,10 @@ const shared = globalThis.SyncZoteroShared || {
 const WEBCHAT_DEBUG = false;
 const TURN_DEBUG_EVENT_LIMIT = 200;
 const RESPONSE_TIMEOUT_MS = 60 * 60_000;
+// A reasoning model can keep working for minutes without changing any visible
+// text. Report that the run is still alive at this cadence so the plugin's
+// progress-based timeout does not mistake a long think for a stalled pipeline.
+const ACTIVITY_HEARTBEAT_INTERVAL_MS = 45_000;
 // ChatGPT mounts the transcript within seconds of the conversation URL settling; if no turn node appears within five minutes of entering the pending state, the page is not going to expose it.
 const PENDING_TRANSCRIPT_TIMEOUT_MS = 5 * 60_000;
 let turnDebugEvents = [];
@@ -3578,6 +3582,7 @@ async function streamResponseSnapshots(
   let lastUserTurnKey = null;
   let lastAssistantTurnKey = null;
   let lastAnyProgressAt = Date.now();
+  let lastHeartbeatAt = Date.now();
   const deadline = Date.now() + timeoutMs;
   const userTurnDeadline = Date.now() + 30_000;
   const emitTerminal = (payload) => {
@@ -4274,6 +4279,37 @@ async function streamResponseSnapshots(
       lastTurnStatus = turnStatus;
       lastUserTurnKey = userTurnKey;
       lastAssistantTurnKey = assistantTurnKey;
+      lastHeartbeatAt = nowMs;
+    } else if (
+      activeRun &&
+      nowMs - lastHeartbeatAt >= ACTIVITY_HEARTBEAT_INTERVAL_MS
+    ) {
+      // Nothing observable changed, but the provider is still working (stop
+      // control or busy composer). Send a heartbeat so long silent reasoning
+      // keeps refreshing the relay activity timestamp.
+      lastHeartbeatAt = nowMs;
+      postSnapshot(port, {
+        seq,
+        attempt,
+        heartbeat: true,
+        answerSnapshot: lastAnswerText,
+        thinkingSnapshot: lastThinkingText || null,
+        text: lastAnswerText,
+        thinking: lastThinkingText || null,
+        answerAnchorId: assistantTurnKey,
+        answerRevision,
+        thinkingRevision,
+        runState,
+        completionReason: null,
+        remoteChatUrl,
+        remoteChatId,
+        userTurnKey,
+        assistantTurnKey,
+        baselineTranscriptCount,
+        baselineTranscriptHash,
+        turnStatus,
+        diagnostic: makeTurnDiagnostic(turnStatus || "streaming"),
+      });
     }
 
     if (completion.emitDone && attachmentContractVerified) {

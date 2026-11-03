@@ -1777,6 +1777,7 @@ function streamPipeline(tabId, payload) {
           () => serverPost("/update_partial", {
             seq:     payload.seq,
             attempt: payload.attempt,
+            heartbeat: msg.heartbeat === true,
             answer_snapshot: msg.answerSnapshot ?? msg.text ?? null,
             thinking_snapshot: msg.thinkingSnapshot ?? msg.thinking ?? null,
             text:    msg.text    ?? null,
