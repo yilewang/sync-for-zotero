@@ -9,6 +9,7 @@ const providers = [
   { target: "chatgpt", url: "https://chatgpt.com/c/6a3dadf5-c2d8-83ea-847e-54de494aefcc" },
   { target: "deepseek", url: "https://chat.deepseek.com/a/chat/s/6a3dadf5-c2d8-83ea-847e-54de494aefcc" },
   { target: "gemini", url: "https://gemini.google.com/app/d11114e59cd9e350" },
+  { target: "yuanbao", url: "https://yuanbao.tencent.com/chat/naQivTmsDa" },
 ];
 
 test("unknown provider bindings never fall through to another provider", () => {
@@ -44,7 +45,7 @@ for (const { target, url } of providers) {
       assert.equal(shared.conversationUrlsMatch(other.url, url), false);
       assert.throws(() => shared.resolveExpectedConversationBinding({ expected_chat_url: other.url }, target), /Invalid.*URL/);
     }
-    for (const invalid of [home, `${url}/extra`, url.replace("https:", "http:"),
+    for (const invalid of [home, `${url}/extra${target === "yuanbao" ? "/more" : ""}`, url.replace("https:", "http:"),
       url.replace("https://", "https://user:password@"),
       url.replace(new URL(url).hostname, `${new URL(url).hostname}.example.com`),
     ]) {

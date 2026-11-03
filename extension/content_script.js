@@ -1201,12 +1201,264 @@ const SITE_ADAPTERS = {
     disablesComposerDuringStreaming: true,
   },
 
+  "yuanbao.tencent.com": {
+    siteId: "yuanbao",
+    homeUrl: "https://yuanbao.tencent.com/",
+    composerSelectors: [
+      ".chat-command-editor-specail .ql-editor",
+      ".chat-input-editor .ql-editor",
+      ".ql-editor[contenteditable='true']",
+      ".ql-editor",
+      "div[contenteditable='true']",
+      "textarea",
+    ],
+    sendButtonSelectors() {
+      const direct = document.querySelector("#yuanbao-send-btn");
+      if (direct && isVisibleElement(direct)) return direct;
+      const icon = document.querySelector(".icon-send, [class*='SendButton_sendButton']");
+      if (!icon || !isVisibleElement(icon)) return null;
+      return icon.closest("#yuanbao-send-btn, button, [role='button']") || icon;
+    },
+    findStopButton() {
+      const direct = document.querySelector("#yuanbao-stop-btn");
+      if (direct && isVisibleElement(direct)) return direct;
+      for (const selector of [
+        ".icon-stop",
+        ".icon-pause",
+        "[class*='StopButton']",
+        "[class*='stopButton']",
+      ]) {
+        const icon = document.querySelector(selector);
+        if (icon && isVisibleElement(icon)) {
+          return icon.closest("button, [role='button'], div[class*='stop'], div[class*='Stop']") || icon;
+        }
+      }
+      return null;
+    },
+    userMessageSelector: ".agent-chat__bubble--human",
+    assistantMessageSelectors: [".agent-chat__bubble--ai"],
+    conversationMessageSelector:
+      ".agent-chat__bubble--ai, .agent-chat__bubble--human",
+    getMessageRole(node) {
+      if (node.classList?.contains("agent-chat__bubble--ai")) return "assistant";
+      if (node.classList?.contains("agent-chat__bubble--human")) return "user";
+      return null;
+    },
+    getMessageId(node) {
+      return node.getAttribute("data-message-id") || node.id || null;
+    },
+    conversationTurnSelector: null,
+    // Yuanbao keeps a "解析中/上传中" label on the composer file card until the
+    // message is actually sent, so waiting for it to disappear never succeeds.
+    attachmentPendingIsReady: true,
+    // The sent user turn collapses the file card to an icon-only chip: no
+    // filename text survives in the DOM, so post-send verification has to
+    // trust the composer card that was confirmed before the click.
+    submittedAttachmentEvidenceOptional: true,
+    extractAttachmentNames(node) {
+      if (!node) return [];
+      const scope =
+        node.closest?.(".agent-chat__list__item--human") ||
+        node.closest?.(".agent-chat__list__item") ||
+        node;
+      const names = [];
+      const push = (value) => {
+        const text = shared.normalizeComposerText(value || "");
+        if (!text || text.length < 2 || text.length > 200) return;
+        if (!/\bpdf\b|\.pdf/i.test(text)) return;
+        if (!names.includes(text)) names.push(text);
+      };
+      // A compact card keeps a "PDF" token next to the (truncated) name or a
+      // size/status label, while the prompt bubble itself is long-form text.
+      scope.querySelectorAll("div, span").forEach((element) => {
+        const text = shared.normalizeComposerText(element.textContent || "");
+        if (!text || text.length > 120) return;
+        if (!/\bpdf\b|\.pdf/i.test(text)) return;
+        if (!shared.attachmentEvidenceHasFileCardSignal(text, true)) return;
+        push(text);
+      });
+      scope.querySelectorAll("[title], [aria-label]").forEach((element) => {
+        const label =
+          element.getAttribute("title") || element.getAttribute("aria-label");
+        if (label && /\.pdf(?:\b|$)/i.test(label)) push(label);
+      });
+      return names;
+    },
+    // Yuanbao renders the copy/share/regenerate toolbar only once the answer
+    // has finished streaming.
+    actionBarSelectors: [".agent-chat__conv--ai__toolbar"],
+    isResponseComplete() {
+      const items = document.querySelectorAll(".agent-chat__list__item--ai");
+      const last = items[items.length - 1];
+      if (!last || !isVisibleElement(last)) return false;
+      const bar = last.querySelector(".agent-chat__conv--ai__toolbar");
+      return Boolean(bar && isVisibleElement(bar));
+    },
+    thinkingSelectors: [
+      ".hyc-component-reasoner__think",
+      ".hyc-component-deepsearch-cot__think",
+      ".hyc-think-content-scroller",
+      "[class*='reasoner__think']",
+      "[class*='think-content']",
+      "[class*='think']",
+      "[class*='reason']",
+      "[class*='deepsearch']",
+      "[data-testid*='thinking']",
+      "[data-testid*='reasoning']",
+    ],
+    pruneThinkingSelectors: [
+      ".hyc-component-reasoner__think",
+      ".hyc-component-deepsearch-cot__think",
+      ".hyc-think-content-scroller",
+      "[class*='reasoner']",
+      "[class*='think']",
+      "[class*='reason']",
+      "[class*='deepsearch']",
+      "[data-testid*='thinking']",
+      "[data-testid*='reasoning']",
+    ],
+    // Yuanbao wraps the reasoning trace in a sibling block of the answer, so
+    // the thinking text used to leak into the answer and render as plain prose
+    // in Zotero. Split it out here so the plugin can fold it.
+    extractAssistantThinkingText(node) {
+      if (!node) return null;
+      const content =
+        node.querySelector?.(".agent-chat__bubble__content") || node;
+      const blocks = findYuanbaoThinkingElements(content);
+      const text = stripYuanbaoThinkingLabel(
+        shared.normalizeComposerText(
+          blocks.map((block) => block.textContent || "").join("\n\n"),
+        ),
+      );
+      return text.length > 2 ? text : null;
+    },
+    extractAssistantAnswerText(node) {
+      const content =
+        node.querySelector?.(".agent-chat__bubble__content") || node;
+      const clone = cloneAssistantOutput(content);
+      pruneAssistantStatusNodes(clone);
+      const markdown =
+        clone.querySelector?.(".hyc-common-markdown") ||
+        clone.querySelector?.(".hyc-content-text");
+      return htmlToMarkdown(markdown ? markdown.innerHTML : clone.innerHTML).trim();
+    },
+    dropTargetSelectors: [
+      ".agent-chat__input-box",
+      ".chat-input-editor",
+      ".ql-editor",
+    ],
+    fileInputSelectors: ['input[type="file"]'],
+    attachmentPillSelector:
+      '[class*="attachment"], [class*="file-card"], [class*="upload"]',
+    getChatIdFromUrl(url) {
+      try {
+        const parsed = new URL(shared.normalizeConversationUrl(url));
+        if (
+          parsed.origin !== "https://yuanbao.tencent.com" ||
+          parsed.username ||
+          parsed.password
+        ) {
+          return null;
+        }
+        const match = parsed.pathname.match(/^\/chat\/([A-Za-z0-9_-]+)(?:\/[A-Za-z0-9_-]+)?\/?$/);
+        return match ? match[1] : null;
+      } catch (_) {
+        return null;
+      }
+    },
+    historyLinkSelector: 'a[href^="/chat/"]',
+    buildHistoryEntry(a) {
+      const href = a.getAttribute("href");
+      const match = href?.match(/^\/chat\/([A-Za-z0-9_-]+)/);
+      if (!match) return null;
+      return {
+        id: match[1],
+        title: a.textContent.trim(),
+        chatUrl: `https://yuanbao.tencent.com/chat/${match[1]}`,
+      };
+    },
+    deleteChatLinkSelector(chatId) {
+      return `a[href^="/chat/${chatId}"]`;
+    },
+    supportsFileUpload: true,
+    /**
+     * Yuanbao has no persistent file input: the "添加" menu item 本地文件
+     * creates one lazily and opens the native picker. injected.js intercepts
+     * that click, then this fills the captured input.
+     */
+    async uploadFile(file) {
+      const attachButton = document.querySelector('button[aria-label="添加"]');
+      if (!attachButton || !isVisibleElement(attachButton)) {
+        throw new Error("Yuanbao 的“添加”按钮未找到。");
+      }
+      if (attachButton.getAttribute("aria-expanded") !== "true") {
+        attachButton.click();
+      }
+      const menuItem = await waitForYuanbaoMenuItem("本地文件", 5000);
+      if (!menuItem) {
+        throw new Error("Yuanbao 的“本地文件”菜单项未找到。");
+      }
+      document.documentElement.setAttribute(
+        "data-sync-zotero-capture-file-input",
+        "1",
+      );
+      try {
+        menuItem.click();
+        const input = await waitForYuanbaoFileInput(4000);
+        if (!input) {
+          throw new Error("Yuanbao 的文件选择输入框未出现。");
+        }
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        input.files = dataTransfer.files;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      } finally {
+        document.documentElement.removeAttribute(
+          "data-sync-zotero-capture-file-input",
+        );
+      }
+    },
+    supportsModelSelector: false,
+    hasFormWrapper: false,
+    /** Quill composer keeps accepting input while a response streams. */
+    disablesComposerDuringStreaming: false,
+  },
+
 };
 
 const SITE_ADAPTER = SITE_ADAPTERS[window.location.hostname];
 if (!SITE_ADAPTER) {
   // Unknown site — content script should not run
   console.warn("[sync-zotero] Unsupported site:", window.location.hostname);
+}
+
+/** Find a visible Yuanbao "添加" dropdown item by its exact label. */
+async function waitForYuanbaoMenuItem(label, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const button of document.querySelectorAll(
+      "button[role='menuitem']",
+    )) {
+      if (!isVisibleElement(button)) continue;
+      if ((button.textContent || "").trim() === label) return button;
+    }
+    await sleep(100);
+  }
+  return null;
+}
+
+/** Wait for the lazily created file input captured by injected.js. */
+async function waitForYuanbaoFileInput(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const input = document.querySelector(
+      'input[type="file"][data-sync-zotero-file-input="1"]',
+    );
+    if (input) return input;
+    await sleep(50);
+  }
+  return null;
 }
 
 /** Wait until a selector matches, polling every 200 ms up to `timeout` ms. */
@@ -1543,7 +1795,7 @@ async function attachImages(imageDataUrls) {
 // ---------------------------------------------------------------------------
 
 const PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS = 15000;
-const PDF_ATTACHMENT_READY_TIMEOUT_MS = 30000;
+const PDF_ATTACHMENT_READY_TIMEOUT_MS = 45000;
 const PDF_ATTACHMENT_POLL_INTERVAL_MS = 100;
 const SUBMITTED_ATTACHMENT_CONTRACT_TIMEOUT_MS = 3000;
 
@@ -1688,7 +1940,7 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
     }
 
     let evidenceNode = candidate;
-    for (let depth = 0; depth < 5 && evidenceNode; depth++) {
+    for (let depth = 0; depth < 6 && evidenceNode; depth++) {
       if (
         !expectedFilename &&
         evidenceNode.closest?.(messageSelector)
@@ -1753,8 +2005,12 @@ function collectComposerFileCardNodes() {
     if (candidates.includes(node) || !isCandidate(node)) return;
     const text = readAttachmentEvidenceText(node);
     if (text.length > FILE_CARD_MAX_TEXT_LENGTH) return;
+    // Some sites (Yuanbao) truncate the card name and print the type as a
+    // bare "PDF" token, so a ".pdf" suffix never appears. Pair a PDF token
+    // with the card metadata (size or status) instead.
+    const hasPdfToken = /\.pdf(?:\b|$)|\bpdf\b/i.test(text);
     if (
-      /\.pdf(?:\b|$)/i.test(text) &&
+      hasPdfToken &&
       shared.attachmentEvidenceHasFileCardSignal(text, true)
     ) {
       candidates.push(node);
@@ -1807,6 +2063,7 @@ async function waitForPdfAttachmentConfirmation({
     acceptTimeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
     readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
     pollIntervalMs: PDF_ATTACHMENT_POLL_INTERVAL_MS,
+    allowPendingAttachment: Boolean(SITE_ADAPTER?.attachmentPendingIsReady),
   });
 }
 
@@ -1857,10 +2114,11 @@ async function attachPDF(pdfBase64, pdfFilename) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const file = new File([bytes], pdfFilename, { type: "application/pdf" });
 
-  if (SITE_ADAPTER?.uploadFile) return SITE_ADAPTER.uploadFile(file);
-
   let method = "drag_drop";
-  if (
+  if (SITE_ADAPTER?.uploadFile) {
+    await SITE_ADAPTER.uploadFile(file);
+    method = "adapter_upload";
+  } else if (
     applyFilesToComposerFileInput(
       [file],
       SITE_ADAPTER?.fileInputSelectors || [],
@@ -3693,9 +3951,32 @@ async function streamResponseSnapshots(
       submittedAttachmentCount = contract.attachmentCount;
       submittedPdfCount = contract.pdfAttachmentCount;
       attachmentContractVerified = contract.contractVerified === true;
+      if (
+        !attachmentContractVerified &&
+        SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+        attachmentRequested &&
+        attachments.length === 0 &&
+        submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true
+      ) {
+        // The site verified the card with the exact filename before the click
+        // but no longer renders a readable name after sending (Yuanbao keeps
+        // only an icon chip), so the composer receipt is the evidence.
+        attachmentContractVerified = true;
+        submittedAttachmentVerified = true;
+        recordTurnDebug("submitted_attachment_verified_via_composer", {
+          seq,
+          attempt,
+          userTurnKey: matchedUserTurn.messageKey,
+          expectedPdfFilename,
+        });
+      }
       if (attachmentContractVerified) {
         userTurnKey = matchedUserTurn.messageKey;
-        if (attachmentRequested && contract.filenameMatched !== true) {
+        if (
+          attachmentRequested &&
+          attachments.length > 0 &&
+          contract.filenameMatched !== true
+        ) {
           console.warn(
             `[sync-zotero] The submitted turn carries an attachment the ` +
               `site names differently from "${expectedPdfFilename}" — ` +
@@ -4621,6 +4902,43 @@ function pruneAssistantStatusNodes(root) {
   for (const sel of selectors) {
     root.querySelectorAll(sel).forEach((node) => node.remove());
   }
+}
+
+const YUANBAO_THINKING_CLASS_RE =
+  /think|reason|deepsearch|thought|brain|(?:^|[-_])cot(?:[-_]|$)/i;
+const YUANBAO_THINKING_LABEL_RE =
+  /^(?:深度思考|已深度思考|思考过程|思考中|正在思考|正在深度思考|推理过程|思维链|Thinking|Thought)(?:[（(][^）)]{0,80}[）)])?\s*/i;
+
+function yuanbaoThinkingSignature(element) {
+  const className =
+    typeof element.className === "string" ? element.className : "";
+  return [
+    className,
+    element.id || "",
+    element.getAttribute?.("aria-label") || "",
+    element.getAttribute?.("data-testid") || "",
+    element.getAttribute?.("title") || "",
+  ].join(" ");
+}
+
+function findYuanbaoThinkingElements(scope) {
+  if (!scope?.querySelectorAll) return [];
+  const matches = [];
+  scope.querySelectorAll("*").forEach((element) => {
+    if (YUANBAO_THINKING_CLASS_RE.test(yuanbaoThinkingSignature(element))) {
+      matches.push(element);
+    }
+  });
+  // Keep only the deepest matches: dropping the outer wrapper would also take
+  // the final answer that sits next to the reasoning trace.
+  return matches.filter(
+    (element) =>
+      !matches.some((other) => other !== element && element.contains(other)),
+  );
+}
+
+function stripYuanbaoThinkingLabel(text) {
+  return String(text || "").replace(YUANBAO_THINKING_LABEL_RE, "").trim();
 }
 
 function extractAssistantThinkingText(node) {
@@ -5787,7 +6105,17 @@ function htmlToMarkdown(html) {
       case "ol": {
         // "1. " marker → nested content aligns under three spaces
         const childIndent = indent + "   ";
-        return "\n" + Array.from(node.children).map((li, i) => `${indent}${i + 1}. ${listItemContent(li, childIndent)}`).join("\n") + "\n";
+        return "\n" + Array.from(node.children).map((li, i) => {
+          const content = listItemContent(li, childIndent);
+          // Yuanbao-style lists draw the ordinal as real text inside each
+          // item (list-style: none), so adding our own marker would produce
+          // "1. 1. text" in the rendered answer.
+          const ownMarker = content.match(/^(\d{1,4})\.\s*(?=\S)/);
+          if (ownMarker) {
+            return `${indent}${ownMarker[1]}. ${content.slice(ownMarker[0].length)}`;
+          }
+          return `${indent}${i + 1}. ${content}`;
+        }).join("\n") + "\n";
       }
       case "li": return `\n- ${children()}`;
       case "a": return `[${children()}](${node.getAttribute("href") ?? ""})`;
@@ -6089,7 +6417,7 @@ async function collectHealthStatus() {
     sendControlState: describeSubmitControl(sendBtn),
     uploadControlFound: Boolean(uploadControl),
     networkHookActive: !domCapture && (networkHookActive || hookResponded),
-    supportedTargets: ["chatgpt", "deepseek", "gemini"],
+    supportedTargets: ["chatgpt", "deepseek", "gemini", "yuanbao"],
     answerCapture: domCapture ? "dom" : "network",
     supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
     lastRequestAt: lastRequestAt || null,
@@ -6102,7 +6430,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "PING") {
     sendResponse({
       pong: true,
-      supportedTargets: ["chatgpt", "deepseek", "gemini"],
+      supportedTargets: ["chatgpt", "deepseek", "gemini", "yuanbao"],
       answerCapture: SITE_ADAPTER?.answerCapture || "network",
       supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
     });

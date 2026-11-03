@@ -135,12 +135,52 @@
     }
   }
 
+  // Some sites hard-truncate the card name without any ellipsis glyph and
+  // leave card chrome after it ("Lee 等 - 2023 - In PDF 931.9KB"). Accept a
+  // leading slice that identifies the file when it ends on a word boundary.
+  function evidenceMatchesTruncatedFilenamePrefix(
+    normalizedEvidence,
+    normalizedFilename,
+  ) {
+    if (normalizedFilename.length <= MIN_ELIDED_FILENAME_PREFIX_LENGTH) {
+      return false;
+    }
+    // Only a real file card qualifies: the tail must carry card metadata.
+    if (!attachmentEvidenceHasFileCardSignal(normalizedEvidence, false)) {
+      return false;
+    }
+    const limit = Math.min(
+      normalizedEvidence.length,
+      normalizedFilename.length,
+    );
+    for (
+      let length = limit;
+      length >= MIN_ELIDED_FILENAME_PREFIX_LENGTH;
+      length--
+    ) {
+      if (!normalizedFilename.startsWith(normalizedEvidence.slice(0, length))) {
+        continue;
+      }
+      const boundary = normalizedEvidence.charAt(length);
+      if (boundary === "" || boundary === " ") return true;
+    }
+    return false;
+  }
+
   function attachmentEvidenceMatchesFilename(evidence, expectedFilename) {
     const normalizedEvidence = normalizeAttachmentEvidence(evidence);
     const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
     if (!normalizedFilename || !normalizedEvidence) return false;
     if (normalizedEvidence.includes(normalizedFilename)) return true;
     if (evidenceMatchesElidedFilename(normalizedEvidence, normalizedFilename)) {
+      return true;
+    }
+    if (
+      evidenceMatchesTruncatedFilenamePrefix(
+        normalizedEvidence,
+        normalizedFilename,
+      )
+    ) {
       return true;
     }
 
@@ -737,6 +777,7 @@
     readyTimeoutMs = 30000,
     pollIntervalMs = 100,
     readyQuietWindowMs = 750,
+    allowPendingAttachment = false,
   } = {}) {
     if (!String(expectedFilename || "").trim()) {
       throw new TypeError("expectedFilename is required");
@@ -816,18 +857,36 @@
     }
 
     let readySince = null;
+    let lastObserved = "";
     const quietWindowMs = Math.max(0, Number(readyQuietWindowMs) || 0);
     const readiness = await poll(
       now() + Math.max(0, Number(readyTimeoutMs) || 0),
       acceptance.filenameConfirmed
-        ? (evidence) => {
+        ? (evidence, newCards) => {
+            lastObserved = [...evidence, ...newCards].join(" | ").slice(0, 400);
             const ready = hasNewExpectedAttachmentEvidence({
               baselineEvidence,
               currentEvidence: evidence,
               expectedFilename,
               requireReady: true,
             });
-            if (!ready) {
+            // A card that no longer reports progress is also sufficient: some
+            // sites keep progress copy inside chrome that the filename-bearing
+            // evidence text happens to include.
+            const settledCards =
+              newCards.length > 0 && newCards.every(attachmentCardIsSettled);
+            // Sites like Yuanbao keep a "解析中" label on the card until the
+            // message is actually sent, so an accepted, name-confirmed card is
+            // as ready as it will ever get when the adapter opts in.
+            const pendingButListed =
+              allowPendingAttachment &&
+              hasNewExpectedAttachmentEvidence({
+                baselineEvidence,
+                currentEvidence: evidence,
+                expectedFilename,
+                requireReady: false,
+              });
+            if (!ready && !pendingButListed && !settledCards) {
               readySince = null;
               return null;
             }
@@ -837,15 +896,21 @@
               evidence:
                 evidence.find((entry) =>
                   attachmentEvidenceIsReady(entry, expectedFilename),
-                ) || acceptance.evidence,
+                ) ||
+                newCards[newCards.length - 1] ||
+                acceptance.evidence,
             };
           }
         : (evidence, newCards) => {
+            lastObserved = [...evidence, ...newCards].join(" | ").slice(0, 400);
             // Nothing here identifies the file, so the best available
             // signal that the upload finished is that no card is still
-            // reporting progress.
+            // reporting progress. Adapters that keep a permanent pending
+            // label opt out of that wait.
             const settled =
-              newCards.length > 0 && newCards.every(attachmentCardIsSettled);
+              newCards.length > 0 &&
+              (allowPendingAttachment ||
+                newCards.every(attachmentCardIsSettled));
             if (!settled) {
               readySince = null;
               return null;
@@ -860,7 +925,8 @@
 
     if (!readiness && acceptance.filenameConfirmed) {
       throw new Error(
-        `The website did not confirm that "${expectedFilename}" was ready.`,
+        `The website did not confirm that "${expectedFilename}" was ready.` +
+          (lastObserved ? ` (last evidence: ${lastObserved})` : ""),
       );
     }
 
@@ -926,6 +992,13 @@
       path: /^\/app\/([a-f0-9]{16})\/?$/,
       id: /^[a-f0-9]{16}$/,
     },
+    yuanbao: {
+      origin: "https://yuanbao.tencent.com", prefix: "/chat/",
+      // Live conversations use /chat/<conversationId>/<turnId>; only the first
+      // segment identifies the conversation.
+      path: /^\/chat\/([A-Za-z0-9_-]+)(?:\/[A-Za-z0-9_-]+)?\/?$/,
+      id: /^[A-Za-z0-9_-]+$/,
+    },
   };
 
   function parseConversationUrl(url, target = null) {
@@ -964,7 +1037,7 @@
       throw new Error(`Unsupported WebChat target: ${target}`);
     }
     const route = CONVERSATION_ROUTES[target];
-    const providerLabel = target === "gemini" ? " Gemini" : "";
+    const providerLabel = { gemini: " Gemini", yuanbao: " Yuanbao" }[target] || "";
     const rawUrl = query.expected_chat_url;
     const rawId = query.expected_chat_id;
     const hasUrl = rawUrl !== undefined && rawUrl !== null;

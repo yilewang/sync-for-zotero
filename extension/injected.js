@@ -15,6 +15,54 @@
 
   const COMPOSER_BRIDGE_VERSION = 2;
   const COMPOSER_BRIDGE_SETTLE_TIMEOUT_MS = 750;
+
+  // Yuanbao creates its file <input> lazily and immediately calls click(),
+  // which would open the native picker. When the content script arms the
+  // capture flag, keep the input in the DOM instead so it can be filled
+  // programmatically.
+  if (
+    typeof HTMLInputElement !== "undefined" &&
+    typeof Element !== "undefined" &&
+    typeof Node !== "undefined" &&
+    !window.__syncZoteroFileInputBridgeInstalled
+  ) {
+    window.__syncZoteroFileInputBridgeInstalled = true;
+    const CAPTURE_FLAG = "data-sync-zotero-capture-file-input";
+    const INPUT_MARKER = "data-sync-zotero-file-input";
+    const nativeInputClick = HTMLInputElement.prototype.click;
+    HTMLInputElement.prototype.click = function () {
+      if (
+        this.type === "file" &&
+        document.documentElement.getAttribute(CAPTURE_FLAG) === "1"
+      ) {
+        this.setAttribute(INPUT_MARKER, "1");
+        if (!this.isConnected) document.body.appendChild(this);
+        return undefined;
+      }
+      return nativeInputClick.apply(this, arguments);
+    };
+    const nativeRemove = Element.prototype.remove;
+    Element.prototype.remove = function () {
+      if (
+        this instanceof HTMLInputElement &&
+        this.getAttribute(INPUT_MARKER) === "1"
+      ) {
+        return undefined;
+      }
+      return nativeRemove.apply(this, arguments);
+    };
+    const nativeRemoveChild = Node.prototype.removeChild;
+    Node.prototype.removeChild = function (child) {
+      if (
+        child instanceof HTMLInputElement &&
+        child.getAttribute(INPUT_MARKER) === "1"
+      ) {
+        return child;
+      }
+      return nativeRemoveChild.apply(this, arguments);
+    };
+  }
+
   if (
     (window.__syncZoteroComposerBridgeVersion || 0) <
     COMPOSER_BRIDGE_VERSION
@@ -1117,6 +1165,29 @@
           return { text, thinking };
         }
         return null;
+      },
+    },
+
+    "yuanbao.tencent.com": {
+      isConversationRequest(url, method) {
+        if (method !== "POST") return false;
+        let pathname = "";
+        try {
+          pathname = new URL(url, window.location.href).pathname;
+        } catch (_) {
+          return false;
+        }
+        if (!/^\/api\/chat(?:\/|$)/.test(pathname)) return false;
+        return !/^\/api\/chat\/(?:title|prechat|complaint|suitable)\b/.test(pathname);
+      },
+      parseSSEPayload(parsed, lastText, lastThinking) {
+        if (!parsed || parsed.type !== "text") return null;
+        if (parsed.isTitle === true) return null;
+        if (parsed.mask === 2 || parsed.mask === 3) return null;
+        const chunk = typeof parsed.msg === "string" ? parsed.msg : "";
+        if (!chunk) return null;
+        const text = (lastText || "") + chunk.replace(/\[ENTRY\]/g, "\n");
+        return { text, thinking: lastThinking };
       },
     },
 

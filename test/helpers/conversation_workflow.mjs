@@ -16,6 +16,11 @@ const markup = {
   deepseek: '<textarea placeholder="Message DeepSeek"></textarea>',
   gemini: read("../fixtures/gemini-observed-dom.html") +
     '<input-container><div class="ql-editor" role="textbox" contenteditable="true"></div></input-container>',
+  yuanbao: '<div id="chat-content"><div class="agent-chat__list">' +
+    '<div class="agent-chat__bubble--human"><div class="agent-chat__bubble__content"></div></div>' +
+    '</div></div><div class="agent-chat__input-box"><div class="chat-input-editor">' +
+    '<div class="ql-editor" role="textbox" contenteditable="true"></div></div>' +
+    '<div id="yuanbao-send-btn" role="button" aria-label="发送"></div></div>',
 };
 
 // Exercise the worker, actual DOM readiness, and pre-submit guard together.
