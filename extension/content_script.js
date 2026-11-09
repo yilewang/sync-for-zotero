@@ -1392,21 +1392,28 @@ const SITE_ADAPTERS = {
     },
     supportsFileUpload: true,
     /**
-     * Yuanbao has no persistent file input: the "添加" menu item 本地文件
-     * creates one lazily and opens the native picker. injected.js intercepts
-     * that click, then this fills the captured input.
+     * Yuanbao has no persistent file input: the attach menu item ("本地文件" /
+     * "Local Files") creates one lazily and opens the native picker.
+     * injected.js intercepts that click, then this fills the captured input.
      */
     async uploadFile(file) {
-      const attachButton = document.querySelector('button[aria-label="添加"]');
-      if (!attachButton || !isVisibleElement(attachButton)) {
-        throw new Error("Yuanbao 的“添加”按钮未找到。");
+      const attachButton = findYuanbaoAttachButton();
+      if (!attachButton) {
+        throw new Error(
+          'Yuanbao attach button not found (expected aria-label "添加" or "Add").',
+        );
       }
       if (attachButton.getAttribute("aria-expanded") !== "true") {
         attachButton.click();
       }
-      const menuItem = await waitForYuanbaoMenuItem("本地文件", 5000);
+      const menuItem = await waitForYuanbaoMenuItem(
+        ["本地文件", "Local Files"],
+        5000,
+      );
       if (!menuItem) {
-        throw new Error("Yuanbao 的“本地文件”菜单项未找到。");
+        throw new Error(
+          'Yuanbao "本地文件 / Local Files" menu item not found.',
+        );
       }
       document.documentElement.setAttribute(
         "data-sync-zotero-capture-file-input",
@@ -1416,7 +1423,7 @@ const SITE_ADAPTERS = {
         menuItem.click();
         const input = await waitForYuanbaoFileInput(4000);
         if (!input) {
-          throw new Error("Yuanbao 的文件选择输入框未出现。");
+          throw new Error("Yuanbao file input did not appear.");
         }
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(file);
@@ -1455,15 +1462,58 @@ function attachmentMatchOptions() {
   };
 }
 
-/** Find a visible Yuanbao "添加" dropdown item by its exact label. */
-async function waitForYuanbaoMenuItem(label, timeoutMs) {
+/** Yuanbao labels its composer attach control "添加" in Chinese and "Add" in English. */
+const YUANBAO_ATTACH_LABEL_RE = /^(?:添加|add)$/i;
+
+/** Find the composer attach button across Yuanbao locales. */
+function findYuanbaoAttachButton() {
+  const scopes = [
+    document.querySelector(".chat-command-editor-specail"),
+    document.querySelector(".chat-command-editor"),
+    document,
+  ].filter(Boolean);
+  for (const scope of scopes) {
+    for (const candidate of scope.querySelectorAll(
+      "button, [role='button']",
+    )) {
+      if (!isVisibleElement(candidate)) continue;
+      const labels = [
+        candidate.getAttribute("aria-label"),
+        candidate.getAttribute("title"),
+      ];
+      if (
+        labels.some(
+          (label) => label && YUANBAO_ATTACH_LABEL_RE.test(label.trim()),
+        )
+      ) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+/** Find a visible Yuanbao attach-menu item by label (Chinese or English). */
+async function waitForYuanbaoMenuItem(labels, timeoutMs) {
+  const expected = (Array.isArray(labels) ? labels : [labels])
+    .map((label) => String(label || "").trim().toLowerCase())
+    .filter(Boolean);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const button of document.querySelectorAll(
-      "button[role='menuitem']",
+      "button[role='menuitem'], [role='menuitem']",
     )) {
       if (!isVisibleElement(button)) continue;
-      if ((button.textContent || "").trim() === label) return button;
+      const text = (button.textContent || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      const ariaLabel = (button.getAttribute("aria-label") || "")
+        .trim()
+        .toLowerCase();
+      if (expected.includes(text) || expected.includes(ariaLabel)) {
+        return button;
+      }
     }
     await sleep(100);
   }
