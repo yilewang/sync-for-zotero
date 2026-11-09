@@ -167,7 +167,11 @@
     return false;
   }
 
-  function attachmentEvidenceMatchesFilename(evidence, expectedFilename) {
+  function attachmentEvidenceMatchesFilename(
+    evidence,
+    expectedFilename,
+    { allowTruncatedPrefix = false } = {},
+  ) {
     const normalizedEvidence = normalizeAttachmentEvidence(evidence);
     const normalizedFilename = normalizeAttachmentEvidence(expectedFilename);
     if (!normalizedFilename || !normalizedEvidence) return false;
@@ -176,6 +180,7 @@
       return true;
     }
     if (
+      allowTruncatedPrefix &&
       evidenceMatchesTruncatedFilenamePrefix(
         normalizedEvidence,
         normalizedFilename,
@@ -222,8 +227,14 @@
     return normalizedEvidence.replace(/\s+/g, " ").trim();
   }
 
-  function attachmentEvidenceIsReady(evidence, expectedFilename) {
-    if (!attachmentEvidenceMatchesFilename(evidence, expectedFilename)) {
+  function attachmentEvidenceIsReady(
+    evidence,
+    expectedFilename,
+    options = {},
+  ) {
+    if (
+      !attachmentEvidenceMatchesFilename(evidence, expectedFilename, options)
+    ) {
       return false;
     }
     const normalizedEvidence = attachmentStatusEvidence(
@@ -237,14 +248,18 @@
       /(?:解析中|上传中|处理中|正在解析|正在上传|正在处理)/.test(
         normalizedEvidence,
       ) ||
-      attachmentEvidenceHasFailure(evidence, expectedFilename)
+      attachmentEvidenceHasFailure(evidence, expectedFilename, options)
     );
   }
 
-  function attachmentEvidenceHasFailure(evidence, expectedFilename = "") {
+  function attachmentEvidenceHasFailure(
+    evidence,
+    expectedFilename = "",
+    options = {},
+  ) {
     if (
       expectedFilename &&
-      !attachmentEvidenceMatchesFilename(evidence, expectedFilename)
+      !attachmentEvidenceMatchesFilename(evidence, expectedFilename, options)
     ) {
       return false;
     }
@@ -585,15 +600,17 @@
   function attachmentListContainsExpectedFilename(
     attachments,
     expectedFilename,
+    options = {},
   ) {
     return (Array.isArray(attachments) ? attachments : []).some((attachment) =>
-      attachmentEvidenceMatchesFilename(attachment, expectedFilename),
+      attachmentEvidenceMatchesFilename(attachment, expectedFilename, options),
     );
   }
 
   function classifySubmittedPdfContract(
     attachments,
     expectedFilename = "",
+    options = {},
   ) {
     const normalizedAttachments = (Array.isArray(attachments)
       ? attachments
@@ -605,7 +622,11 @@
       /\.pdf(?:\b|$)/i.test(normalizeAttachmentEvidence(attachment)) ||
       /\bpdf\b/i.test(normalizeAttachmentEvidence(attachment)) ||
       (attachmentRequested &&
-        attachmentEvidenceMatchesFilename(attachment, expectedFilename));
+        attachmentEvidenceMatchesFilename(
+          attachment,
+          expectedFilename,
+          options,
+        ));
     const isImageAttachment = (attachment) =>
       /^(?:image(?:_\d+)?|.+\.(?:png|jpe?g|gif|webp|heic))$/i.test(
         normalizeAttachmentEvidence(attachment),
@@ -619,6 +640,7 @@
       ? attachmentListContainsExpectedFilename(
         pdfAttachments,
         expectedFilename,
+        options,
       )
       : null;
 
@@ -669,12 +691,18 @@
     currentEvidence = [],
     expectedFilename = "",
     requireReady = true,
+    allowTruncatedPrefix = false,
   } = {}) {
+    const matchOptions = { allowTruncatedPrefix };
     const countMatchingEvidence = (evidenceList) =>
       (Array.isArray(evidenceList) ? evidenceList : []).filter((evidence) =>
         requireReady
-          ? attachmentEvidenceIsReady(evidence, expectedFilename)
-          : attachmentEvidenceMatchesFilename(evidence, expectedFilename),
+          ? attachmentEvidenceIsReady(evidence, expectedFilename, matchOptions)
+          : attachmentEvidenceMatchesFilename(
+            evidence,
+            expectedFilename,
+            matchOptions,
+          ),
       ).length;
 
     return (
@@ -692,6 +720,7 @@
     timeoutMs = 7000,
     pollIntervalMs = 100,
     requireReady = true,
+    allowTruncatedPrefix = false,
   } = {}) {
     if (!expectedFilename) {
       throw new TypeError("expectedFilename is required");
@@ -713,18 +742,24 @@
 
     while (true) {
       const currentEvidence = await readEvidence();
+      const matchOptions = { allowTruncatedPrefix };
       if (
         hasNewExpectedAttachmentEvidence({
           baselineEvidence,
           currentEvidence,
           expectedFilename,
           requireReady,
+          allowTruncatedPrefix,
         })
       ) {
         const evidence = currentEvidence.find((entry) =>
           requireReady
-            ? attachmentEvidenceIsReady(entry, expectedFilename)
-            : attachmentEvidenceMatchesFilename(entry, expectedFilename),
+            ? attachmentEvidenceIsReady(entry, expectedFilename, matchOptions)
+            : attachmentEvidenceMatchesFilename(
+                entry,
+                expectedFilename,
+                matchOptions,
+              ),
         );
         return {
           evidence: evidence || expectedFilename,
@@ -778,6 +813,8 @@
     pollIntervalMs = 100,
     readyQuietWindowMs = 750,
     allowPendingAttachment = false,
+    allowSettledAttachment = false,
+    allowTruncatedPrefix = false,
   } = {}) {
     if (!String(expectedFilename || "").trim()) {
       throw new TypeError("expectedFilename is required");
@@ -791,6 +828,7 @@
 
     const boundedPollIntervalMs = Math.max(10, Number(pollIntervalMs) || 100);
     const startedAt = now();
+    const matchOptions = { allowTruncatedPrefix };
 
     const poll = async (deadline, isSatisfied) => {
       while (true) {
@@ -799,7 +837,11 @@
         const newCards = Array.isArray(state.newCards) ? state.newCards : [];
         const failedEvidence =
           evidence.find((entry) =>
-            attachmentEvidenceHasFailure(entry, expectedFilename),
+            attachmentEvidenceHasFailure(
+              entry,
+              expectedFilename,
+              matchOptions,
+            ),
           ) ??
           newCards.find((card) =>
             attachmentEvidenceHasFailure(
@@ -830,10 +872,15 @@
             currentEvidence: evidence,
             expectedFilename,
             requireReady: false,
+            allowTruncatedPrefix,
           })
         ) {
           const matched = evidence.find((entry) =>
-            attachmentEvidenceMatchesFilename(entry, expectedFilename),
+            attachmentEvidenceMatchesFilename(
+              entry,
+              expectedFilename,
+              matchOptions,
+            ),
           );
           return {
             evidence: matched || expectedFilename,
@@ -869,12 +916,16 @@
               currentEvidence: evidence,
               expectedFilename,
               requireReady: true,
+              allowTruncatedPrefix,
             });
             // A card that no longer reports progress is also sufficient: some
             // sites keep progress copy inside chrome that the filename-bearing
-            // evidence text happens to include.
+            // evidence text happens to include. Adapters opt in so other sites
+            // keep the stricter "listed and ready" requirement.
             const settledCards =
-              newCards.length > 0 && newCards.every(attachmentCardIsSettled);
+              allowSettledAttachment &&
+              newCards.length > 0 &&
+              newCards.every(attachmentCardIsSettled);
             // Sites like Yuanbao keep a "解析中" label on the card until the
             // message is actually sent, so an accepted, name-confirmed card is
             // as ready as it will ever get when the adapter opts in.
@@ -885,6 +936,7 @@
                 currentEvidence: evidence,
                 expectedFilename,
                 requireReady: false,
+                allowTruncatedPrefix,
               });
             if (!ready && !pendingButListed && !settledCards) {
               readySince = null;
@@ -895,7 +947,11 @@
             return {
               evidence:
                 evidence.find((entry) =>
-                  attachmentEvidenceIsReady(entry, expectedFilename),
+                  attachmentEvidenceIsReady(
+                    entry,
+                    expectedFilename,
+                    matchOptions,
+                  ),
                 ) ||
                 newCards[newCards.length - 1] ||
                 acceptance.evidence,

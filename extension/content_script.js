@@ -1255,6 +1255,12 @@ const SITE_ADAPTERS = {
     // Yuanbao keeps a "解析中/上传中" label on the composer file card until the
     // message is actually sent, so waiting for it to disappear never succeeds.
     attachmentPendingIsReady: true,
+    // Yuanbao truncates the composer card filename ("Zhang 等 - 2026 - …"),
+    // so matching the card needs a truncated-prefix comparison.
+    attachmentTruncatedPrefixMatch: true,
+    // A name-confirmed card that no longer reports progress is ready for this
+    // site even though the pending label never clears before sending.
+    attachmentSettledIsReady: true,
     // The sent user turn collapses the file card to an icon-only chip: no
     // filename text survives in the DOM, so post-send verification has to
     // trust the composer card that was confirmed before the click.
@@ -1435,6 +1441,18 @@ const SITE_ADAPTER = SITE_ADAPTERS[window.location.hostname];
 if (!SITE_ADAPTER) {
   // Unknown site — content script should not run
   console.warn("[sync-zotero] Unsupported site:", window.location.hostname);
+}
+
+/**
+ * Attachment matching options for the active site. Provider-specific leniency
+ * (truncated card names, settled pending cards) must opt in from the adapter so
+ * every other site keeps the stricter shared behaviour.
+ */
+function attachmentMatchOptions() {
+  return {
+    allowTruncatedPrefix:
+      SITE_ADAPTER?.attachmentTruncatedPrefixMatch === true,
+  };
 }
 
 /** Find a visible Yuanbao "添加" dropdown item by its exact label. */
@@ -1836,6 +1854,7 @@ function hasExplicitComposerFileControl(region, expectedFilename) {
         ? shared.attachmentEvidenceMatchesFilename(
           controlText,
           expectedFilename,
+          attachmentMatchOptions(),
         )
         : true;
     }),
@@ -1869,7 +1888,11 @@ function collectComposerRegionAttachmentEvidence(
         hasExplicitFileControl,
       );
     const matchesExpected = expectedFilename
-      ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
+      ? shared.attachmentEvidenceMatchesFilename(
+        text,
+        expectedFilename,
+        attachmentMatchOptions(),
+      )
       : shared.hasPendingPdfEvidence([text], hasExplicitFileControl);
     if (matchesExpected && hasAttachmentMetadata) {
       if (!expectedFilename) {
@@ -2068,6 +2091,10 @@ async function waitForPdfAttachmentConfirmation({
     readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
     pollIntervalMs: PDF_ATTACHMENT_POLL_INTERVAL_MS,
     allowPendingAttachment: Boolean(SITE_ADAPTER?.attachmentPendingIsReady),
+    allowSettledAttachment: Boolean(SITE_ADAPTER?.attachmentSettledIsReady),
+    allowTruncatedPrefix: Boolean(
+      SITE_ADAPTER?.attachmentTruncatedPrefixMatch,
+    ),
   });
 }
 
@@ -3945,11 +3972,14 @@ async function streamResponseSnapshots(
       const attachments = Array.isArray(matchedUserTurn.attachments)
         ? matchedUserTurn.attachments
         : [];
-      const contract = (SITE_ADAPTER?.classifySubmittedAttachments || shared.classifySubmittedPdfContract)(
-        attachments,
-        expectedPdfFilename,
-        expectedImageCount,
-      );
+      const classify = SITE_ADAPTER?.classifySubmittedAttachments;
+      const contract = classify
+        ? classify(attachments, expectedPdfFilename, expectedImageCount)
+        : shared.classifySubmittedPdfContract(
+            attachments,
+            expectedPdfFilename,
+            attachmentMatchOptions(),
+          );
       submittedAttachmentVerified = attachmentRequested
         ? contract.filenameMatched === true
         : null;

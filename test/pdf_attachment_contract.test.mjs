@@ -875,3 +875,69 @@ test("fails closed when the website never exposes expected PDF evidence", async 
     /did not confirm/,
   );
 });
+
+test("only matches a truncated card name for adapters that opt in", () => {
+  const truncatedCard =
+    "Zhang 等 - 2026 - DAGE Decay-aware graph PDF 931.9KB";
+  const truncatedFilename =
+    "Zhang 等 - 2026 - DAGE Decay-aware graph extrapolation for temporal " +
+    "knowledge graph reasoning.pdf";
+
+  // Default behaviour for ChatGPT / DeepSeek / Gemini stays strict.
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(truncatedCard, truncatedFilename),
+    false,
+  );
+  assert.equal(
+    shared.attachmentEvidenceIsReady(truncatedCard, truncatedFilename),
+    false,
+  );
+  assert.equal(
+    shared.attachmentEvidenceMatchesFilename(truncatedCard, truncatedFilename, {
+      allowTruncatedPrefix: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shared.attachmentEvidenceIsReady(truncatedCard, truncatedFilename, {
+      allowTruncatedPrefix: true,
+    }),
+    true,
+  );
+});
+
+test("only treats a settled pending card as ready for adapters that opt in", async () => {
+  const readState = async () => ({
+    evidence: [`${filename} Parsing...`],
+    newCards: [filename],
+  });
+  const wait = async () => {};
+
+  await assert.rejects(
+    shared.confirmAttachmentAcceptedThenReady({
+      baselineEvidence: [],
+      expectedFilename: filename,
+      readState,
+      wait,
+      acceptTimeoutMs: 200,
+      readyTimeoutMs: 200,
+      pollIntervalMs: 20,
+      readyQuietWindowMs: 0,
+    }),
+    /did not confirm that/,
+  );
+
+  const confirmed = await shared.confirmAttachmentAcceptedThenReady({
+    baselineEvidence: [],
+    expectedFilename: filename,
+    readState,
+    wait,
+    acceptTimeoutMs: 200,
+    readyTimeoutMs: 200,
+    pollIntervalMs: 20,
+    readyQuietWindowMs: 0,
+    allowSettledAttachment: true,
+  });
+  assert.equal(confirmed.filenameConfirmed, true);
+  assert.equal(confirmed.readyConfirmed, true);
+});
