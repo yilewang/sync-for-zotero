@@ -433,7 +433,7 @@ test("manual injection loads Gemini DOM support without injecting the MAIN-world
     chrome: { runtime: {}, tabs: {
       get: async () => ({ id: 1, url: chatUrl }),
       sendMessage: (_id, _message, callback) => callback(loaded ? { pong: true, supportedDeliveryContracts: [1], supportedTargets: ["gemini"], answerCapture: "dom" } : null),
-    }, scripting: { executeScript: async (args) => { injected.push(args); if (args.files.includes("content_script.js")) loaded = true; } } },
+    }, scripting: { executeScript: async (args) => { injected.push(args); if (args.files?.includes("content_script.js")) loaded = true; return args.func ? [{ result: false }] : []; } } },
   });
   const configStart = backgroundSource.indexOf("const SITE_CONFIGS =");
   const configEnd = backgroundSource.indexOf("let activeTarget =", configStart);
@@ -443,7 +443,8 @@ test("manual injection loads Gemini DOM support without injecting the MAIN-world
   const health = await context.ensureContentScript(1, 1);
   assert.equal(health.answerCapture, "dom");
   assert.ok(injected.every((args) => args.world !== "MAIN"));
-  assert.deepEqual(Array.from(injected[0].files), ["webchat_shared.js", "gemini_adapter.js", "content_script.js"]);
+  const fileInjection = injected.find((args) => args.files?.includes("content_script.js"));
+  assert.deepEqual(Array.from(fileInjection.files), ["webchat_shared.js", "gemini_adapter.js", "content_script.js"]);
 });
 
 test("Gemini performs one Send click and never retries an ambiguous submission", async () => {

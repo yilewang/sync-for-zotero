@@ -1962,19 +1962,53 @@ async function ensureContentScript(tabId, requiredDeliveryContractVersion) {
     if (hasRequiredContract(health)) return health;
   }
 
-  // Content script not responsive — inject the shared helpers and listener in
-  // manifest order. This also repairs tabs whose old extension context became
-  // stale after an extension reload.
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files:  ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
-  });
+  const pollContentScriptHealth = async (attempts) => {
+    let current = await pingContentScript();
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (hasRequiredContract(current)) return current;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      current = await pingContentScript();
+    }
+    return current;
+  };
 
-  // Poll briefly instead of always paying a fixed 1s delay after injection.
-  for (let attempt = 0; attempt < 10; attempt++) {
-    health = await pingContentScript();
+  // An extension reload leaves the old content script in the (same) isolated
+  // world: its globals survive but its runtime context is dead, so it never
+  // answers a ping and injecting another copy fails with "Identifier ... has
+  // already been declared". Detect that world and reload the tab instead.
+  const contentScriptGlobalsPresent = async () => {
+    try {
+      const [probe] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () =>
+          typeof globalThis.SUPPORTED_DELIVERY_CONTRACTS !== "undefined",
+      });
+      return probe?.result === true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  if (await contentScriptGlobalsPresent()) {
+    // A script that is merely still starting up answers within a moment.
+    health = await pollContentScriptHealth(4);
     if (hasRequiredContract(health)) return health;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await reloadTab(tabId);
+    await waitForTabLoad(tabId, CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS);
+    await injectMainWorld();
+    health = await pollContentScriptHealth(20);
+    if (hasRequiredContract(health)) return health;
+  } else {
+    // Content script not responsive — inject the shared helpers and listener in
+    // manifest order.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files:  ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
+    });
+
+    // Poll briefly instead of always paying a fixed 1s delay after injection.
+    health = await pollContentScriptHealth(10);
+    if (hasRequiredContract(health)) return health;
   }
 
   const error = new Error(
