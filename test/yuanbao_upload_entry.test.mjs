@@ -8,7 +8,7 @@ const source = fs.readFileSync(
   "utf8",
 );
 const helperCode = source.slice(
-  source.indexOf("/** Yuanbao labels its composer attach control"),
+  source.indexOf("const YUANBAO_ATTACH_LABEL_RE"),
   source.indexOf("/** Wait for the lazily created file input"),
 );
 
@@ -17,6 +17,7 @@ function makeButton(attrs = {}, { text = "" } = {}) {
     textContent: text,
     visible: true,
     clicks: 0,
+    querySelector: () => null,
     getAttribute(name) {
       return Object.prototype.hasOwnProperty.call(attrs, name)
         ? attrs[name]
@@ -28,18 +29,50 @@ function makeButton(attrs = {}, { text = "" } = {}) {
   };
 }
 
+function makeMenuItem({ text = "", textNode = null } = {}) {
+  return {
+    textContent: text,
+    visible: true,
+    clicks: 0,
+    querySelector(selector) {
+      return textNode && selector.includes("item-text") ? textNode : null;
+    },
+    getAttribute: () => null,
+    click() {
+      this.clicks += 1;
+    },
+  };
+}
+
 function createHarness({
+  composerIcon = null,
   composerButtons = [],
+  fallbackIcon = null,
   fallbackButtons = [],
   menuItems = [],
+  scopes = [".chat-input-editor"],
 } = {}) {
-  const composer = { querySelectorAll: () => composerButtons };
-  const document = {
+  const composer = {
     querySelector(selector) {
-      return selector === ".chat-command-editor-specail" ? composer : null;
+      return selector.includes("UploadFileSelector_iconButton") ? composerIcon : null;
+    },
+    querySelectorAll: () => composerButtons,
+  };
+  const body = {
+    querySelector(selector) {
+      return selector.includes("UploadFileSelector_iconButton") ? fallbackIcon : null;
+    },
+    querySelectorAll: () => fallbackButtons,
+  };
+  const document = {
+    body,
+    querySelector(selector) {
+      return scopes.includes(selector) ? composer : null;
     },
     querySelectorAll(selector) {
-      return selector.includes("menuitem") ? menuItems : fallbackButtons;
+      return selector.includes("menuitem") || selector.includes("dropdown__item")
+        ? menuItems
+        : [];
     },
   };
   const context = vm.createContext({
@@ -58,41 +91,45 @@ function createHarness({
   };
 }
 
-test("finds the attach button and menu item by their Chinese labels", async () => {
+const MENU_LABELS = ["本地文件", "Local Files"];
+
+test("finds the labelled attach control and menu row in the Chinese UI", async () => {
   const attach = makeButton({ "aria-label": "添加" });
-  const localFiles = makeButton({}, { text: "本地文件" });
-  const page = createHarness({
-    composerButtons: [attach],
-    menuItems: [localFiles],
-  });
+  const localFiles = makeMenuItem({ text: "本地文件" });
+  const page = createHarness({ composerButtons: [attach], menuItems: [localFiles] });
 
   assert.equal(page.find(), attach);
-  assert.equal(await page.menu(["本地文件", "Local Files"]), localFiles);
+  assert.equal(await page.menu(MENU_LABELS), localFiles);
 });
 
-test("finds the attach button and menu item in Yuanbao's English UI", async () => {
+test("finds the labelled attach control and menu row in the English UI", async () => {
   const attach = makeButton({ "aria-label": "Add" });
-  const localFiles = makeButton({}, { text: "Local Files" });
-  const page = createHarness({
-    composerButtons: [attach],
-    menuItems: [localFiles],
-  });
+  const localFiles = makeMenuItem({ text: "Local Files" });
+  const page = createHarness({ composerButtons: [attach], menuItems: [localFiles] });
 
   assert.equal(page.find(), attach);
-  assert.equal(await page.menu(["本地文件", "Local Files"]), localFiles);
+  assert.equal(await page.menu(MENU_LABELS), localFiles);
 });
 
-test("falls back to a page-wide scan and accepts menu aria-labels", async () => {
-  const attach = makeButton({ "aria-label": "Add" });
-  const localFiles = makeButton({ "aria-label": "Local Files" });
+test("finds the unlabelled UploadFileSelector icon and the TDesign dropdown row", async () => {
+  const attach = makeButton({ class: "UploadFileSelector_iconButton__LEwqk" });
+  const rowText = { textContent: "Local Files" };
+  const localFiles = makeMenuItem({ text: "Local Files", textNode: rowText });
+  const page = createHarness({ composerIcon: attach, menuItems: [localFiles] });
+
+  assert.equal(page.find(), attach);
+  assert.equal(await page.menu(MENU_LABELS), localFiles);
+});
+
+test("falls back to a page-wide icon scan when the composer scope changed", async () => {
+  const attach = makeButton({ class: "UploadFileSelector_iconButton__LEwqk" });
   const page = createHarness({
-    composerButtons: [],
-    fallbackButtons: [attach],
-    menuItems: [localFiles],
+    fallbackIcon: attach,
+    menuItems: [makeMenuItem({ text: "Local Files" })],
+    scopes: [],
   });
 
   assert.equal(page.find(), attach);
-  assert.equal(await page.menu(["本地文件", "Local Files"]), localFiles);
 });
 
 test("ignores hidden and unrelated attach controls", () => {

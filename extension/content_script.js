@@ -1207,6 +1207,9 @@ const SITE_ADAPTERS = {
 
   "yuanbao.tencent.com": {
     siteId: "yuanbao",
+    // Yuanbao renders KaTeX in HTML-only mode, so the DOM copy has lost the
+    // LaTeX source; the streamed Markdown still carries it.
+    preferNetworkAnswer: true,
     homeUrl: "https://yuanbao.tencent.com/",
     composerSelectors: [
       ".chat-command-editor-specail .ql-editor",
@@ -1347,10 +1350,17 @@ const SITE_ADAPTERS = {
         node.querySelector?.(".agent-chat__bubble__content") || node;
       const clone = cloneAssistantOutput(content);
       pruneAssistantStatusNodes(clone);
+      // The source list is page furniture: its link icon is an <img>, so the
+      // Markdown copy would end with an image that Zotero then downloads.
+      clone
+        .querySelectorAll?.(".hyc-common-markdown__ref-list")
+        .forEach((element) => element.remove());
       const markdown =
         clone.querySelector?.(".hyc-common-markdown") ||
         clone.querySelector?.(".hyc-content-text");
-      return htmlToMarkdown(markdown ? markdown.innerHTML : clone.innerHTML).trim();
+      return htmlToMarkdown(markdown ? markdown.innerHTML : clone.innerHTML)
+        .replace(/\u200b/g, "")
+        .trim();
     },
     dropTargetSelectors: [
       ".agent-chat__input-box",
@@ -1400,7 +1410,7 @@ const SITE_ADAPTERS = {
       const attachButton = findYuanbaoAttachButton();
       if (!attachButton) {
         throw new Error(
-          'Yuanbao attach button not found (expected aria-label "添加" or "Add").',
+          'Yuanbao attach control not found (expected an aria-label of "添加"/"Add" or [class*="UploadFileSelector_iconButton"]).',
         );
       }
       if (attachButton.getAttribute("aria-expanded") !== "true") {
@@ -1412,7 +1422,7 @@ const SITE_ADAPTERS = {
       );
       if (!menuItem) {
         throw new Error(
-          'Yuanbao "本地文件 / Local Files" menu item not found.',
+          'Yuanbao "本地文件 / Local Files" menu item not found in the attach menu.',
         );
       }
       document.documentElement.setAttribute(
@@ -1462,35 +1472,62 @@ function attachmentMatchOptions() {
   };
 }
 
-/** Yuanbao labels its composer attach control "添加" in Chinese and "Add" in English. */
-const YUANBAO_ATTACH_LABEL_RE = /^(?:添加|add)$/i;
+/**
+ * Yuanbao labels its composer attach control "添加" in Chinese and "Add" in
+ * English, and the current markup renders it as an unlabelled icon div.
+ */
+const YUANBAO_ATTACH_LABEL_RE =
+  /^(?:添加|add|新增|上传(?:图片或文件)?|upload(?: image or files)?|\+)$/i;
+const YUANBAO_ATTACH_CLASS_SELECTOR = '[class*="UploadFileSelector_iconButton"]';
 
-/** Find the composer attach button across Yuanbao locales. */
+/** Find the composer attach control across Yuanbao's markup revisions. */
 function findYuanbaoAttachButton() {
-  const scopes = [
-    document.querySelector(".chat-command-editor-specail"),
-    document.querySelector(".chat-command-editor"),
-    document,
-  ].filter(Boolean);
-  for (const scope of scopes) {
-    for (const candidate of scope.querySelectorAll(
-      "button, [role='button']",
-    )) {
+  const roots = [
+    ".chat-command-editor-specail",
+    ".chat-command-editor",
+    ".chat-input-editor",
+  ]
+    .map((selector) => document.querySelector(selector))
+    .filter(Boolean);
+  roots.push(document.body);
+  for (const root of roots) {
+    if (!root) continue;
+    const iconButton = root.querySelector(YUANBAO_ATTACH_CLASS_SELECTOR);
+    if (iconButton && isVisibleElement(iconButton)) return iconButton;
+    for (const candidate of root.querySelectorAll("button, [role='button']")) {
       if (!isVisibleElement(candidate)) continue;
-      const labels = [
-        candidate.getAttribute("aria-label"),
-        candidate.getAttribute("title"),
-      ];
-      if (
-        labels.some(
-          (label) => label && YUANBAO_ATTACH_LABEL_RE.test(label.trim()),
-        )
-      ) {
+      const label =
+        candidate.getAttribute("aria-label") || candidate.getAttribute("title");
+      if (label && YUANBAO_ATTACH_LABEL_RE.test(label.trim())) {
         return candidate;
       }
     }
   }
   return null;
+}
+
+/**
+ * The attach menu is either legacy `role="menuitem"` buttons or a TDesign
+ * dropdown whose rows carry no menuitem role.
+ */
+const YUANBAO_MENU_ITEM_SELECTOR = [
+  "[role='menuitem']",
+  "li.t-dropdown__item",
+  "[class*='t-dropdown__item']",
+].join(", ");
+
+/** Visible label of an attach-menu row, without nested badge text. */
+function yuanbaoMenuItemLabel(item) {
+  const textNode = item.querySelector?.(
+    ".t-dropdown__item-text, [class*='dropdown__item-text']",
+  );
+  const raw =
+    textNode?.textContent ||
+    item.getAttribute?.("aria-label") ||
+    item.getAttribute?.("title") ||
+    item.textContent ||
+    "";
+  return raw.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 /** Find a visible Yuanbao attach-menu item by label (Chinese or English). */
@@ -1500,20 +1537,9 @@ async function waitForYuanbaoMenuItem(labels, timeoutMs) {
     .filter(Boolean);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    for (const button of document.querySelectorAll(
-      "button[role='menuitem'], [role='menuitem']",
-    )) {
-      if (!isVisibleElement(button)) continue;
-      const text = (button.textContent || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-      const ariaLabel = (button.getAttribute("aria-label") || "")
-        .trim()
-        .toLowerCase();
-      if (expected.includes(text) || expected.includes(ariaLabel)) {
-        return button;
-      }
+    for (const item of document.querySelectorAll(YUANBAO_MENU_ITEM_SELECTOR)) {
+      if (!isVisibleElement(item)) continue;
+      if (expected.includes(yuanbaoMenuItemLabel(item))) return item;
     }
     await sleep(100);
   }
@@ -4210,9 +4236,11 @@ async function streamResponseSnapshots(
       assistantTurn?.text ||
       deepseekAnchoredSnapshot?.answerText ||
       "";
-    const answerText = shared.hasMeaningfulAssistantText(domAnswerText)
-      ? domAnswerText
-      : (shared.hasMeaningfulAssistantText(sseText) ? sseText : domAnswerText);
+    const answerText = shared.chooseAnswerText({
+      domText: domAnswerText,
+      sseText,
+      preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+    });
     const domThinking =
       assistantTurn?.thinking ||
       deepseekAnchoredSnapshot?.thinkingText ||
@@ -4484,8 +4512,11 @@ async function streamResponseSnapshots(
       completion.phase !== "verified_done"
     ) {
       // Use DOM answer if available, otherwise SSE answer
-      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
-        ? lastAnswerText : sseText;
+      const finalText = shared.chooseAnswerText({
+        domText: lastAnswerText,
+        sseText,
+        preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+      });
       const finalThinking = lastThinkingText || sseThinking || null;
       recordTurnDebug("sse_fast_completion", {
         seq,
@@ -4539,9 +4570,11 @@ async function streamResponseSnapshots(
       quietThresholdMs: deepseekQuietThresholdMs,
       completionPhase: completion.phase,
     })) {
-      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
-        ? lastAnswerText
-        : (shared.hasMeaningfulAssistantText(sseText) ? sseText : "");
+      const finalText = shared.chooseAnswerText({
+        domText: lastAnswerText,
+        sseText,
+        preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+      });
       const finalThinking = lastThinkingText || sseThinking || null;
 
       if (shared.hasMeaningfulAssistantText(finalText)) {
@@ -4635,9 +4668,11 @@ async function streamResponseSnapshots(
       countConversationRoleNodes(),
     );
   }
-  const timeoutAnswerText = shared.hasMeaningfulAssistantText(lastAnswerText)
-    ? lastAnswerText
-    : (shared.hasMeaningfulAssistantText(sseText) ? sseText : lastAnswerText);
+  const timeoutAnswerText = shared.chooseAnswerText({
+    domText: lastAnswerText,
+    sseText,
+    preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+  });
   const timeoutThinkingText = lastThinkingText || sseThinking || null;
 
   if (shared.hasMeaningfulAssistantText(timeoutAnswerText)) {

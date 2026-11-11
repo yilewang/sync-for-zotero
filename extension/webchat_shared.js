@@ -1030,6 +1030,17 @@
     return normalized.length > 1 && !isPlaceholderAssistantText(normalized);
   }
 
+  /**
+   * Pick the answer text to deliver. Sites that render math as HTML-only KaTeX
+   * opt in to preferring the streamed Markdown, which keeps the original LaTeX
+   * that the DOM copy has already flattened.
+   */
+  function chooseAnswerText({ domText = "", sseText = "", preferNetwork = false } = {}) {
+    if (preferNetwork && hasMeaningfulAssistantText(sseText)) return sseText;
+    if (hasMeaningfulAssistantText(domText)) return domText;
+    return hasMeaningfulAssistantText(sseText) ? sseText : domText;
+  }
+
   // Provider routes define both accepted navigation URLs and stable identities.
   // A ChatGPT Project changes the navigation path, but keeps the conversation ID.
   const CONVERSATION_ROUTES = {
@@ -1696,6 +1707,7 @@
     conversationUrlsMatch,
     createTurnCompletionTracker,
     hasMeaningfulAssistantText,
+    chooseAnswerText,
     hasNewExpectedAttachmentEvidence,
     hasPendingPdfEvidence,
     hasDeliverySignal,
