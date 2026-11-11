@@ -1380,14 +1380,17 @@ const SITE_ADAPTERS = {
         ) {
           return null;
         }
-        const match = parsed.pathname.match(/^\/chat\/([A-Za-z0-9_-]+)(?:\/[A-Za-z0-9_-]+)?\/?$/);
+        // /chat/<agentId>/<conversationId> — the conversation id is last.
+        const match = parsed.pathname.match(/^\/chat\/(?:[A-Za-z0-9_-]+\/)?([A-Za-z0-9_-]+)\/?$/);
         return match ? match[1] : null;
       } catch (_) {
         return null;
       }
     },
     // The sidebar lists conversations as rows carrying `data-conversation-id`;
-    // older builds used anchors, so both shapes are collected.
+    // older builds used anchors, so both shapes are collected. A conversation
+    // URL is /chat/<agentId>/<conversationId>: the row exposes the agent as
+    // `dt-agent-id`, and the current page is used when a row omits it.
     historyLinkSelector:
       ".yb-recent-conv-list__item, [data-conversation-id], a[href*='/chat/']",
     buildHistoryEntry(element) {
@@ -1396,15 +1399,23 @@ const SITE_ADAPTERS = {
         element.querySelector?.("[data-conversation-id]") ||
         element;
       const href = element.getAttribute?.("href") || "";
-      const hrefMatch = href.match(/\/chat\/([A-Za-z0-9_-]+)/);
+      const hrefMatch = href.match(
+        /\/chat\/(?:[A-Za-z0-9_-]+\/)?([A-Za-z0-9_-]+)/,
+      );
       const id =
         String(row.getAttribute?.("data-conversation-id") || "").trim() ||
         (hrefMatch ? hrefMatch[1] : "");
       if (!id) return null;
+      const agentId =
+        String(row.getAttribute?.("dt-agent-id") || "").trim() ||
+        (window.location.pathname.match(/^\/chat\/([A-Za-z0-9_-]+)(?:\/|$)/) ||
+          [])[1] ||
+        "";
+      if (!agentId) return null;
       return {
         id,
         title: row.textContent.trim(),
-        chatUrl: `https://yuanbao.tencent.com/chat/${id}`,
+        chatUrl: `https://yuanbao.tencent.com/chat/${agentId}/${id}`,
       };
     },
     deleteChatLinkSelector(chatId) {

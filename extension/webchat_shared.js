@@ -1061,9 +1061,9 @@
     },
     yuanbao: {
       origin: "https://yuanbao.tencent.com", prefix: "/chat/",
-      // Live conversations use /chat/<conversationId>/<turnId>; only the first
-      // segment identifies the conversation.
-      path: /^\/chat\/([A-Za-z0-9_-]+)(?:\/[A-Za-z0-9_-]+)?\/?$/,
+      // Conversations live at /chat/<agentId>/<conversationId>; the last
+      // segment identifies the conversation, the first one the agent.
+      path: /^\/chat\/(?:[A-Za-z0-9_-]+\/)?([A-Za-z0-9_-]+)\/?$/,
       id: /^[A-Za-z0-9_-]+$/,
     },
   };
