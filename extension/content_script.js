@@ -1386,19 +1386,29 @@ const SITE_ADAPTERS = {
         return null;
       }
     },
-    historyLinkSelector: 'a[href^="/chat/"]',
-    buildHistoryEntry(a) {
-      const href = a.getAttribute("href");
-      const match = href?.match(/^\/chat\/([A-Za-z0-9_-]+)/);
-      if (!match) return null;
+    // The sidebar lists conversations as rows carrying `data-conversation-id`;
+    // older builds used anchors, so both shapes are collected.
+    historyLinkSelector:
+      ".yb-recent-conv-list__item, [data-conversation-id], a[href*='/chat/']",
+    buildHistoryEntry(element) {
+      const row =
+        element.closest?.("[data-conversation-id]") ||
+        element.querySelector?.("[data-conversation-id]") ||
+        element;
+      const href = element.getAttribute?.("href") || "";
+      const hrefMatch = href.match(/\/chat\/([A-Za-z0-9_-]+)/);
+      const id =
+        String(row.getAttribute?.("data-conversation-id") || "").trim() ||
+        (hrefMatch ? hrefMatch[1] : "");
+      if (!id) return null;
       return {
-        id: match[1],
-        title: a.textContent.trim(),
-        chatUrl: `https://yuanbao.tencent.com/chat/${match[1]}`,
+        id,
+        title: row.textContent.trim(),
+        chatUrl: `https://yuanbao.tencent.com/chat/${id}`,
       };
     },
     deleteChatLinkSelector(chatId) {
-      return `a[href^="/chat/${chatId}"]`;
+      return `[data-conversation-id="${chatId}"], a[href*="/chat/${chatId}"]`;
     },
     supportsFileUpload: true,
     /**
