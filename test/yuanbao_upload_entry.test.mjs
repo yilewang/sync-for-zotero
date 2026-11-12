@@ -140,3 +140,10 @@ test("ignores hidden and unrelated attach controls", () => {
 
   assert.equal(page.find(), null);
 });
+
+test("stays quiet when the site renames the sent attachment", () => {
+  assert.match(
+    source,
+    /if \(SITE_ADAPTER\?\.submittedAttachmentEvidenceOptional !== true\) \{[\s\S]{0,240}site names differently/,
+  );
+});

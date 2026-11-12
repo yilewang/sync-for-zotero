@@ -4109,11 +4109,16 @@ async function streamResponseSnapshots(
           attachments.length > 0 &&
           contract.filenameMatched !== true
         ) {
-          console.warn(
-            `[sync-zotero] The submitted turn carries an attachment the ` +
-              `site names differently from "${expectedPdfFilename}" — ` +
-              `accepting it.`,
-          );
+          // Sites that opt into optional sent-turn evidence (Yuanbao) render
+          // the card with their own label, so a name mismatch here is expected
+          // and must not surface as an extension warning.
+          if (SITE_ADAPTER?.submittedAttachmentEvidenceOptional !== true) {
+            console.warn(
+              `[sync-zotero] The submitted turn carries an attachment the ` +
+                `site names differently from "${expectedPdfFilename}" — ` +
+                `accepting it.`,
+            );
+          }
           recordTurnDebug("submitted_pdf_name_unmatched", {
             seq,
             attempt,
