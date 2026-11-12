@@ -49,3 +49,45 @@ test("the Yuanbao adapter opts in and drops the source-list chrome", () => {
   assert.match(adapter, /\.hyc-common-markdown__ref-list/);
   assert.match(adapter, /\.replace\(\/\\u200b\/g, ""\)/);
 });
+
+test("Yuanbao anchors completion on the bubble that always renders", () => {
+  const adapterStart = contentScript.indexOf('"yuanbao.tencent.com": {');
+  const adapter = contentScript.slice(
+    adapterStart,
+    contentScript.indexOf("\n  },\n", adapterStart),
+  );
+
+  assert.match(adapter, /document\.querySelectorAll\("\.agent-chat__bubble--ai"\)/);
+  // The outer list item class is not rendered consistently, so anchoring the
+  // answer toolbar lookup on it made every finished answer look unfinished.
+  assert.doesNotMatch(adapter, /querySelectorAll\("\.agent-chat__list__item--ai"\)/);
+  assert.match(adapter, /terminalEvidenceFromSettledAnswer: true/);
+});
+
+test("a stalled counted stream stops pinning the turn open", () => {
+  assert.match(contentScript, /const TRANSPORT_STALL_TIMEOUT_MS = \d+_000;/);
+  assert.match(
+    contentScript,
+    /const transportStalled =\s*activeConversationStreamCount > 0 &&\s*nowMs - lastTransportActivityAt >= TRANSPORT_STALL_TIMEOUT_MS;/,
+  );
+  assert.match(
+    contentScript,
+    /isConversationStillRunning\(stopBtn, \{[\s\S]{0,160}transportStalled,/,
+  );
+  assert.match(contentScript, /activeConversationStreamCount > 0 && !transportStalled/);
+});
+
+test("a settled answer becomes terminal evidence for opted-in sites", () => {
+  assert.match(contentScript, /const SETTLED_ANSWER_EVIDENCE_MS = \d+_000;/);
+  assert.match(
+    contentScript,
+    /SITE_ADAPTER\?\.terminalEvidenceFromSettledAnswer === true[\s\S]{0,300}quietSinceMs >= SETTLED_ANSWER_EVIDENCE_MS/,
+  );
+});
+
+test("a confirmed composer card outranks an unreadable sent chip", () => {
+  assert.match(
+    contentScript,
+    /SITE_ADAPTER\?\.submittedAttachmentEvidenceOptional === true &&\s*attachmentRequested &&\s*submissionMeta\?\.pdfAttachmentReceipt\?\.filenameConfirmed === true/,
+  );
+});

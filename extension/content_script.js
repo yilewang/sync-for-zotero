@@ -861,6 +861,14 @@ const RESPONSE_TIMEOUT_MS = 60 * 60_000;
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 45_000;
 // ChatGPT mounts the transcript within seconds of the conversation URL settling; if no turn node appears within five minutes of entering the pending state, the page is not going to expose it.
 const PENDING_TRANSCRIPT_TIMEOUT_MS = 5 * 60_000;
+// A hooked stream can be left open after the provider finished the answer (the
+// app keeps the response body alive, or a second unrelated request matches the
+// conversation route). Treat its silence as "no longer running" so the turn can
+// complete instead of waiting out the full pipeline timeout.
+const TRANSPORT_STALL_TIMEOUT_MS = 30_000;
+// Sites that expose no reliable terminal marker may declare a settled answer as
+// terminal evidence after this much verified quiet.
+const SETTLED_ANSWER_EVIDENCE_MS = 6_000;
 let turnDebugEvents = [];
 let activeTurnDebugToken = null;
 
@@ -1301,12 +1309,21 @@ const SITE_ADAPTERS = {
     // has finished streaming.
     actionBarSelectors: [".agent-chat__conv--ai__toolbar"],
     isResponseComplete() {
-      const items = document.querySelectorAll(".agent-chat__list__item--ai");
-      const last = items[items.length - 1];
+      // The bubble class is the only wrapper this build guarantees; the outer
+      // list item class is not rendered consistently, so anchoring completion
+      // on it made every answer look unfinished.
+      const bubbles = document.querySelectorAll(".agent-chat__bubble--ai");
+      const last = bubbles[bubbles.length - 1];
       if (!last || !isVisibleElement(last)) return false;
-      const bar = last.querySelector(".agent-chat__conv--ai__toolbar");
+      const scope =
+        last.closest(".agent-chat__list__item--ai, .agent-chat__list__item") ||
+        last;
+      const bar = scope.querySelector(".agent-chat__conv--ai__toolbar");
       return Boolean(bar && isVisibleElement(bar));
     },
+    // The toolbar above is hover-revealed, so the answer text staying unchanged
+    // is the completion signal this site can actually provide.
+    terminalEvidenceFromSettledAnswer: true,
     thinkingSelectors: [
       ".hyc-component-reasoner__think",
       ".hyc-component-deepsearch-cot__think",
@@ -3388,6 +3405,7 @@ function isConversationStillRunning(
   {
     busyComposer = hasBusyComposerHint(),
     strongTransportCompletion = false,
+    transportStalled = false,
   } = {},
 ) {
   // Grace period: treat the conversation as still running if we saw transport
@@ -3399,9 +3417,12 @@ function isConversationStillRunning(
   const recentActivity =
     !strongTransportCompletion &&
     (Date.now() - lastTransportActivityAt) < 8000;
+  // A stream that stopped delivering events is not a run: keeping it counted
+  // pinned every completion signal to "still working" until the outer timeout.
+  const streamActive = activeConversationStreamCount > 0 && !transportStalled;
   return (
     Boolean(stopBtn) ||
-    activeConversationStreamCount > 0 ||
+    streamActive ||
     busyComposer ||
     recentActivity
   );
@@ -3719,6 +3740,7 @@ async function streamResponseSnapshots(
   let reportedDeepSeekMissingUserTurn = false;
   let reportedPendingTranscript = false;
   let pendingTranscriptSince = 0;
+  let settledTerminalEvidenceReported = false;
   let lastActiveRun = null;
   let toolUseDetected = false;
   let completionTracker = shared.createTurnCompletionTracker(Date.now());
@@ -3825,6 +3847,11 @@ async function streamResponseSnapshots(
     const stopBtn = findStopButton();
     const busyComposer = hasBusyComposerHint();
     const actionBarVisible = hasResponseActionBar(assistantTurnKey);
+    // A counted stream that stopped emitting events must not keep the turn
+    // "active" forever; the answer itself decides completion below.
+    const transportStalled =
+      activeConversationStreamCount > 0 &&
+      nowMs - lastTransportActivityAt >= TRANSPORT_STALL_TIMEOUT_MS;
     const strongTransportCompletion =
       shared.hasStrongTransportCompletionSignal({
         sseDone,
@@ -3839,14 +3866,7 @@ async function streamResponseSnapshots(
     const activeRun = isConversationStillRunning(stopBtn, {
       busyComposer,
       strongTransportCompletion,
-    });
-    const terminalEvidence = shared.hasVerifiedTerminalEvidence({
-      siteId: SITE_ADAPTER?.siteId,
-      sseDone,
-      activeConversationStreamCount,
-      actionBarVisible,
-      stopButtonVisible: Boolean(stopBtn),
-      busyComposer,
+      transportStalled,
     });
     if (SITE_ADAPTER?.siteId === "deepseek" && !requestContext) {
       requestContext = findObservedDeepSeekRequestContext(
@@ -3967,7 +3987,10 @@ async function streamResponseSnapshots(
       } else if (Date.now() > userTurnDeadline) {
         // Use strict active-run check (no transport grace period) for the deadline,
         // so SSE activity doesn't keep the deadline from firing indefinitely.
-        const strictActiveRun = Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint();
+        const strictActiveRun =
+          Boolean(stopBtn) ||
+          (activeConversationStreamCount > 0 && !transportStalled) ||
+          hasBusyComposerHint();
         const deepseekRequestObserved =
           SITE_ADAPTER?.siteId === "deepseek" && Boolean(requestContext);
 
@@ -4087,12 +4110,12 @@ async function streamResponseSnapshots(
         !attachmentContractVerified &&
         SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
         attachmentRequested &&
-        attachments.length === 0 &&
         submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true
       ) {
         // The site verified the card with the exact filename before the click
         // but no longer renders a readable name after sending (Yuanbao keeps
-        // only an icon chip), so the composer receipt is the evidence.
+        // only an icon chip), so the composer receipt is the evidence — a
+        // chip label that disagrees with it must not veto the verified card.
         attachmentContractVerified = true;
         submittedAttachmentVerified = true;
         recordTurnDebug("submitted_attachment_verified_via_composer", {
@@ -4302,6 +4325,41 @@ async function streamResponseSnapshots(
     const answerVisible = shared.hasMeaningfulAssistantText(answerText);
     const thinkingVisible = Boolean(thinkingText);
     const quietSinceMs = nowMs - Math.max(lastAnyProgressAt, lastTransportActivityAt || 0);
+
+    let terminalEvidence = shared.hasVerifiedTerminalEvidence({
+      siteId: SITE_ADAPTER?.siteId,
+      sseDone,
+      activeConversationStreamCount: transportStalled
+        ? 0
+        : activeConversationStreamCount,
+      actionBarVisible,
+      stopButtonVisible: Boolean(stopBtn),
+      busyComposer,
+    });
+    if (
+      !terminalEvidence &&
+      SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true &&
+      answerVisible &&
+      !stopBtn &&
+      !busyComposer &&
+      quietSinceMs >= SETTLED_ANSWER_EVIDENCE_MS
+    ) {
+      // The site exposes no dependable terminal marker (Yuanbao reveals its
+      // answer toolbar on hover and may not stream through a hooked request),
+      // so a visible answer that stopped changing is the only completion
+      // signal left. Without it the turn never settles and the plugin waits
+      // out the whole timeout while the page already shows the answer.
+      terminalEvidence = true;
+      if (!settledTerminalEvidenceReported) {
+        settledTerminalEvidenceReported = true;
+        recordTurnDebug("terminal_evidence_settled_answer", {
+          seq,
+          attempt,
+          quietForMs: quietSinceMs,
+          answerLength: lastAnswerText.length,
+        });
+      }
+    }
 
     // Detect tool-use patterns in SSE text or DOM content to adapt completion
     // timing. Once detected, stays true for the entire turn. Check both SSE
