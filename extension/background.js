@@ -202,6 +202,18 @@ const SITE_CONFIGS = {
     urlPrefix: "https://chat.deepseek.com",
     conversationUrlPattern: /\/a\/chat\/s\//,
   },
+  yuanbao: {
+    siteId: "yuanbao",
+    label: "Tencent Yuanbao",
+    homeUrl: "https://yuanbao.tencent.com/",
+    urlPattern: "https://yuanbao.tencent.com/*",
+    urlPrefix: "https://yuanbao.tencent.com",
+    conversationUrlPattern: /^https:\/\/yuanbao\.tencent\.com\/chat\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)?\/?(?:[?#].*)?$/,
+    // Yuanbao's home page immediately redirects to a freshly created
+    // /chat/<id> conversation, so a fresh chat can never satisfy a
+    // home-URL readiness match.
+    homeSettlesOnConversation: true,
+  },
 };
 
 const ALL_SITE_URL_PATTERNS = Object.values(SITE_CONFIGS).map(s => s.urlPattern);
@@ -1093,7 +1105,7 @@ async function pollForCommand() {
 
       let scrapeResult = null;
       try {
-        const scrape = (scrapeSiteConfig.siteId === "chatgpt" || scrapeSiteConfig.siteId === "gemini")
+        const scrape = (scrapeSiteConfig.siteId === "chatgpt" || scrapeSiteConfig.siteId === "gemini" || scrapeSiteConfig.siteId === "yuanbao")
           ? scrapeChatGPTHistory
           : scrapeDeepSeekHistory;
         scrapeResult = await scrape(scrapeSiteConfig, historyStartedAt);
@@ -1206,6 +1218,11 @@ async function runPipeline(query) {
   try {
     const siteConfig = getSiteConfig(queryTarget);
     const siteLabel = siteConfig.label;
+    // Sites whose home page redirects into a new conversation (Yuanbao) have
+    // no stable home URL to match during readiness checks.
+    const freshChatReadyUrl = siteConfig.homeSettlesOnConversation
+      ? null
+      : siteConfig.homeUrl;
     const expectedBinding = shared.resolveExpectedConversationBinding(query, queryTarget);
     activeTarget = queryTarget;
 
@@ -1308,9 +1325,15 @@ async function runPipeline(query) {
     );
     activeChatTabId = tab.id;
 
+    const readyExpectedChatUrl = shouldNavigateFresh
+      ? freshChatReadyUrl
+      : (expectedBinding.chatUrl ||
+        (siteConfig.homeSettlesOnConversation && isSiteHomeUrl(tab.url, siteConfig)
+          ? null
+          : (tab.url || null)));
     const readyState = await publishReadyConversationState(
       tab.id,
-      shouldNavigateFresh ? siteConfig.homeUrl : (expectedBinding.chatUrl || tab.url || null),
+      readyExpectedChatUrl,
       { submitScraped: false },
     );
 
@@ -1361,7 +1384,7 @@ async function runPipeline(query) {
       images:       query.images || null,
       chatgptMode:  query.chatgpt_mode || null,
       deliveryContractVersion: query.delivery_contract_version,
-      expectedChatUrl: expectedBinding.chatUrl || (shouldNavigateFresh ? siteConfig.homeUrl : null),
+      expectedChatUrl: expectedBinding.chatUrl || (shouldNavigateFresh ? freshChatReadyUrl : null),
       forceNewChat: shouldNavigateFresh,
       seq,
       attempt,
@@ -1754,6 +1777,7 @@ function streamPipeline(tabId, payload) {
           () => serverPost("/update_partial", {
             seq:     payload.seq,
             attempt: payload.attempt,
+            heartbeat: msg.heartbeat === true,
             answer_snapshot: msg.answerSnapshot ?? msg.text ?? null,
             thinking_snapshot: msg.thinkingSnapshot ?? msg.thinking ?? null,
             text:    msg.text    ?? null,

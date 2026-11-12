@@ -855,8 +855,20 @@ const shared = globalThis.SyncZoteroShared || {
 const WEBCHAT_DEBUG = false;
 const TURN_DEBUG_EVENT_LIMIT = 200;
 const RESPONSE_TIMEOUT_MS = 60 * 60_000;
+// A reasoning model can keep working for minutes without changing any visible
+// text. Report that the run is still alive at this cadence so the plugin's
+// progress-based timeout does not mistake a long think for a stalled pipeline.
+const ACTIVITY_HEARTBEAT_INTERVAL_MS = 45_000;
 // ChatGPT mounts the transcript within seconds of the conversation URL settling; if no turn node appears within five minutes of entering the pending state, the page is not going to expose it.
 const PENDING_TRANSCRIPT_TIMEOUT_MS = 5 * 60_000;
+// A hooked stream can be left open after the provider finished the answer (the
+// app keeps the response body alive, or a second unrelated request matches the
+// conversation route). Treat its silence as "no longer running" so the turn can
+// complete instead of waiting out the full pipeline timeout.
+const TRANSPORT_STALL_TIMEOUT_MS = 30_000;
+// Sites that expose no reliable terminal marker may declare a settled answer as
+// terminal evidence after this much verified quiet.
+const SETTLED_ANSWER_EVIDENCE_MS = 6_000;
 let turnDebugEvents = [];
 let activeTurnDebugToken = null;
 
@@ -1201,12 +1213,397 @@ const SITE_ADAPTERS = {
     disablesComposerDuringStreaming: true,
   },
 
+  "yuanbao.tencent.com": {
+    siteId: "yuanbao",
+    // Yuanbao renders KaTeX in HTML-only mode, so the DOM copy has lost the
+    // LaTeX source; the streamed Markdown still carries it.
+    preferNetworkAnswer: true,
+    homeUrl: "https://yuanbao.tencent.com/",
+    composerSelectors: [
+      ".chat-command-editor-specail .ql-editor",
+      ".chat-input-editor .ql-editor",
+      ".ql-editor[contenteditable='true']",
+      ".ql-editor",
+      "div[contenteditable='true']",
+      "textarea",
+    ],
+    sendButtonSelectors() {
+      const direct = document.querySelector("#yuanbao-send-btn");
+      if (direct && isVisibleElement(direct)) return direct;
+      const icon = document.querySelector(".icon-send, [class*='SendButton_sendButton']");
+      if (!icon || !isVisibleElement(icon)) return null;
+      return icon.closest("#yuanbao-send-btn, button, [role='button']") || icon;
+    },
+    findStopButton() {
+      const direct = document.querySelector("#yuanbao-stop-btn");
+      if (direct && isVisibleElement(direct)) return direct;
+      for (const selector of [
+        ".icon-stop",
+        ".icon-pause",
+        "[class*='StopButton']",
+        "[class*='stopButton']",
+      ]) {
+        const icon = document.querySelector(selector);
+        if (icon && isVisibleElement(icon)) {
+          return icon.closest("button, [role='button'], div[class*='stop'], div[class*='Stop']") || icon;
+        }
+      }
+      return null;
+    },
+    userMessageSelector: ".agent-chat__bubble--human",
+    assistantMessageSelectors: [".agent-chat__bubble--ai"],
+    conversationMessageSelector:
+      ".agent-chat__bubble--ai, .agent-chat__bubble--human",
+    getMessageRole(node) {
+      if (node.classList?.contains("agent-chat__bubble--ai")) return "assistant";
+      if (node.classList?.contains("agent-chat__bubble--human")) return "user";
+      return null;
+    },
+    getMessageId(node) {
+      return node.getAttribute("data-message-id") || node.id || null;
+    },
+    conversationTurnSelector: null,
+    // Yuanbao keeps a "解析中/上传中" label on the composer file card until the
+    // message is actually sent, so waiting for it to disappear never succeeds.
+    attachmentPendingIsReady: true,
+    // Yuanbao truncates the composer card filename ("Zhang 等 - 2026 - …"),
+    // so matching the card needs a truncated-prefix comparison.
+    attachmentTruncatedPrefixMatch: true,
+    // A name-confirmed card that no longer reports progress is ready for this
+    // site even though the pending label never clears before sending.
+    attachmentSettledIsReady: true,
+    // The sent user turn collapses the file card to an icon-only chip: no
+    // filename text survives in the DOM, so post-send verification has to
+    // trust the composer card that was confirmed before the click.
+    submittedAttachmentEvidenceOptional: true,
+    extractAttachmentNames(node) {
+      if (!node) return [];
+      const scope =
+        node.closest?.(".agent-chat__list__item--human") ||
+        node.closest?.(".agent-chat__list__item") ||
+        node;
+      const names = [];
+      const push = (value) => {
+        const text = shared.normalizeComposerText(value || "");
+        if (!text || text.length < 2 || text.length > 200) return;
+        if (!/\bpdf\b|\.pdf/i.test(text)) return;
+        if (!names.includes(text)) names.push(text);
+      };
+      // A compact card keeps a "PDF" token next to the (truncated) name or a
+      // size/status label, while the prompt bubble itself is long-form text.
+      scope.querySelectorAll("div, span").forEach((element) => {
+        const text = shared.normalizeComposerText(element.textContent || "");
+        if (!text || text.length > 120) return;
+        if (!/\bpdf\b|\.pdf/i.test(text)) return;
+        if (!shared.attachmentEvidenceHasFileCardSignal(text, true)) return;
+        push(text);
+      });
+      scope.querySelectorAll("[title], [aria-label]").forEach((element) => {
+        const label =
+          element.getAttribute("title") || element.getAttribute("aria-label");
+        if (label && /\.pdf(?:\b|$)/i.test(label)) push(label);
+      });
+      return names;
+    },
+    // Yuanbao renders the copy/share/regenerate toolbar only once the answer
+    // has finished streaming.
+    actionBarSelectors: [".agent-chat__conv--ai__toolbar"],
+    isResponseComplete() {
+      // The bubble class is the only wrapper this build guarantees; the outer
+      // list item class is not rendered consistently, so anchoring completion
+      // on it made every answer look unfinished.
+      const bubbles = document.querySelectorAll(".agent-chat__bubble--ai");
+      const last = bubbles[bubbles.length - 1];
+      if (!last || !isVisibleElement(last)) return false;
+      const scope =
+        last.closest(".agent-chat__list__item--ai, .agent-chat__list__item") ||
+        last;
+      const bar = scope.querySelector(".agent-chat__conv--ai__toolbar");
+      return Boolean(bar && isVisibleElement(bar));
+    },
+    // The toolbar above is hover-revealed, so the answer text staying unchanged
+    // is the completion signal this site can actually provide.
+    terminalEvidenceFromSettledAnswer: true,
+    thinkingSelectors: [
+      ".hyc-component-reasoner__think",
+      ".hyc-component-deepsearch-cot__think",
+      ".hyc-think-content-scroller",
+      "[class*='reasoner__think']",
+      "[class*='think-content']",
+      "[class*='think']",
+      "[class*='reason']",
+      "[class*='deepsearch']",
+      "[data-testid*='thinking']",
+      "[data-testid*='reasoning']",
+    ],
+    pruneThinkingSelectors: [
+      ".hyc-component-reasoner__think",
+      ".hyc-component-deepsearch-cot__think",
+      ".hyc-think-content-scroller",
+      "[class*='reasoner']",
+      "[class*='think']",
+      "[class*='reason']",
+      "[class*='deepsearch']",
+      "[data-testid*='thinking']",
+      "[data-testid*='reasoning']",
+    ],
+    // Yuanbao wraps the reasoning trace in a sibling block of the answer, so
+    // the thinking text used to leak into the answer and render as plain prose
+    // in Zotero. Split it out here so the plugin can fold it.
+    extractAssistantThinkingText(node) {
+      if (!node) return null;
+      const content =
+        node.querySelector?.(".agent-chat__bubble__content") || node;
+      const blocks = findYuanbaoThinkingElements(content);
+      const text = stripYuanbaoThinkingLabel(
+        shared.normalizeComposerText(
+          blocks.map((block) => block.textContent || "").join("\n\n"),
+        ),
+      );
+      return text.length > 2 ? text : null;
+    },
+    extractAssistantAnswerText(node) {
+      const content =
+        node.querySelector?.(".agent-chat__bubble__content") || node;
+      const clone = cloneAssistantOutput(content);
+      pruneAssistantStatusNodes(clone);
+      // The source list is page furniture: its link icon is an <img>, so the
+      // Markdown copy would end with an image that Zotero then downloads.
+      clone
+        .querySelectorAll?.(".hyc-common-markdown__ref-list")
+        .forEach((element) => element.remove());
+      // A long report is split into one Markdown block per section; reading a
+      // single block truncated the answer (and a thinking-only bubble read as
+      // empty, which left the plugin waiting on a finished turn). Collect the
+      // innermost blocks so nested wrappers do not duplicate their text.
+      const blocks = Array.from(
+        clone.querySelectorAll?.(".hyc-common-markdown, .hyc-content-text") ||
+          [],
+      ).filter(
+        (block) =>
+          !block.querySelector(".hyc-common-markdown, .hyc-content-text"),
+      );
+      const html = blocks.length
+        ? blocks.map((block) => block.innerHTML).join("\n\n")
+        : clone.innerHTML;
+      return htmlToMarkdown(html).replace(/\u200b/g, "").trim();
+    },
+    dropTargetSelectors: [
+      ".agent-chat__input-box",
+      ".chat-input-editor",
+      ".ql-editor",
+    ],
+    fileInputSelectors: ['input[type="file"]'],
+    attachmentPillSelector:
+      '[class*="attachment"], [class*="file-card"], [class*="upload"]',
+    getChatIdFromUrl(url) {
+      try {
+        const parsed = new URL(shared.normalizeConversationUrl(url));
+        if (
+          parsed.origin !== "https://yuanbao.tencent.com" ||
+          parsed.username ||
+          parsed.password
+        ) {
+          return null;
+        }
+        // /chat/<agentId>/<conversationId> — the conversation id is last.
+        const match = parsed.pathname.match(/^\/chat\/(?:[A-Za-z0-9_-]+\/)?([A-Za-z0-9_-]+)\/?$/);
+        return match ? match[1] : null;
+      } catch (_) {
+        return null;
+      }
+    },
+    // The sidebar lists conversations as rows carrying `data-conversation-id`;
+    // older builds used anchors, so both shapes are collected. A conversation
+    // URL is /chat/<agentId>/<conversationId>: the row exposes the agent as
+    // `dt-agent-id`, and the current page is used when a row omits it.
+    historyLinkSelector:
+      ".yb-recent-conv-list__item, [data-conversation-id], a[href*='/chat/']",
+    buildHistoryEntry(element) {
+      const row =
+        element.closest?.("[data-conversation-id]") ||
+        element.querySelector?.("[data-conversation-id]") ||
+        element;
+      const href = element.getAttribute?.("href") || "";
+      const hrefMatch = href.match(
+        /\/chat\/(?:[A-Za-z0-9_-]+\/)?([A-Za-z0-9_-]+)/,
+      );
+      const id =
+        String(row.getAttribute?.("data-conversation-id") || "").trim() ||
+        (hrefMatch ? hrefMatch[1] : "");
+      if (!id) return null;
+      const agentId =
+        String(row.getAttribute?.("dt-agent-id") || "").trim() ||
+        (window.location.pathname.match(/^\/chat\/([A-Za-z0-9_-]+)(?:\/|$)/) ||
+          [])[1] ||
+        "";
+      if (!agentId) return null;
+      return {
+        id,
+        title: row.textContent.trim(),
+        chatUrl: `https://yuanbao.tencent.com/chat/${agentId}/${id}`,
+      };
+    },
+    deleteChatLinkSelector(chatId) {
+      return `[data-conversation-id="${chatId}"], a[href*="/chat/${chatId}"]`;
+    },
+    supportsFileUpload: true,
+    /**
+     * Yuanbao has no persistent file input: the attach menu item ("本地文件" /
+     * "Local Files") creates one lazily and opens the native picker.
+     * injected.js intercepts that click, then this fills the captured input.
+     */
+    async uploadFile(file) {
+      const attachButton = findYuanbaoAttachButton();
+      if (!attachButton) {
+        throw new Error(
+          'Yuanbao attach control not found (expected an aria-label of "添加"/"Add" or [class*="UploadFileSelector_iconButton"]).',
+        );
+      }
+      if (attachButton.getAttribute("aria-expanded") !== "true") {
+        attachButton.click();
+      }
+      const menuItem = await waitForYuanbaoMenuItem(
+        ["本地文件", "Local Files"],
+        5000,
+      );
+      if (!menuItem) {
+        throw new Error(
+          'Yuanbao "本地文件 / Local Files" menu item not found in the attach menu.',
+        );
+      }
+      document.documentElement.setAttribute(
+        "data-sync-zotero-capture-file-input",
+        "1",
+      );
+      try {
+        menuItem.click();
+        const input = await waitForYuanbaoFileInput(4000);
+        if (!input) {
+          throw new Error("Yuanbao file input did not appear.");
+        }
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        input.files = dataTransfer.files;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      } finally {
+        document.documentElement.removeAttribute(
+          "data-sync-zotero-capture-file-input",
+        );
+      }
+    },
+    supportsModelSelector: false,
+    hasFormWrapper: false,
+    /** Quill composer keeps accepting input while a response streams. */
+    disablesComposerDuringStreaming: false,
+  },
+
 };
 
 const SITE_ADAPTER = SITE_ADAPTERS[window.location.hostname];
 if (!SITE_ADAPTER) {
   // Unknown site — content script should not run
   console.warn("[sync-zotero] Unsupported site:", window.location.hostname);
+}
+
+/**
+ * Attachment matching options for the active site. Provider-specific leniency
+ * (truncated card names, settled pending cards) must opt in from the adapter so
+ * every other site keeps the stricter shared behaviour.
+ */
+function attachmentMatchOptions() {
+  return {
+    allowTruncatedPrefix:
+      SITE_ADAPTER?.attachmentTruncatedPrefixMatch === true,
+  };
+}
+
+/**
+ * Yuanbao labels its composer attach control "添加" in Chinese and "Add" in
+ * English, and the current markup renders it as an unlabelled icon div.
+ */
+const YUANBAO_ATTACH_LABEL_RE =
+  /^(?:添加|add|新增|上传(?:图片或文件)?|upload(?: image or files)?|\+)$/i;
+const YUANBAO_ATTACH_CLASS_SELECTOR = '[class*="UploadFileSelector_iconButton"]';
+
+/** Find the composer attach control across Yuanbao's markup revisions. */
+function findYuanbaoAttachButton() {
+  const roots = [
+    ".chat-command-editor-specail",
+    ".chat-command-editor",
+    ".chat-input-editor",
+  ]
+    .map((selector) => document.querySelector(selector))
+    .filter(Boolean);
+  roots.push(document.body);
+  for (const root of roots) {
+    if (!root) continue;
+    const iconButton = root.querySelector(YUANBAO_ATTACH_CLASS_SELECTOR);
+    if (iconButton && isVisibleElement(iconButton)) return iconButton;
+    for (const candidate of root.querySelectorAll("button, [role='button']")) {
+      if (!isVisibleElement(candidate)) continue;
+      const label =
+        candidate.getAttribute("aria-label") || candidate.getAttribute("title");
+      if (label && YUANBAO_ATTACH_LABEL_RE.test(label.trim())) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The attach menu is either legacy `role="menuitem"` buttons or a TDesign
+ * dropdown whose rows carry no menuitem role.
+ */
+const YUANBAO_MENU_ITEM_SELECTOR = [
+  "[role='menuitem']",
+  "li.t-dropdown__item",
+  "[class*='t-dropdown__item']",
+].join(", ");
+
+/** Visible label of an attach-menu row, without nested badge text. */
+function yuanbaoMenuItemLabel(item) {
+  const textNode = item.querySelector?.(
+    ".t-dropdown__item-text, [class*='dropdown__item-text']",
+  );
+  const raw =
+    textNode?.textContent ||
+    item.getAttribute?.("aria-label") ||
+    item.getAttribute?.("title") ||
+    item.textContent ||
+    "";
+  return raw.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/** Find a visible Yuanbao attach-menu item by label (Chinese or English). */
+async function waitForYuanbaoMenuItem(labels, timeoutMs) {
+  const expected = (Array.isArray(labels) ? labels : [labels])
+    .map((label) => String(label || "").trim().toLowerCase())
+    .filter(Boolean);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const item of document.querySelectorAll(YUANBAO_MENU_ITEM_SELECTOR)) {
+      if (!isVisibleElement(item)) continue;
+      if (expected.includes(yuanbaoMenuItemLabel(item))) return item;
+    }
+    await sleep(100);
+  }
+  return null;
+}
+
+/** Wait for the lazily created file input captured by injected.js. */
+async function waitForYuanbaoFileInput(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const input = document.querySelector(
+      'input[type="file"][data-sync-zotero-file-input="1"]',
+    );
+    if (input) return input;
+    await sleep(50);
+  }
+  return null;
 }
 
 /** Wait until a selector matches, polling every 200 ms up to `timeout` ms. */
@@ -1543,7 +1940,7 @@ async function attachImages(imageDataUrls) {
 // ---------------------------------------------------------------------------
 
 const PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS = 15000;
-const PDF_ATTACHMENT_READY_TIMEOUT_MS = 30000;
+const PDF_ATTACHMENT_READY_TIMEOUT_MS = 45000;
 const PDF_ATTACHMENT_POLL_INTERVAL_MS = 100;
 const SUBMITTED_ATTACHMENT_CONTRACT_TIMEOUT_MS = 3000;
 
@@ -1580,6 +1977,7 @@ function hasExplicitComposerFileControl(region, expectedFilename) {
         ? shared.attachmentEvidenceMatchesFilename(
           controlText,
           expectedFilename,
+          attachmentMatchOptions(),
         )
         : true;
     }),
@@ -1613,7 +2011,11 @@ function collectComposerRegionAttachmentEvidence(
         hasExplicitFileControl,
       );
     const matchesExpected = expectedFilename
-      ? shared.attachmentEvidenceMatchesFilename(text, expectedFilename)
+      ? shared.attachmentEvidenceMatchesFilename(
+        text,
+        expectedFilename,
+        attachmentMatchOptions(),
+      )
       : shared.hasPendingPdfEvidence([text], hasExplicitFileControl);
     if (matchesExpected && hasAttachmentMetadata) {
       if (!expectedFilename) {
@@ -1688,7 +2090,7 @@ function collectVisibleComposerAttachmentEvidence(expectedFilename) {
     }
 
     let evidenceNode = candidate;
-    for (let depth = 0; depth < 5 && evidenceNode; depth++) {
+    for (let depth = 0; depth < 6 && evidenceNode; depth++) {
       if (
         !expectedFilename &&
         evidenceNode.closest?.(messageSelector)
@@ -1753,8 +2155,12 @@ function collectComposerFileCardNodes() {
     if (candidates.includes(node) || !isCandidate(node)) return;
     const text = readAttachmentEvidenceText(node);
     if (text.length > FILE_CARD_MAX_TEXT_LENGTH) return;
+    // Some sites (Yuanbao) truncate the card name and print the type as a
+    // bare "PDF" token, so a ".pdf" suffix never appears. Pair a PDF token
+    // with the card metadata (size or status) instead.
+    const hasPdfToken = /\.pdf(?:\b|$)|\bpdf\b/i.test(text);
     if (
-      /\.pdf(?:\b|$)/i.test(text) &&
+      hasPdfToken &&
       shared.attachmentEvidenceHasFileCardSignal(text, true)
     ) {
       candidates.push(node);
@@ -1807,6 +2213,11 @@ async function waitForPdfAttachmentConfirmation({
     acceptTimeoutMs: PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS,
     readyTimeoutMs: PDF_ATTACHMENT_READY_TIMEOUT_MS,
     pollIntervalMs: PDF_ATTACHMENT_POLL_INTERVAL_MS,
+    allowPendingAttachment: Boolean(SITE_ADAPTER?.attachmentPendingIsReady),
+    allowSettledAttachment: Boolean(SITE_ADAPTER?.attachmentSettledIsReady),
+    allowTruncatedPrefix: Boolean(
+      SITE_ADAPTER?.attachmentTruncatedPrefixMatch,
+    ),
   });
 }
 
@@ -1857,10 +2268,11 @@ async function attachPDF(pdfBase64, pdfFilename) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const file = new File([bytes], pdfFilename, { type: "application/pdf" });
 
-  if (SITE_ADAPTER?.uploadFile) return SITE_ADAPTER.uploadFile(file);
-
   let method = "drag_drop";
-  if (
+  if (SITE_ADAPTER?.uploadFile) {
+    await SITE_ADAPTER.uploadFile(file);
+    method = "adapter_upload";
+  } else if (
     applyFilesToComposerFileInput(
       [file],
       SITE_ADAPTER?.fileInputSelectors || [],
@@ -3002,6 +3414,7 @@ function isConversationStillRunning(
   {
     busyComposer = hasBusyComposerHint(),
     strongTransportCompletion = false,
+    transportStalled = false,
   } = {},
 ) {
   // Grace period: treat the conversation as still running if we saw transport
@@ -3013,9 +3426,12 @@ function isConversationStillRunning(
   const recentActivity =
     !strongTransportCompletion &&
     (Date.now() - lastTransportActivityAt) < 8000;
+  // A stream that stopped delivering events is not a run: keeping it counted
+  // pinned every completion signal to "still working" until the outer timeout.
+  const streamActive = activeConversationStreamCount > 0 && !transportStalled;
   return (
     Boolean(stopBtn) ||
-    activeConversationStreamCount > 0 ||
+    streamActive ||
     busyComposer ||
     recentActivity
   );
@@ -3320,6 +3736,7 @@ async function streamResponseSnapshots(
   let lastUserTurnKey = null;
   let lastAssistantTurnKey = null;
   let lastAnyProgressAt = Date.now();
+  let lastHeartbeatAt = Date.now();
   const deadline = Date.now() + timeoutMs;
   const userTurnDeadline = Date.now() + 30_000;
   const emitTerminal = (payload) => {
@@ -3332,6 +3749,8 @@ async function streamResponseSnapshots(
   let reportedDeepSeekMissingUserTurn = false;
   let reportedPendingTranscript = false;
   let pendingTranscriptSince = 0;
+  let reportedRelaxedMissingUserTurn = false;
+  let settledTerminalEvidenceReported = false;
   let lastActiveRun = null;
   let toolUseDetected = false;
   let completionTracker = shared.createTurnCompletionTracker(Date.now());
@@ -3438,6 +3857,11 @@ async function streamResponseSnapshots(
     const stopBtn = findStopButton();
     const busyComposer = hasBusyComposerHint();
     const actionBarVisible = hasResponseActionBar(assistantTurnKey);
+    // A counted stream that stopped emitting events must not keep the turn
+    // "active" forever; the answer itself decides completion below.
+    const transportStalled =
+      activeConversationStreamCount > 0 &&
+      nowMs - lastTransportActivityAt >= TRANSPORT_STALL_TIMEOUT_MS;
     const strongTransportCompletion =
       shared.hasStrongTransportCompletionSignal({
         sseDone,
@@ -3452,14 +3876,7 @@ async function streamResponseSnapshots(
     const activeRun = isConversationStillRunning(stopBtn, {
       busyComposer,
       strongTransportCompletion,
-    });
-    const terminalEvidence = shared.hasVerifiedTerminalEvidence({
-      siteId: SITE_ADAPTER?.siteId,
-      sseDone,
-      activeConversationStreamCount,
-      actionBarVisible,
-      stopButtonVisible: Boolean(stopBtn),
-      busyComposer,
+      transportStalled,
     });
     if (SITE_ADAPTER?.siteId === "deepseek" && !requestContext) {
       requestContext = findObservedDeepSeekRequestContext(
@@ -3580,9 +3997,19 @@ async function streamResponseSnapshots(
       } else if (Date.now() > userTurnDeadline) {
         // Use strict active-run check (no transport grace period) for the deadline,
         // so SSE activity doesn't keep the deadline from firing indefinitely.
-        const strictActiveRun = Boolean(stopBtn) || activeConversationStreamCount > 0 || hasBusyComposerHint();
+        const strictActiveRun =
+          Boolean(stopBtn) ||
+          (activeConversationStreamCount > 0 && !transportStalled) ||
+          hasBusyComposerHint();
         const deepseekRequestObserved =
           SITE_ADAPTER?.siteId === "deepseek" && Boolean(requestContext);
+        // Sites that declare their sent turn unreadable cannot be verified by
+        // matching its text. The composer held exactly this prompt (and the
+        // file card was confirmed before the click), so a new turn after the
+        // baseline is ours even when its text never matches.
+        const relaxedUserTurnEvidence =
+          SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+          submissionMeta?.composerTextMatched === true;
 
         if (!strictActiveRun) {
           // Fallback: take the last user message after baseline (position-based).
@@ -3616,6 +4043,37 @@ async function streamResponseSnapshots(
                 requestSerial: requestContext?.requestSerial || null,
                 remoteChatUrl,
                 remoteChatId,
+              });
+            }
+          } else if (relaxedUserTurnEvidence) {
+            if (fallbackCandidates.length > 0) {
+              const fallback = fallbackCandidates[fallbackCandidates.length - 1];
+              matchedUserTurn = fallback;
+              userTurnKey = fallback.messageKey;
+              recordTurnDebug("user_turn_position_fallback", {
+                seq,
+                attempt,
+                userTurnKey,
+                siteDeclaredUnreadableTurn: true,
+              });
+              postTurnState(port, {
+                seq, attempt, remoteChatUrl, remoteChatId,
+                baselineTranscriptCount, baselineTranscriptHash,
+                userTurnKey, turnStatus: "user_turn_matched",
+                diagnostic: makeTurnDiagnostic("user_turn_matched", {
+                  reasonCode: "user_turn_position_fallback",
+                  userTurnMatched: true,
+                }),
+              });
+            } else if (!reportedRelaxedMissingUserTurn) {
+              // The site never mounts a readable user turn at all; the answer
+              // after the baseline is the remaining evidence of delivery.
+              reportedRelaxedMissingUserTurn = true;
+              recordTurnDebug("user_turn_unavailable_relaxed_site", {
+                seq,
+                attempt,
+                newMessages: newMessages.length,
+                ...countConversationRoleNodes(),
               });
             }
           } else if (SITE_ADAPTER?.siteId !== "deepseek" && fallbackCandidates.length > 0) {
@@ -3682,25 +4140,56 @@ async function streamResponseSnapshots(
       const attachments = Array.isArray(matchedUserTurn.attachments)
         ? matchedUserTurn.attachments
         : [];
-      const contract = (SITE_ADAPTER?.classifySubmittedAttachments || shared.classifySubmittedPdfContract)(
-        attachments,
-        expectedPdfFilename,
-        expectedImageCount,
-      );
+      const classify = SITE_ADAPTER?.classifySubmittedAttachments;
+      const contract = classify
+        ? classify(attachments, expectedPdfFilename, expectedImageCount)
+        : shared.classifySubmittedPdfContract(
+            attachments,
+            expectedPdfFilename,
+            attachmentMatchOptions(),
+          );
       submittedAttachmentVerified = attachmentRequested
         ? contract.filenameMatched === true
         : null;
       submittedAttachmentCount = contract.attachmentCount;
       submittedPdfCount = contract.pdfAttachmentCount;
       attachmentContractVerified = contract.contractVerified === true;
+      if (
+        !attachmentContractVerified &&
+        SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+        attachmentRequested &&
+        submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true
+      ) {
+        // The site verified the card with the exact filename before the click
+        // but no longer renders a readable name after sending (Yuanbao keeps
+        // only an icon chip), so the composer receipt is the evidence — a
+        // chip label that disagrees with it must not veto the verified card.
+        attachmentContractVerified = true;
+        submittedAttachmentVerified = true;
+        recordTurnDebug("submitted_attachment_verified_via_composer", {
+          seq,
+          attempt,
+          userTurnKey: matchedUserTurn.messageKey,
+          expectedPdfFilename,
+        });
+      }
       if (attachmentContractVerified) {
         userTurnKey = matchedUserTurn.messageKey;
-        if (attachmentRequested && contract.filenameMatched !== true) {
-          console.warn(
-            `[sync-zotero] The submitted turn carries an attachment the ` +
-              `site names differently from "${expectedPdfFilename}" — ` +
-              `accepting it.`,
-          );
+        if (
+          attachmentRequested &&
+          attachments.length > 0 &&
+          contract.filenameMatched !== true
+        ) {
+          // Sites that opt into optional sent-turn evidence (Yuanbao) render
+          // the card with their own label, so a name mismatch here is expected
+          // and must not surface as an extension warning.
+          if (SITE_ADAPTER?.submittedAttachmentEvidenceOptional !== true) {
+            console.warn(
+              `[sync-zotero] The submitted turn carries an attachment the ` +
+                `site names differently from "${expectedPdfFilename}" — ` +
+                `accepting it.`,
+            );
+          }
           recordTurnDebug("submitted_pdf_name_unmatched", {
             seq,
             attempt,
@@ -3752,6 +4241,18 @@ async function streamResponseSnapshots(
       );
     }
 
+    // Evidence that the requested attachment reached the site. The turn-level
+    // contract above can only run once the sent user turn is mounted; sites
+    // that declare their sent turn unreadable confirmed the exact file card in
+    // the composer before the click, and that receipt is the delivery proof.
+    // Without this fallback the answer could stream in while the emit gate
+    // stayed closed forever.
+    const attachmentDeliveryVerified =
+      attachmentContractVerified ||
+      (SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+        (!attachmentRequested ||
+          submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true));
+
     const previousAssistantTurnKey = assistantTurnKey;
     const assistantTurn = userTurnKey
       ? resolveBoundAssistantTurn(
@@ -3760,7 +4261,8 @@ async function streamResponseSnapshots(
         assistantTurnKey,
       )
       : (
-        SITE_ADAPTER?.siteId === "deepseek" && requestContext
+        (SITE_ADAPTER?.siteId === "deepseek" && requestContext) ||
+        SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
           ? resolveLatestAssistantTurnAfterBaseline(
             transcript,
             baselineTranscriptCount,
@@ -3844,9 +4346,11 @@ async function streamResponseSnapshots(
       assistantTurn?.text ||
       deepseekAnchoredSnapshot?.answerText ||
       "";
-    const answerText = shared.hasMeaningfulAssistantText(domAnswerText)
-      ? domAnswerText
-      : (shared.hasMeaningfulAssistantText(sseText) ? sseText : domAnswerText);
+    const answerText = shared.chooseAnswerText({
+      domText: domAnswerText,
+      sseText,
+      preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+    });
     const domThinking =
       assistantTurn?.thinking ||
       deepseekAnchoredSnapshot?.thinkingText ||
@@ -3882,6 +4386,41 @@ async function streamResponseSnapshots(
     const answerVisible = shared.hasMeaningfulAssistantText(answerText);
     const thinkingVisible = Boolean(thinkingText);
     const quietSinceMs = nowMs - Math.max(lastAnyProgressAt, lastTransportActivityAt || 0);
+
+    let terminalEvidence = shared.hasVerifiedTerminalEvidence({
+      siteId: SITE_ADAPTER?.siteId,
+      sseDone,
+      activeConversationStreamCount: transportStalled
+        ? 0
+        : activeConversationStreamCount,
+      actionBarVisible,
+      stopButtonVisible: Boolean(stopBtn),
+      busyComposer,
+    });
+    if (
+      !terminalEvidence &&
+      SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true &&
+      answerVisible &&
+      !stopBtn &&
+      !busyComposer &&
+      quietSinceMs >= SETTLED_ANSWER_EVIDENCE_MS
+    ) {
+      // The site exposes no dependable terminal marker (Yuanbao reveals its
+      // answer toolbar on hover and may not stream through a hooked request),
+      // so a visible answer that stopped changing is the only completion
+      // signal left. Without it the turn never settles and the plugin waits
+      // out the whole timeout while the page already shows the answer.
+      terminalEvidence = true;
+      if (!settledTerminalEvidenceReported) {
+        settledTerminalEvidenceReported = true;
+        recordTurnDebug("terminal_evidence_settled_answer", {
+          seq,
+          attempt,
+          quietForMs: quietSinceMs,
+          answerLength: lastAnswerText.length,
+        });
+      }
+    }
 
     // Detect tool-use patterns in SSE text or DOM content to adapt completion
     // timing. Once detected, stays true for the entire turn. Check both SSE
@@ -3993,9 +4532,40 @@ async function streamResponseSnapshots(
       lastTurnStatus = turnStatus;
       lastUserTurnKey = userTurnKey;
       lastAssistantTurnKey = assistantTurnKey;
+      lastHeartbeatAt = nowMs;
+    } else if (
+      activeRun &&
+      nowMs - lastHeartbeatAt >= ACTIVITY_HEARTBEAT_INTERVAL_MS
+    ) {
+      // Nothing observable changed, but the provider is still working (stop
+      // control or busy composer). Send a heartbeat so long silent reasoning
+      // keeps refreshing the relay activity timestamp.
+      lastHeartbeatAt = nowMs;
+      postSnapshot(port, {
+        seq,
+        attempt,
+        heartbeat: true,
+        answerSnapshot: lastAnswerText,
+        thinkingSnapshot: lastThinkingText || null,
+        text: lastAnswerText,
+        thinking: lastThinkingText || null,
+        answerAnchorId: assistantTurnKey,
+        answerRevision,
+        thinkingRevision,
+        runState,
+        completionReason: null,
+        remoteChatUrl,
+        remoteChatId,
+        userTurnKey,
+        assistantTurnKey,
+        baselineTranscriptCount,
+        baselineTranscriptHash,
+        turnStatus,
+        diagnostic: makeTurnDiagnostic(turnStatus || "streaming"),
+      });
     }
 
-    if (completion.emitDone && attachmentContractVerified) {
+    if (completion.emitDone && attachmentDeliveryVerified) {
       // Re-read the bound assistant turn after a final rebound delay. ChatGPT
       // can expose a prefix in the DOM long enough to satisfy visual completion
       // heuristics, especially after a discarded-tab reload.
@@ -4003,12 +4573,28 @@ async function streamResponseSnapshots(
       await prepareRichOutput();
       const confirmedTranscript = extractConversationTranscript();
       assertTrackedConversation(confirmedTranscript);
-      const confirmedAssistantTurn = resolveBoundAssistantTurn(
-        confirmedTranscript,
-        userTurnKey,
-        assistantTurnKey,
-      );
-      const confirmedAnswerText = confirmedAssistantTurn?.text || "";
+      const confirmedAssistantTurn =
+        resolveBoundAssistantTurn(
+          confirmedTranscript,
+          userTurnKey,
+          assistantTurnKey,
+        ) ||
+        // A site whose sent user turn is unreadable has no binding to resolve
+        // against; its newest answer after the baseline is the one we tracked.
+        (SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
+          ? resolveLatestAssistantTurnAfterBaseline(
+            confirmedTranscript,
+            baselineTranscriptCount,
+            assistantTurnKey,
+          )
+          : null);
+      // Yuanbao's answer is tracked from the stream, so keep that text when
+      // the DOM no longer re-renders the same conversation.
+      const confirmedAnswerText =
+        confirmedAssistantTurn?.text ||
+        (SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
+          ? lastAnswerText
+          : "");
       const confirmedAssistantTurnKey =
         confirmedAssistantTurn?.messageKey || assistantTurnKey;
       const stableTerminalSnapshot =
@@ -4083,12 +4669,15 @@ async function streamResponseSnapshots(
       !stopBtn &&
       !hasBusyComposerHint() &&
       terminalEvidence &&
-      attachmentContractVerified &&
+      attachmentDeliveryVerified &&
       completion.phase !== "verified_done"
     ) {
       // Use DOM answer if available, otherwise SSE answer
-      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
-        ? lastAnswerText : sseText;
+      const finalText = shared.chooseAnswerText({
+        domText: lastAnswerText,
+        sseText,
+        preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+      });
       const finalThinking = lastThinkingText || sseThinking || null;
       recordTurnDebug("sse_fast_completion", {
         seq,
@@ -4136,15 +4725,17 @@ async function streamResponseSnapshots(
       busyComposer: hasBusyComposerHint(),
       hasRequestContext: Boolean(requestContext),
       hasAssistantTurn: Boolean(assistantTurnKey),
-      attachmentContractVerified,
+      attachmentContractVerified: attachmentDeliveryVerified,
       terminalEvidence,
       quietSinceMs,
       quietThresholdMs: deepseekQuietThresholdMs,
       completionPhase: completion.phase,
     })) {
-      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
-        ? lastAnswerText
-        : (shared.hasMeaningfulAssistantText(sseText) ? sseText : "");
+      const finalText = shared.chooseAnswerText({
+        domText: lastAnswerText,
+        sseText,
+        preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+      });
       const finalThinking = lastThinkingText || sseThinking || null;
 
       if (shared.hasMeaningfulAssistantText(finalText)) {
@@ -4238,9 +4829,11 @@ async function streamResponseSnapshots(
       countConversationRoleNodes(),
     );
   }
-  const timeoutAnswerText = shared.hasMeaningfulAssistantText(lastAnswerText)
-    ? lastAnswerText
-    : (shared.hasMeaningfulAssistantText(sseText) ? sseText : lastAnswerText);
+  const timeoutAnswerText = shared.chooseAnswerText({
+    domText: lastAnswerText,
+    sseText,
+    preferNetwork: SITE_ADAPTER?.preferNetworkAnswer === true,
+  });
   const timeoutThinkingText = lastThinkingText || sseThinking || null;
 
   if (shared.hasMeaningfulAssistantText(timeoutAnswerText)) {
@@ -4621,6 +5214,43 @@ function pruneAssistantStatusNodes(root) {
   for (const sel of selectors) {
     root.querySelectorAll(sel).forEach((node) => node.remove());
   }
+}
+
+const YUANBAO_THINKING_CLASS_RE =
+  /think|reason|deepsearch|thought|brain|(?:^|[-_])cot(?:[-_]|$)/i;
+const YUANBAO_THINKING_LABEL_RE =
+  /^(?:深度思考|已深度思考|思考过程|思考中|正在思考|正在深度思考|推理过程|思维链|Thinking|Thought)(?:[（(][^）)]{0,80}[）)])?\s*/i;
+
+function yuanbaoThinkingSignature(element) {
+  const className =
+    typeof element.className === "string" ? element.className : "";
+  return [
+    className,
+    element.id || "",
+    element.getAttribute?.("aria-label") || "",
+    element.getAttribute?.("data-testid") || "",
+    element.getAttribute?.("title") || "",
+  ].join(" ");
+}
+
+function findYuanbaoThinkingElements(scope) {
+  if (!scope?.querySelectorAll) return [];
+  const matches = [];
+  scope.querySelectorAll("*").forEach((element) => {
+    if (YUANBAO_THINKING_CLASS_RE.test(yuanbaoThinkingSignature(element))) {
+      matches.push(element);
+    }
+  });
+  // Keep only the deepest matches: dropping the outer wrapper would also take
+  // the final answer that sits next to the reasoning trace.
+  return matches.filter(
+    (element) =>
+      !matches.some((other) => other !== element && element.contains(other)),
+  );
+}
+
+function stripYuanbaoThinkingLabel(text) {
+  return String(text || "").replace(YUANBAO_THINKING_LABEL_RE, "").trim();
 }
 
 function extractAssistantThinkingText(node) {
@@ -5787,7 +6417,17 @@ function htmlToMarkdown(html) {
       case "ol": {
         // "1. " marker → nested content aligns under three spaces
         const childIndent = indent + "   ";
-        return "\n" + Array.from(node.children).map((li, i) => `${indent}${i + 1}. ${listItemContent(li, childIndent)}`).join("\n") + "\n";
+        return "\n" + Array.from(node.children).map((li, i) => {
+          const content = listItemContent(li, childIndent);
+          // Yuanbao-style lists draw the ordinal as real text inside each
+          // item (list-style: none), so adding our own marker would produce
+          // "1. 1. text" in the rendered answer.
+          const ownMarker = content.match(/^(\d{1,4})\.\s*(?=\S)/);
+          if (ownMarker) {
+            return `${indent}${ownMarker[1]}. ${content.slice(ownMarker[0].length)}`;
+          }
+          return `${indent}${i + 1}. ${content}`;
+        }).join("\n") + "\n";
       }
       case "li": return `\n- ${children()}`;
       case "a": return `[${children()}](${node.getAttribute("href") ?? ""})`;
@@ -6089,7 +6729,7 @@ async function collectHealthStatus() {
     sendControlState: describeSubmitControl(sendBtn),
     uploadControlFound: Boolean(uploadControl),
     networkHookActive: !domCapture && (networkHookActive || hookResponded),
-    supportedTargets: ["chatgpt", "deepseek", "gemini"],
+    supportedTargets: ["chatgpt", "deepseek", "gemini", "yuanbao"],
     answerCapture: domCapture ? "dom" : "network",
     supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
     lastRequestAt: lastRequestAt || null,
@@ -6102,7 +6742,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "PING") {
     sendResponse({
       pong: true,
-      supportedTargets: ["chatgpt", "deepseek", "gemini"],
+      supportedTargets: ["chatgpt", "deepseek", "gemini", "yuanbao"],
       answerCapture: SITE_ADAPTER?.answerCapture || "network",
       supportedDeliveryContracts: [...SUPPORTED_DELIVERY_CONTRACTS],
     });

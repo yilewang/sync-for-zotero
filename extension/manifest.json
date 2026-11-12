@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Sync for Zotero",
   "version": "0.0.19",
-  "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek and Google Gemini web chats",
+  "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek, Google Gemini and Tencent Yuanbao web chats",
   "minimum_chrome_version": "119",
   "permissions": [
     "tabs",
@@ -15,6 +15,7 @@
     "https://chatgpt.com/*",
     "https://chat.deepseek.com/*",
     "https://gemini.google.com/*",
+    "https://yuanbao.tencent.com/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
@@ -34,13 +35,13 @@
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*", "https://yuanbao.tencent.com/*"],
       "js": ["injected.js"],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*", "https://gemini.google.com/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*", "https://gemini.google.com/*", "https://yuanbao.tencent.com/*"],
       "js": ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
       "run_at": "document_idle"
     }

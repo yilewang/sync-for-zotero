@@ -9,7 +9,7 @@ const historyCode = source.slice(
   source.indexOf("// History Mirroring Logic"),
 );
 
-for (const siteId of ["gemini", "chatgpt", "deepseek"]) {
+for (const siteId of ["gemini", "chatgpt", "deepseek", "yuanbao"]) {
   test(`${siteId} history uses its intended refresh policy and forwards the scrape request`, async () => {
     const events = [];
     const config = { siteId, urlPattern: `https://${siteId}.example/*`, homeUrl: `https://${siteId}.example/` };
