@@ -1372,12 +1372,21 @@ const SITE_ADAPTERS = {
       clone
         .querySelectorAll?.(".hyc-common-markdown__ref-list")
         .forEach((element) => element.remove());
-      const markdown =
-        clone.querySelector?.(".hyc-common-markdown") ||
-        clone.querySelector?.(".hyc-content-text");
-      return htmlToMarkdown(markdown ? markdown.innerHTML : clone.innerHTML)
-        .replace(/\u200b/g, "")
-        .trim();
+      // A long report is split into one Markdown block per section; reading a
+      // single block truncated the answer (and a thinking-only bubble read as
+      // empty, which left the plugin waiting on a finished turn). Collect the
+      // innermost blocks so nested wrappers do not duplicate their text.
+      const blocks = Array.from(
+        clone.querySelectorAll?.(".hyc-common-markdown, .hyc-content-text") ||
+          [],
+      ).filter(
+        (block) =>
+          !block.querySelector(".hyc-common-markdown, .hyc-content-text"),
+      );
+      const html = blocks.length
+        ? blocks.map((block) => block.innerHTML).join("\n\n")
+        : clone.innerHTML;
+      return htmlToMarkdown(html).replace(/\u200b/g, "").trim();
     },
     dropTargetSelectors: [
       ".agent-chat__input-box",
@@ -3740,6 +3749,7 @@ async function streamResponseSnapshots(
   let reportedDeepSeekMissingUserTurn = false;
   let reportedPendingTranscript = false;
   let pendingTranscriptSince = 0;
+  let reportedRelaxedMissingUserTurn = false;
   let settledTerminalEvidenceReported = false;
   let lastActiveRun = null;
   let toolUseDetected = false;
@@ -3993,6 +4003,13 @@ async function streamResponseSnapshots(
           hasBusyComposerHint();
         const deepseekRequestObserved =
           SITE_ADAPTER?.siteId === "deepseek" && Boolean(requestContext);
+        // Sites that declare their sent turn unreadable cannot be verified by
+        // matching its text. The composer held exactly this prompt (and the
+        // file card was confirmed before the click), so a new turn after the
+        // baseline is ours even when its text never matches.
+        const relaxedUserTurnEvidence =
+          SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+          submissionMeta?.composerTextMatched === true;
 
         if (!strictActiveRun) {
           // Fallback: take the last user message after baseline (position-based).
@@ -4026,6 +4043,37 @@ async function streamResponseSnapshots(
                 requestSerial: requestContext?.requestSerial || null,
                 remoteChatUrl,
                 remoteChatId,
+              });
+            }
+          } else if (relaxedUserTurnEvidence) {
+            if (fallbackCandidates.length > 0) {
+              const fallback = fallbackCandidates[fallbackCandidates.length - 1];
+              matchedUserTurn = fallback;
+              userTurnKey = fallback.messageKey;
+              recordTurnDebug("user_turn_position_fallback", {
+                seq,
+                attempt,
+                userTurnKey,
+                siteDeclaredUnreadableTurn: true,
+              });
+              postTurnState(port, {
+                seq, attempt, remoteChatUrl, remoteChatId,
+                baselineTranscriptCount, baselineTranscriptHash,
+                userTurnKey, turnStatus: "user_turn_matched",
+                diagnostic: makeTurnDiagnostic("user_turn_matched", {
+                  reasonCode: "user_turn_position_fallback",
+                  userTurnMatched: true,
+                }),
+              });
+            } else if (!reportedRelaxedMissingUserTurn) {
+              // The site never mounts a readable user turn at all; the answer
+              // after the baseline is the remaining evidence of delivery.
+              reportedRelaxedMissingUserTurn = true;
+              recordTurnDebug("user_turn_unavailable_relaxed_site", {
+                seq,
+                attempt,
+                newMessages: newMessages.length,
+                ...countConversationRoleNodes(),
               });
             }
           } else if (SITE_ADAPTER?.siteId !== "deepseek" && fallbackCandidates.length > 0) {
@@ -4193,6 +4241,18 @@ async function streamResponseSnapshots(
       );
     }
 
+    // Evidence that the requested attachment reached the site. The turn-level
+    // contract above can only run once the sent user turn is mounted; sites
+    // that declare their sent turn unreadable confirmed the exact file card in
+    // the composer before the click, and that receipt is the delivery proof.
+    // Without this fallback the answer could stream in while the emit gate
+    // stayed closed forever.
+    const attachmentDeliveryVerified =
+      attachmentContractVerified ||
+      (SITE_ADAPTER?.submittedAttachmentEvidenceOptional === true &&
+        (!attachmentRequested ||
+          submissionMeta?.pdfAttachmentReceipt?.filenameConfirmed === true));
+
     const previousAssistantTurnKey = assistantTurnKey;
     const assistantTurn = userTurnKey
       ? resolveBoundAssistantTurn(
@@ -4201,7 +4261,8 @@ async function streamResponseSnapshots(
         assistantTurnKey,
       )
       : (
-        SITE_ADAPTER?.siteId === "deepseek" && requestContext
+        (SITE_ADAPTER?.siteId === "deepseek" && requestContext) ||
+        SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
           ? resolveLatestAssistantTurnAfterBaseline(
             transcript,
             baselineTranscriptCount,
@@ -4504,7 +4565,7 @@ async function streamResponseSnapshots(
       });
     }
 
-    if (completion.emitDone && attachmentContractVerified) {
+    if (completion.emitDone && attachmentDeliveryVerified) {
       // Re-read the bound assistant turn after a final rebound delay. ChatGPT
       // can expose a prefix in the DOM long enough to satisfy visual completion
       // heuristics, especially after a discarded-tab reload.
@@ -4512,12 +4573,28 @@ async function streamResponseSnapshots(
       await prepareRichOutput();
       const confirmedTranscript = extractConversationTranscript();
       assertTrackedConversation(confirmedTranscript);
-      const confirmedAssistantTurn = resolveBoundAssistantTurn(
-        confirmedTranscript,
-        userTurnKey,
-        assistantTurnKey,
-      );
-      const confirmedAnswerText = confirmedAssistantTurn?.text || "";
+      const confirmedAssistantTurn =
+        resolveBoundAssistantTurn(
+          confirmedTranscript,
+          userTurnKey,
+          assistantTurnKey,
+        ) ||
+        // A site whose sent user turn is unreadable has no binding to resolve
+        // against; its newest answer after the baseline is the one we tracked.
+        (SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
+          ? resolveLatestAssistantTurnAfterBaseline(
+            confirmedTranscript,
+            baselineTranscriptCount,
+            assistantTurnKey,
+          )
+          : null);
+      // Yuanbao's answer is tracked from the stream, so keep that text when
+      // the DOM no longer re-renders the same conversation.
+      const confirmedAnswerText =
+        confirmedAssistantTurn?.text ||
+        (SITE_ADAPTER?.terminalEvidenceFromSettledAnswer === true
+          ? lastAnswerText
+          : "");
       const confirmedAssistantTurnKey =
         confirmedAssistantTurn?.messageKey || assistantTurnKey;
       const stableTerminalSnapshot =
@@ -4592,7 +4669,7 @@ async function streamResponseSnapshots(
       !stopBtn &&
       !hasBusyComposerHint() &&
       terminalEvidence &&
-      attachmentContractVerified &&
+      attachmentDeliveryVerified &&
       completion.phase !== "verified_done"
     ) {
       // Use DOM answer if available, otherwise SSE answer
@@ -4648,7 +4725,7 @@ async function streamResponseSnapshots(
       busyComposer: hasBusyComposerHint(),
       hasRequestContext: Boolean(requestContext),
       hasAssistantTurn: Boolean(assistantTurnKey),
-      attachmentContractVerified,
+      attachmentContractVerified: attachmentDeliveryVerified,
       terminalEvidence,
       quietSinceMs,
       quietThresholdMs: deepseekQuietThresholdMs,

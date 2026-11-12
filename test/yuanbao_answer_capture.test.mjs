@@ -91,3 +91,26 @@ test("a confirmed composer card outranks an unreadable sent chip", () => {
     /SITE_ADAPTER\?\.submittedAttachmentEvidenceOptional === true &&\s*attachmentRequested &&\s*submissionMeta\?\.pdfAttachmentReceipt\?\.filenameConfirmed === true/,
   );
 });
+
+test("an unreadable sent turn binds by position instead of failing", () => {
+  assert.match(
+    contentScript,
+    /const relaxedUserTurnEvidence =\s*SITE_ADAPTER\?\.submittedAttachmentEvidenceOptional === true &&\s*submissionMeta\?\.composerTextMatched === true;/,
+  );
+  assert.match(
+    contentScript,
+    /else if \(relaxedUserTurnEvidence\) \{[\s\S]{0,400}user_turn_position_fallback/,
+  );
+});
+
+test("delivery evidence falls back to the confirmed composer receipt", () => {
+  assert.match(
+    contentScript,
+    /const attachmentDeliveryVerified =\s*attachmentContractVerified \|\|[\s\S]{0,260}filenameConfirmed === true\)\)/,
+  );
+  assert.match(contentScript, /if \(completion\.emitDone && attachmentDeliveryVerified\) \{/);
+  assert.match(
+    contentScript,
+    /terminalEvidenceFromSettledAnswer === true\s*\?\s*lastAnswerText/,
+  );
+});
